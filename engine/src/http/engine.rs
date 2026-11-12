@@ -136,6 +136,16 @@ impl EngineCtx {
             phase,
         }
     }
+
+    /// 发一条进度。HLS 引擎用它报告分片进度。
+    pub fn send_progress(&self, progress: TaskProgress) {
+        let _ = self.progress.send(progress);
+    }
+
+    /// 报告阶段变化。
+    pub fn send_phase(&self, phase: &'static str) {
+        let _ = self.phase.send(phase);
+    }
 }
 
 /// 引擎之间共享的运行期状态。

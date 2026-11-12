@@ -206,6 +206,12 @@ impl DownloadManager {
         let id = Uuid::new_v4();
         let mut task = Task::new(id, req, dir, filename);
 
+        // 自动判断引擎类型：URL 看着像 m3u8 就走 HLS。
+        // 用户显式指定 engine 时不动。
+        if task.engine == crate::task::EngineKind::Auto && looks_like_hls(&task.url) {
+            task.engine = crate::task::EngineKind::Hls;
+        }
+
         // 需要确认保存位置的：先写到暂存文件，用户选完再转存。
         // 暂存目录和最终目录同卷，转存时 rename 是原子操作。
         if task.needs_confirm {
@@ -326,7 +332,14 @@ impl DownloadManager {
                     progress_tx,
                     phase_tx,
                 );
-            let result = engine.download(&task, ctx).await;
+
+            // 按引擎类型分流：HLS 走自己的流程，其余走 HTTP 引擎
+            let result = match task.engine {
+                crate::task::EngineKind::Hls => {
+                    crate::hls::download_playlist(&task, &ctx).await
+                }
+                _ => engine.download(&task, ctx).await,
+            };
 
             let intent = *task_intent.lock().await;
 
@@ -569,6 +582,14 @@ pub fn default_download_dir() -> PathBuf {
         }
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// URL 看起来像 HLS 播放列表吗。
+pub fn looks_like_hls(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    // 去掉查询参数再判断，避免 ?url=xxx.m3u8 这类误伤
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
 /// 下载完成后的收尾：把暂存文件挪到最终位置。
