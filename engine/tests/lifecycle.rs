@@ -564,3 +564,62 @@ async fn confirm_before_start_still_transfers_to_chosen_path() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+#[tokio::test]
+async fn confirm_after_completion_moves_the_file() {
+    // 回归测试：下载很快，先下完了，用户才点确认。
+    // 这时文件已经转存到默认位置，确认应当把它挪到新位置。
+    let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-late");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/late.bin"),
+            filename: Some("late.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    mgr.start(task.id).await.unwrap();
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "任务应当下载完成");
+
+    // 默认位置已经有文件了
+    assert!(dir.join("late.bin").exists(), "默认位置应当有文件");
+
+    // 这时候用户才确认另一个位置
+    let custom = dir.join("late-target");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("late.bin")))
+        .await
+        .unwrap();
+
+    assert!(
+        custom.join("late.bin").exists(),
+        "确认后文件应当被挪到新位置"
+    );
+    assert!(
+        !dir.join("late.bin").exists(),
+        "默认位置不该残留文件"
+    );
+    let content = std::fs::read(custom.join("late.bin")).unwrap();
+    assert!(content == body, "挪动之后内容必须一致");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

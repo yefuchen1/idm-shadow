@@ -452,6 +452,33 @@ impl DownloadManager {
         task.needs_confirm = false;
         self.inner.store.update_task(&task)?;
 
+        // 下载已经完成才确认：文件已经转到默认位置了，再挪一次。
+        if task.status == TaskStatus::Completed {
+            if let Some(target) = path {
+                if let Some(staging) = task.staging_path.as_ref() {
+                    // 已经转存过了，把最终文件挪到新位置
+                    let current = task.target_path();
+                    if current.exists() && current != target {
+                        if let Some(parent) = target.parent() {
+                            tokio::fs::create_dir_all(parent).await.ok();
+                        }
+                        let moved = tokio::fs::rename(&current, &target).await.is_ok()
+                            || {
+                                let copied = tokio::fs::copy(&current, &target).await.is_ok();
+                                if copied {
+                                    let _ = tokio::fs::remove_file(&current).await;
+                                }
+                                copied
+                            };
+                        if moved {
+                            let _ = tokio::fs::remove_file(staging).await;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         // 已经进入 AwaitingConfirm 的，改回正常状态
         if task.status == TaskStatus::AwaitingConfirm {
             self.inner

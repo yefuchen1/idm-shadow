@@ -74,6 +74,43 @@ fn handle(
     let name = path.trim_start_matches('/');
     let file = dir.join(name);
 
+    // m3u8 播放列表：把目录里的 seg*.ts 按序号列出来
+    if name.ends_with(".m3u8") {
+        let mut segs: Vec<(u32, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if let Some(rest) = fname.strip_prefix("seg") {
+                    if let Some(num) = rest.strip_suffix(".ts") {
+                        if let Ok(n) = num.parse::<u32>() {
+                            segs.push((n, entry.path()));
+                        }
+                    }
+                }
+            }
+        }
+        segs.sort_by_key(|(n, _)| *n);
+
+        let mut playlist =
+            String::from("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n");
+        for (i, _) in &segs {
+            playlist.push_str(&format!("#EXTINF:4.0,\nseg{i}.ts\n"));
+        }
+        playlist.push_str("#EXT-X-ENDLIST\n");
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/vnd.apple.mpegurl\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            playlist.len()
+        );
+        socket.write_all(header.as_bytes())?;
+        socket.write_all(playlist.as_bytes())?;
+        socket.flush()?;
+        return Ok(());
+    }
+
     if !file.is_file() {
         socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         return Ok(());
