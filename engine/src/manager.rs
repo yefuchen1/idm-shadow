@@ -180,6 +180,21 @@ impl DownloadManager {
 
             let (progress_tx, mut progress_rx) =
                 tokio::sync::mpsc::unbounded_channel::<TaskProgress>();
+            let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+
+            // 阶段变化：引擎进入下载阶段时，把任务状态从 Probing 改成 Downloading。
+            let phase_store = store.clone();
+            let phase_events = events.clone();
+            let phase_task = tokio::spawn(async move {
+                while let Some(phase) = phase_rx.recv().await {
+                    let status = match phase {
+                        "downloading" => TaskStatus::Downloading,
+                        _ => continue,
+                    };
+                    let _ = phase_store.set_status(id, status, None);
+                    let _ = phase_events.send(TaskEvent::StatusChanged(id, status));
+                }
+            });
 
             // 进度接收：更新数据库并广播事件
             let progress_store = store.clone();
@@ -197,7 +212,12 @@ impl DownloadManager {
             let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Probing));
 
             let ctx =
-                crate::http::engine::EngineCtx::new(cancel_rx, cancel_tx.clone(), progress_tx);
+                crate::http::engine::EngineCtx::new(
+                    cancel_rx,
+                    cancel_tx.clone(),
+                    progress_tx,
+                    phase_tx,
+                );
             let result = engine.download(&task, ctx).await;
 
             let intent = *task_intent.lock().await;
@@ -230,6 +250,7 @@ impl DownloadManager {
             // 通道已经关闭，这里 recv 会立刻返回 None，等它把队列里
             // 最后一条进度消息处理完再收工。
             let _ = progress_task.await;
+            let _ = phase_task.await;
 
             // 任务结束：从运行表里摘掉，这样"继续"才能重新启动它。
             running.lock().await.remove(&id);

@@ -86,6 +86,8 @@ pub struct EngineCtx {
     pub cancel_tx: watch::Sender<bool>,
     /// 进度上报通道。
     pub progress: mpsc::UnboundedSender<TaskProgress>,
+    /// 阶段变化通知。引擎进入真正下载阶段时发一条 `downloading`。
+    pub phase: mpsc::UnboundedSender<&'static str>,
 }
 
 /// 引擎在任务结束时返回的原因。
@@ -120,11 +122,13 @@ impl EngineCtx {
         cancel: watch::Receiver<bool>,
         cancel_tx: watch::Sender<bool>,
         progress: mpsc::UnboundedSender<TaskProgress>,
+        phase: mpsc::UnboundedSender<&'static str>,
     ) -> Self {
         Self {
             cancel,
             cancel_tx,
             progress,
+            phase,
         }
     }
 }
@@ -171,6 +175,9 @@ impl HttpEngine {
     pub async fn download(&self, task: &Task, ctx: EngineCtx) -> Result<()> {
         let rctx = RequestContext::from_task(task);
         let meta = probe(&self.client, &rctx).await?;
+
+        // 探测结束，进入下载阶段。
+        let _ = ctx.phase.send("downloading");
 
         let total = match meta.total_size {
             Some(t) if meta.supports_range && t > 0 => t,

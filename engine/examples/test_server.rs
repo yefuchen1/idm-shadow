@@ -2,7 +2,9 @@
 //!
 //! 手动验证下载器时的好用工具：
 //!
-//!     cargo run -p idm-shadow-engine --example test_server -- <目录> [端口]
+//!     cargo run -p idm-shadow-engine --example test_server -- <目录> [端口] [KB/s]
+//!
+//! 第三个参数是限速（KB/s），用来观察下载过程中的界面表现。
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,6 +18,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let port: u16 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(18999);
+    let limit_kbps: u64 = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(0);
 
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -26,19 +29,27 @@ fn main() {
     };
 
     println!("测试服务器: http://127.0.0.1:{port}/  (根目录: {})", dir.display());
+    if limit_kbps > 0 {
+        println!("限速: {limit_kbps} KB/s");
+    }
 
     loop {
         let Ok((mut socket, _)) = listener.accept() else {
             continue;
         };
         let dir = dir.clone();
+        let limit_kbps = limit_kbps;
         std::thread::spawn(move || {
-            let _ = handle(socket, &dir);
+            let _ = handle(socket, &dir, limit_kbps);
         });
     }
 }
 
-fn handle(mut socket: std::net::TcpStream, dir: &Path) -> std::io::Result<()> {
+fn handle(
+    mut socket: std::net::TcpStream,
+    dir: &Path,
+    limit_kbps: u64,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -105,6 +116,13 @@ fn handle(mut socket: std::net::TcpStream, dir: &Path) -> std::io::Result<()> {
     handle.seek(SeekFrom::Start(start))?;
     let mut remaining = length;
     let mut buf = vec![0u8; 64 * 1024];
+    // 限速：每 64KB 睡一次
+    let chunk_size = 64 * 1024u64;
+    let sleep_ms = if limit_kbps > 0 {
+        (chunk_size * 1000 / (limit_kbps * 1024)).max(1)
+    } else {
+        0
+    };
     while remaining > 0 {
         let want = std::cmp::min(remaining as usize, buf.len());
         let read = handle.read(&mut buf[..want])?;
@@ -113,6 +131,9 @@ fn handle(mut socket: std::net::TcpStream, dir: &Path) -> std::io::Result<()> {
         }
         socket.write_all(&buf[..read])?;
         remaining -= read as u64;
+        if sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        }
     }
     socket.flush()?;
     Ok(())

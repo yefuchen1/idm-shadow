@@ -128,13 +128,14 @@ async fn run_download(url: String, dir: PathBuf, filename: &str, connections: us
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (progress_tx, mut progress_rx) =
         mpsc::unbounded_channel::<idm_shadow_engine::http::TaskProgress>();
+    let (phase_tx, _phase_rx) = mpsc::unbounded_channel::<&'static str>();
     tokio::spawn(async move {
         while let Some(p) = progress_rx.recv().await {
             assert!(p.downloaded <= p.total.unwrap_or(u64::MAX) + 1024);
         }
     });
 
-    let ctx = EngineCtx::new(cancel_rx, cancel_tx, progress_tx);
+    let ctx = EngineCtx::new(cancel_rx, cancel_tx, progress_tx, phase_tx);
     engine.download(&task, ctx).await.expect("下载应当成功");
 
     dir.join(filename)
@@ -219,7 +220,8 @@ async fn resumes_from_completed_intervals() {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (progress_tx, _rx) =
         mpsc::unbounded_channel::<idm_shadow_engine::http::TaskProgress>();
-    let ctx = EngineCtx::new(cancel_rx, cancel_tx, progress_tx);
+    let (phase_tx, _phase_rx) = mpsc::unbounded_channel::<&'static str>();
+    let ctx = EngineCtx::new(cancel_rx, cancel_tx, progress_tx, phase_tx);
     engine.download(&task, ctx).await.expect("续传应当成功");
 
     let content = std::fs::read(dir.join(filename)).unwrap();
