@@ -11,3 +11,6 @@ Thumbs.db
 *.db-shm
 .idea
 .vscode
+
+*.log
+.playwright-cli/
