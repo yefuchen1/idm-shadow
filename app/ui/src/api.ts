@@ -25,6 +25,8 @@ export interface TaskDto {
   max_connections: number;
   error: string | null;
   needs_confirm: boolean;
+  /** 产物说明，比如 HLS 合并后是不是标准 mp4。 */
+  note: string | null;
   created_at: string;
   updated_at: string;
 }

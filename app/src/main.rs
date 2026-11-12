@@ -173,6 +173,7 @@ fn main() {
                                     "total": progress.total,
                                     "speed": progress.speed,
                                     "connections": progress.connections,
+                                    "note": progress.note,
                                 }),
                             );
                         }

@@ -82,6 +82,7 @@ export default function App() {
       total: number | null;
       speed: number;
       connections: number;
+      note: string | null;
     }>("task-progress", (event) => {
       const p = event.payload;
       setTasks((prev) =>
@@ -92,7 +93,8 @@ export default function App() {
                 downloaded: p.downloaded,
                 total_size: p.total,
                 speed: p.speed,
-                connections: p.connections
+                connections: p.connections,
+                note: p.note ?? t.note
               }
             : t
         )
@@ -534,6 +536,11 @@ export default function App() {
                 {task.error && (
                   <span className="subtle error-text" title={task.error}>
                     {task.error}
+                  </span>
+                )}
+                {task.note && (
+                  <span className="subtle note-text" title={task.note}>
+                    {task.note}
                   </span>
                 )}
               </div>

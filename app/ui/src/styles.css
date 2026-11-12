@@ -428,6 +428,14 @@ body {
   max-width: 140px;
 }
 
+.note-text {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+
 .col-speed,
 .col-eta {
   font-variant-numeric: tabular-nums;

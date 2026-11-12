@@ -84,6 +84,7 @@ pub async fn download_playlist(
                 speed: 0,
                 connections: done,
                 segments: Vec::new(),
+                note: None,
             });
         },
     )
@@ -92,6 +93,22 @@ pub async fn download_playlist(
     // 4. 合并
     let target = task.write_path();
     let result = merge(&segments, &target).await?;
+
+    // 告诉用户产物是什么类型：转封装过是标准 mp4，
+    // 没装 ffmpeg 就只是原始拼接的 TS，部分播放器不认。
+    let note = if result.is_mp4 {
+        "已转封装为 mp4".to_string()
+    } else {
+        "原始 TS 流（未安装 ffmpeg，未转封装）".to_string()
+    };
+    ctx.send_progress(crate::http::engine::TaskProgress {
+        downloaded: result.bytes,
+        total: Some(result.bytes),
+        speed: 0,
+        connections: 0,
+        segments: Vec::new(),
+        note: Some(note),
+    });
 
     tracing::info!(
         task = %task.id,

@@ -81,6 +81,8 @@ pub struct TaskProgress {
     pub speed: u64,
     pub connections: usize,
     pub segments: Vec<SegmentInfo>,
+    /// 产物说明。HLS 合并后会说明是 mp4 还是原始 TS。
+    pub note: Option<String>,
 }
 
 /// 传给引擎的运行期上下文。
@@ -302,6 +304,7 @@ impl HttpEngine {
                         end: offset,
                         speed,
                     }],
+                    note: None,
                 });
             }
         }
@@ -313,6 +316,7 @@ impl HttpEngine {
             speed: 0,
             connections: 0,
             segments: Vec::new(),
+            note: None,
         });
         Ok(())
     }
@@ -536,6 +540,7 @@ impl HttpEngine {
             speed,
             connections,
             segments,
+            note: None,
         }
     }
 }
