@@ -97,7 +97,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn manager(dir: &PathBuf) -> Arc<DownloadManager> {
+fn manager(_dir: &PathBuf) -> Arc<DownloadManager> {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let config = DownloadConfig {
         max_connections: 4,
@@ -292,6 +292,108 @@ async fn remove_deletes_task_and_optional_file() {
 
     mgr.remove(task2.id, true).await.unwrap();
     assert!(!dir.join("y.bin").exists(), "勾选删除文件时文件应当被删掉");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn concurrent_task_limit_queues_the_rest() {
+    let body: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("concurrency");
+    let mgr = manager(&dir);
+    // 只允许同时跑 1 个任务
+    mgr.set_max_concurrent_tasks(Some(1)).await;
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let task = mgr
+            .add(TaskRequest {
+                url: format!("http://{addr}/f{i}.bin"),
+                filename: Some(format!("f{i}.bin")),
+                dir: Some(dir.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        mgr.start(task.id).await.unwrap();
+        ids.push(task.id);
+    }
+
+    // 只应该有一个任务真正在跑，其余排队
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let statuses: Vec<TaskStatus> = ids
+        .iter()
+        .map(|id| mgr.get(*id).unwrap().unwrap().status)
+        .collect();
+    let downloading = statuses
+        .iter()
+        .filter(|s| **s == TaskStatus::Downloading)
+        .count();
+    assert_eq!(downloading, 1, "同时只该有一个任务在下载，实际: {statuses:?}");
+
+    // 排队的任务状态是 Queued
+    let queued = statuses
+        .iter()
+        .filter(|s| **s == TaskStatus::Queued)
+        .count();
+    assert_eq!(queued, 2, "另外两个应当排队，实际: {statuses:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn raising_the_limit_lets_queued_tasks_start() {
+    let body: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("raise-limit");
+    let mgr = manager(&dir);
+    mgr.set_max_concurrent_tasks(Some(1)).await;
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let task = mgr
+            .add(TaskRequest {
+                url: format!("http://{addr}/r{i}.bin"),
+                filename: Some(format!("r{i}.bin")),
+                dir: Some(dir.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        mgr.start(task.id).await.unwrap();
+        ids.push(task.id);
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 放开限制后，排队里的任务应该陆续跑起来
+    mgr.set_max_concurrent_tasks(None).await;
+    let pump = mgr.handle();
+    pump.pump_queue_for_test().await;
+
+    let started = wait_for(
+        || {
+            ids.iter()
+                .filter(|id| {
+                    matches!(
+                        mgr.get(**id).unwrap().unwrap().status,
+                        TaskStatus::Downloading | TaskStatus::Completed
+                    )
+                })
+                .count()
+                >= 2
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(started, "放开限制后更多任务应当开始下载");
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -26,6 +26,8 @@ use crate::task::Task;
 pub struct DownloadConfig {
     /// 单任务并发连接数上限。
     pub max_connections: usize,
+    /// 同时下载的任务数上限。None = 不限。
+    pub max_concurrent_tasks: Option<usize>,
     /// 单段最小字节数。低于这个值不再切分。
     pub min_segment_size: u64,
     /// 单段最大字节数。
@@ -48,6 +50,7 @@ impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
             max_connections: 8,
+            max_concurrent_tasks: None,
             min_segment_size: 256 * 1024,
             max_segment_size: 64 * 1024 * 1024,
             rebalance_interval: Duration::from_secs(2),
@@ -148,7 +151,7 @@ struct Shared {
 pub struct HttpEngine {
     client: reqwest::Client,
     store: Arc<Store>,
-    config: DownloadConfig,
+    config: tokio::sync::RwLock<DownloadConfig>,
     global_limiter: Arc<RateLimiter>,
 }
 
@@ -158,13 +161,18 @@ impl HttpEngine {
         Ok(Self {
             client,
             store,
-            config,
+            config: tokio::sync::RwLock::new(config),
             global_limiter: Arc::new(RateLimiter::new(None)),
         })
     }
 
-    pub fn config(&self) -> &DownloadConfig {
-        &self.config
+    pub async fn config(&self) -> DownloadConfig {
+        self.config.read().await.clone()
+    }
+
+    /// 改全局默认参数（连接数等）。
+    pub async fn set_config(&self, config: DownloadConfig) {
+        *self.config.write().await = config;
     }
 
     pub fn set_global_limit(&self, limit: Option<u64>) {
@@ -325,7 +333,16 @@ impl HttpEngine {
             file.sync_all().await.ok();
         }
 
-        let connections = self.config.max_connections.clamp(1, 64);
+        // 单任务的连接数以任务上的设置为准，引擎的全局配置只作为默认值。
+        // 之前这里只看全局配置，导致 PATCH 改单任务连接数完全不生效。
+        let global = self.config.read().await;
+        let connections = if task.max_connections > 0 {
+            task.max_connections as usize
+        } else {
+            global.max_connections
+        }
+        .clamp(1, 64);
+        let config = global.clone();
         let shared = Arc::new(Shared {
             segmenter: Mutex::new(Segmenter::resume(total, done)),
             speeds: (0..connections).map(|_| AtomicU64::new(0)).collect(),
@@ -348,7 +365,7 @@ impl HttpEngine {
             let rctx = rctx.clone();
             let client = self.client.clone();
             let path = path.clone();
-            let config = self.config.clone();
+            let config = config.clone();
             let mut cancel = ctx.cancel.clone();
             workers.push(tokio::spawn(async move {
                 worker_loop(id, shared, rctx, client, path, config, &mut cancel).await;
@@ -381,7 +398,8 @@ impl HttpEngine {
         total: u64,
         mut ctx: EngineCtx,
     ) -> Result<()> {
-        let mut tick = tokio::time::interval(self.config.rebalance_interval);
+        let config = self.config.read().await.clone();
+        let mut tick = tokio::time::interval(config.rebalance_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_persist = Instant::now();
 
@@ -400,7 +418,7 @@ impl HttpEngine {
                     self.rebalance(&shared).await;
 
                     let now = Instant::now();
-                    if now.duration_since(last_persist) >= self.config.persist_interval {
+                    if now.duration_since(last_persist) >= config.persist_interval {
                         last_persist = now;
                         let seg = shared.segmenter.lock().await;
                         let done = seg.done().clone();
@@ -425,6 +443,7 @@ impl HttpEngine {
 
     /// 一轮重平衡：淘汰拖后腿的连接，把关键路径分给更快的连接。
     async fn rebalance(&self, shared: &Arc<Shared>) {
+        let config = self.config.read().await.clone();
         let mut seg = shared.segmenter.lock().await;
 
         let speeds: Vec<(WorkerId, f64)> = shared
@@ -449,8 +468,8 @@ impl HttpEngine {
         // 1. 淘汰明显拖后腿的连接
         if alive >= 2 {
             for (id, v) in &speeds {
-                let below_floor = (*v as u64) < self.config.min_speed;
-                if below_floor && *v < self.config.drop_ratio * v_max {
+                let below_floor = (*v as u64) < config.min_speed;
+                if below_floor && *v < config.drop_ratio * v_max {
                     tracing::debug!(worker = id, speed = *v, "淘汰慢连接");
                     seg.release(*id);
                 }

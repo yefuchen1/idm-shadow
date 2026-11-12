@@ -66,6 +66,7 @@ fn main() {
             protocol::handle_args(app, &argv);
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = data_dir();
             std::fs::create_dir_all(&dir).ok();
@@ -87,6 +88,24 @@ fn main() {
                 .and_then(|v| v.parse::<u64>().ok())
             {
                 manager.set_global_limit(if limit == 0 { None } else { Some(limit) });
+            }
+            if let Some(n) = store
+                .get_setting("max_connections")?
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                tauri::async_runtime::block_on(async {
+                    let mut config = manager.engine().config().await;
+                    config.max_connections = n.clamp(1, 64);
+                    manager.engine().set_config(config).await;
+                });
+            }
+            if let Some(n) = store
+                .get_setting("max_concurrent_tasks")?
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                tauri::async_runtime::block_on(
+                    manager.set_max_concurrent_tasks(if n == 0 { None } else { Some(n) }),
+                );
             }
 
             // token：环境变量 > 上次存的 > 新生成的。
@@ -131,6 +150,12 @@ fn main() {
                 manager: manager.clone(),
                 bridge_port: port,
                 token: token.clone(),
+            });
+
+            // 调度器：定期把排队里的任务捞起来
+            let scheduler = manager.clone();
+            tauri::async_runtime::spawn(async move {
+                scheduler.run_scheduler().await;
             });
 
             // 把引擎事件转发给前端
@@ -188,6 +213,7 @@ fn main() {
             commands::retry_task,
             commands::remove_task,
             commands::get_settings,
+            commands::update_settings,
             commands::set_global_limit,
             commands::reveal_file,
         ])

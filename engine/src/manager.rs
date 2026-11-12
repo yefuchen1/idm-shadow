@@ -2,7 +2,7 @@
 //!
 //! 桌面应用和本地 HTTP API 都通过它操作任务，保证两条入口看到同一份状态。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,7 +40,13 @@ enum Intent {
     Cancelled,
 }
 
+#[derive(Clone)]
 pub struct DownloadManager {
+    inner: Arc<Inner>,
+}
+
+/// 共享的内部状态。
+struct Inner {
     store: Arc<Store>,
     engine: Arc<HttpEngine>,
     running: Arc<Mutex<HashMap<TaskId, Running>>>,
@@ -51,6 +57,10 @@ pub struct DownloadManager {
     events: broadcast::Sender<TaskEvent>,
     limiter: Arc<RateLimiter>,
     default_dir: tokio::sync::RwLock<PathBuf>,
+    /// 同时下载的任务数上限。None = 不限。
+    max_concurrent_tasks: Arc<Mutex<Option<usize>>>,
+    /// 排队等待的任务。超过并发上限时先进这里。
+    pending: Arc<Mutex<VecDeque<TaskId>>>,
 }
 
 impl DownloadManager {
@@ -59,45 +69,111 @@ impl DownloadManager {
         let (events, _) = broadcast::channel(256);
         let default_dir = default_download_dir();
         Ok(Self {
-            store,
-            engine,
-            running: Arc::new(Mutex::new(HashMap::new())),
-            finishing: Arc::new(Mutex::new(HashSet::new())),
-            live: Arc::new(Mutex::new(HashMap::new())),
-            events,
-            limiter: Arc::new(RateLimiter::new(None)),
-        default_dir: tokio::sync::RwLock::new(default_dir),
+            inner: Arc::new(Inner {
+                store,
+                engine,
+                running: Arc::new(Mutex::new(HashMap::new())),
+                finishing: Arc::new(Mutex::new(HashSet::new())),
+                live: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                limiter: Arc::new(RateLimiter::new(None)),
+                default_dir: tokio::sync::RwLock::new(default_dir),
+                max_concurrent_tasks: Arc::new(Mutex::new(None)),
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+            }),
         })
     }
 
     pub fn store(&self) -> &Arc<Store> {
-        &self.store
+        &self.inner.store
+    }
+
+    /// 复制一份管理器句柄，共享同一份内部状态。
+    pub fn handle(&self) -> DownloadManager {
+        DownloadManager {
+            inner: self.inner.clone(),
+        }
     }
 
     pub fn engine(&self) -> &Arc<HttpEngine> {
-        &self.engine
+        &self.inner.engine
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
-        self.events.subscribe()
+        self.inner.events.subscribe()
     }
 
     /// 当前的实时进度快照。
     pub async fn live_progress(&self) -> HashMap<TaskId, TaskProgress> {
-        self.live.lock().await.clone()
+        self.inner.live.lock().await.clone()
     }
 
     pub fn set_global_limit(&self, limit: Option<u64>) {
-        self.limiter.set_limit(limit);
-        self.engine.set_global_limit(limit);
+        self.inner.limiter.set_limit(limit);
+        self.inner.engine.set_global_limit(limit);
     }
 
     pub async fn set_default_dir(&self, dir: PathBuf) {
-        *self.default_dir.write().await = dir;
+        *self.inner.default_dir.write().await = dir;
     }
 
     pub async fn default_dir(&self) -> PathBuf {
-        self.default_dir.read().await.clone()
+        self.inner.default_dir.read().await.clone()
+    }
+
+    /// 设置同时下载的任务数上限。None = 不限。
+    pub async fn set_max_concurrent_tasks(&self, limit: Option<usize>) {
+        *self.inner.max_concurrent_tasks.lock().await = limit;
+    }
+
+    pub async fn max_concurrent_tasks(&self) -> Option<usize> {
+        *self.inner.max_concurrent_tasks.lock().await
+    }
+
+    /// 有任务跑完时，把排队里的下一个捞起来。
+    async fn pump_queue(&self) {
+        let limit = self.max_concurrent_tasks().await;
+        let Some(limit) = limit else {
+            // 不限并发时，队列里所有任务都该跑起来
+            let queued: Vec<TaskId> = self.inner.pending.lock().await.drain(..).collect();
+            for id in queued {
+                if let Err(err) = self.start(id).await {
+                    tracing::warn!(task = %id, "排队任务启动失败: {err}");
+                }
+            }
+            return;
+        };
+
+        loop {
+            let active = self.inner.running.lock().await.len();
+            if active >= limit {
+                break;
+            }
+            let next = self.inner.pending.lock().await.pop_front();
+            let Some(id) = next else {
+                break;
+            };
+                if let Err(err) = self.start(id).await {
+                tracing::warn!(task = %id, "排队任务启动失败: {err}");
+            }
+        }
+    }
+
+    /// 调度器循环：定期把排队里的任务捞起来。
+    ///
+    /// 单独一个长驻任务来做这件事，而不是在每个任务结束时再 spawn 一个——
+    /// 后者会让 spawned 任务借用它自己持有的管理器，
+    /// 那样得到的 future 不是 Send，spawn 不了。
+    pub async fn run_scheduler(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            self.pump_queue().await;
+        }
+    }
+
+    /// 立刻把排队里的任务捞起来（测试用）。
+    pub async fn pump_queue_for_test(&self) {
+        self.pump_queue().await;
     }
 
     /// 新建任务。落到队列里等待启动。
@@ -126,8 +202,8 @@ impl DownloadManager {
 
         let id = Uuid::new_v4();
         let task = Task::new(id, req, dir, filename);
-        self.store.insert_task(&task)?;
-        self.events
+        self.inner.store.insert_task(&task)?;
+        self.inner.events
             .send(TaskEvent::StatusChanged(id, TaskStatus::Queued))
             .ok();
         Ok(task)
@@ -136,18 +212,19 @@ impl DownloadManager {
     /// 启动（或恢复）一个任务。
     pub async fn start(&self, id: TaskId) -> Result<()> {
         {
-            let running = self.running.lock().await;
+            let running = self.inner.running.lock().await;
             if running.contains_key(&id) {
                 return Ok(());
             }
         }
 
         // 收尾中的任务不接受重新启动
-        if self.finishing.lock().await.contains(&id) {
+        if self.inner.finishing.lock().await.contains(&id) {
             return Err(anyhow!("任务正在收尾，请稍候"));
         }
 
         let task = self
+            .inner
             .store
             .get_task(id)?
             .ok_or_else(|| anyhow!("任务不存在"))?;
@@ -156,9 +233,24 @@ impl DownloadManager {
             return Err(anyhow!("任务已完成"));
         }
 
+        // 超过同时下载任务数上限时，任务留在队列里等着。
+        // 前面有任务跑完时，pump_queue 会把它捞起来。
+        let limit = self.max_concurrent_tasks().await;
+        if let Some(limit) = limit {
+            let active = self.inner.running.lock().await.len();
+            if active >= limit {
+                self.inner.store.set_status(id, TaskStatus::Queued, None)?;
+                self.inner.events
+                    .send(TaskEvent::StatusChanged(id, TaskStatus::Queued))
+                    .ok();
+                self.inner.pending.lock().await.push_back(id);
+                return Ok(());
+            }
+        }
+
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let intent = Arc::new(Mutex::new(Intent::Active));
-        self.running
+        self.inner.running
             .lock()
             .await
             .insert(id, Running {
@@ -166,14 +258,13 @@ impl DownloadManager {
                 intent: intent.clone(),
             });
 
-        let store = self.store.clone();
-        let engine = self.engine.clone();
-        let events = self.events.clone();
-        let live = self.live.clone();
+        let store = self.inner.store.clone();
+        let engine = self.inner.engine.clone();
+        let events = self.inner.events.clone();
+        let live = self.inner.live.clone();
         let task_intent = intent.clone();
-        let running = self.running.clone();
-        let finishing = self.finishing.clone();
-
+        let running = self.inner.running.clone();
+        let finishing = self.inner.finishing.clone();
         tokio::spawn(async move {
             let manager_finishing = finishing.clone();
             manager_finishing.lock().await.insert(id);
@@ -255,6 +346,7 @@ impl DownloadManager {
             // 任务结束：从运行表里摘掉，这样"继续"才能重新启动它。
             running.lock().await.remove(&id);
             manager_finishing.lock().await.remove(&id);
+
         });
 
         Ok(())
@@ -262,14 +354,14 @@ impl DownloadManager {
 
     /// 暂停任务。
     pub async fn pause(&self, id: TaskId) -> Result<()> {
-        let running = self.running.lock().await;
+        let running = self.inner.running.lock().await;
         if let Some(r) = running.get(&id) {
             *r.intent.lock().await = Intent::Paused;
             let _ = r.cancel.send(true);
         }
         drop(running);
-        self.store.set_status(id, TaskStatus::Paused, None)?;
-        self.events
+        self.inner.store.set_status(id, TaskStatus::Paused, None)?;
+        self.inner.events
             .send(TaskEvent::StatusChanged(id, TaskStatus::Paused))
             .ok();
         Ok(())
@@ -277,20 +369,20 @@ impl DownloadManager {
 
     /// 继续任务（从断点续传）。
     pub async fn resume(&self, id: TaskId) -> Result<()> {
-        self.store.set_status(id, TaskStatus::Queued, None)?;
+        self.inner.store.set_status(id, TaskStatus::Queued, None)?;
         self.start(id).await
     }
 
     /// 取消任务。
     pub async fn cancel(&self, id: TaskId) -> Result<()> {
-        let running = self.running.lock().await;
+        let running = self.inner.running.lock().await;
         if let Some(r) = running.get(&id) {
             *r.intent.lock().await = Intent::Cancelled;
             let _ = r.cancel.send(true);
         }
         drop(running);
-        self.store.set_status(id, TaskStatus::Cancelled, None)?;
-        self.events
+        self.inner.store.set_status(id, TaskStatus::Cancelled, None)?;
+        self.inner.events
             .send(TaskEvent::StatusChanged(id, TaskStatus::Cancelled))
             .ok();
         Ok(())
@@ -298,13 +390,13 @@ impl DownloadManager {
 
     /// 重试一个失败的任务。
     pub async fn retry(&self, id: TaskId) -> Result<()> {
-        self.store.set_status(id, TaskStatus::Queued, None)?;
+        self.inner.store.set_status(id, TaskStatus::Queued, None)?;
         self.start(id).await
     }
 
     /// 删除任务。可选同时删除已下载的文件。
     pub async fn remove(&self, id: TaskId, delete_file: bool) -> Result<()> {
-        let task = self.store.get_task(id)?;
+        let task = self.inner.store.get_task(id)?;
         if let Some(task) = &task {
             if delete_file {
                 let path = task.target_path();
@@ -313,31 +405,31 @@ impl DownloadManager {
                 }
             }
         }
-        let running = self.running.lock().await;
+        let running = self.inner.running.lock().await;
         if let Some(r) = running.get(&id) {
             let _ = r.cancel.send(true);
         }
         drop(running);
-        self.store.delete_task(id)?;
+        self.inner.store.delete_task(id)?;
         Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<Task>> {
-        self.store.list_tasks()
+        self.inner.store.list_tasks()
     }
 
     pub fn get(&self, id: TaskId) -> Result<Option<Task>> {
-        self.store.get_task(id)
+        self.inner.store.get_task(id)
     }
 
     /// 应用启动时，把上次残留的运行中任务恢复成暂停。
     pub fn recover_interrupted(&self) -> Result<()> {
-        for task in self.store.list_tasks()? {
+        for task in self.inner.store.list_tasks()? {
             if matches!(
                 task.status,
                 TaskStatus::Downloading | TaskStatus::Probing | TaskStatus::Queued
             ) {
-                self.store
+                self.inner.store
                     .set_status(task.id, TaskStatus::Paused, None)?;
             }
         }

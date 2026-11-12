@@ -4,6 +4,7 @@
 //! HTTPS 页面可以直连）。鉴权用 token，防止本机其它网页乱投任务。
 
 pub mod protocol;
+pub mod system;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -398,17 +399,62 @@ async fn get_settings(State(state): State<BridgeState>) -> Result<Json<Value>, A
         .store()
         .all_settings()
         .map_err(|e| ApiError::new("internal", e.to_string()))?;
+    let config = state.manager.engine().config().await;
     Ok(Json(json!({
         "port": state.port,
         "download_dir": state.manager.default_dir().await.to_string_lossy(),
+        "max_connections": config.max_connections,
+        "max_concurrent_tasks": state.manager.max_concurrent_tasks().await,
+        "default_download_tool": is_default_download_tool(&state.manager),
+        "auto_start": system::is_auto_start(),
         "settings": settings,
     })))
+}
+
+/// "设为默认下载工具"这个开关存在数据库里。
+/// 单一事实来源在桌面应用，扩展被动服从。
+pub fn is_default_download_tool(manager: &DownloadManager) -> bool {
+    manager
+        .store()
+        .get_setting("default_download_tool")
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 打开"设为默认下载工具"。
+/// 按约定：默认下载工具意味着开机就在后台待命，所以同时打开开机自启。
+pub fn set_default_download_tool(manager: &DownloadManager, enabled: bool) -> anyhow::Result<()> {
+    manager
+        .store()
+        .set_setting("default_download_tool", if enabled { "1" } else { "0" })?;
+
+    if enabled {
+        // 默认下载工具 ⇒ 开机自启
+        if let Some(exe) = system::current_exe() {
+            system::set_auto_start(true, &exe)?;
+        }
+        // 注册自定义协议，扩展唤起应用时用得上
+        if let Some(exe) = system::current_exe() {
+            let _ = protocol::register(&exe);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateSettingsBody {
     pub download_dir: Option<String>,
     pub global_limit: Option<u64>,
+    /// 单任务连接数上限。
+    pub max_connections: Option<u32>,
+    /// 同时下载的任务数上限。0 = 不限。
+    pub max_concurrent_tasks: Option<u32>,
+    /// 设为默认下载工具。打开它会连带打开开机自启。
+    pub default_download_tool: Option<bool>,
+    /// 开机自启。
+    pub auto_start: Option<bool>,
 }
 
 async fn update_settings(
@@ -432,6 +478,38 @@ async fn update_settings(
             .manager
             .store()
             .set_setting("global_limit", &limit.to_string())
+            .map_err(|e| ApiError::new("internal", e.to_string()))?;
+    }
+    if let Some(n) = body.max_connections {
+        let n = n.clamp(1, 64);
+        let mut config = state.manager.engine().config().await;
+        config.max_connections = n as usize;
+        state.manager.engine().set_config(config).await;
+        state
+            .manager
+            .store()
+            .set_setting("max_connections", &n.to_string())
+            .map_err(|e| ApiError::new("internal", e.to_string()))?;
+    }
+    if let Some(n) = body.max_concurrent_tasks {
+        let limit = if n == 0 { None } else { Some(n as usize) };
+        state.manager.set_max_concurrent_tasks(limit).await;
+        let value = n.to_string();
+        state
+            .manager
+            .store()
+            .set_setting("max_concurrent_tasks", &value)
+            .map_err(|e| ApiError::new("internal", e.to_string()))?;
+    }
+    if let Some(enabled) = body.default_download_tool {
+        set_default_download_tool(&state.manager, enabled)
+            .map_err(|e| ApiError::new("internal", e.to_string()))?;
+    }
+    if let Some(enabled) = body.auto_start {
+        let exe = system::current_exe().ok_or_else(|| {
+            ApiError::new("internal", "找不到程序自身路径")
+        })?;
+        system::set_auto_start(enabled, &exe)
             .map_err(|e| ApiError::new("internal", e.to_string()))?;
     }
     Ok(Json(json!({ "ok": true })))

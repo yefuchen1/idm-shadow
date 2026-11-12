@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Ban,
   Copy,
   FolderOpen,
+  FolderCog,
   Pause,
   Play,
   Plus,
@@ -27,11 +29,23 @@ const ACTIVE: TaskStatus[] = ["queued", "probing", "downloading", "retrying"];
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskDto[]>([]);
-  const [settings, setSettings] = useState<SettingsDto | null>(null);
   const [url, setUrl] = useState("");
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
-  const [limit, setLimit] = useState("");
+  const [settings, setSettings] = useState<SettingsDto | null>(null);
+  const [draft, setDraft] = useState({
+    downloadDir: "",
+    globalLimit: "",
+    maxConnections: "16",
+    maxConcurrentTasks: "0",
+    defaultDownloadTool: false,
+    autoStart: false
+  });
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string;
+    filename: string;
+  } | null>(null);
+  const [deleteFile, setDeleteFile] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -45,7 +59,20 @@ export default function App() {
 
   useEffect(() => {
     refresh();
-    api.getSettings().then(setSettings).catch(() => undefined);
+    api
+      .getSettings()
+      .then((s) => {
+        setSettings(s);
+        setDraft({
+          downloadDir: s.download_dir,
+          globalLimit: "",
+          maxConnections: String(s.max_connections),
+          maxConcurrentTasks: String(s.max_concurrent_tasks),
+          defaultDownloadTool: s.default_download_tool,
+          autoStart: s.auto_start
+        });
+      })
+      .catch(() => undefined);
 
     const unlistenProgress = listen<{
       id: string;
@@ -141,13 +168,60 @@ export default function App() {
     await navigator.clipboard.writeText(text);
   }
 
-  async function applyLimit() {
-    const parsed = limit.trim() === "" ? null : Number(limit.trim());
-    if (parsed !== null && (Number.isNaN(parsed) || parsed < 0)) {
+  async function pickFolder() {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: draft.downloadDir
+    });
+    if (typeof picked === "string") {
+      setDraft((d) => ({ ...d, downloadDir: picked }));
+    }
+  }
+
+  async function saveSettings() {
+    const conns = Number(draft.maxConnections);
+    if (!Number.isInteger(conns) || conns < 1 || conns > 64) {
+      setError("连接数要在 1 到 64 之间");
+      return;
+    }
+    const tasks = Number(draft.maxConcurrentTasks);
+    if (!Number.isInteger(tasks) || tasks < 0) {
+      setError("同时下载任务数不能为负数");
+      return;
+    }
+    const limit =
+      draft.globalLimit.trim() === "" ? 0 : Number(draft.globalLimit.trim());
+    if (Number.isNaN(limit) || limit < 0) {
       setError("限速值不对");
       return;
     }
-    await guard(() => api.setGlobalLimit(parsed));
+
+    await guard(async () => {
+      await api.updateSettings({
+        downloadDir: draft.downloadDir,
+        globalLimit: limit,
+        maxConnections: conns,
+        maxConcurrentTasks: tasks,
+        defaultDownloadTool: draft.defaultDownloadTool,
+        autoStart: draft.autoStart
+      });
+      const s = await api.getSettings();
+      setSettings(s);
+      setDraft((d) => ({
+        ...d,
+        globalLimit: "",
+        defaultDownloadTool: s.default_download_tool,
+        autoStart: s.auto_start
+      }));
+    });
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    await guard(() => api.removeTask(target.id, deleteFile));
   }
 
   return (
@@ -246,21 +320,98 @@ export default function App() {
             </button>
           </div>
           <div className="settings-row">
+            <label>下载目录</label>
+            <input
+              className="dir-input"
+              placeholder="选择保存位置"
+              value={draft.downloadDir}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, downloadDir: e.target.value }))
+              }
+            />
+            <button
+              className="btn small"
+              title="浏览文件夹"
+              onClick={pickFolder}
+            >
+              <FolderCog size={13} />
+            </button>
+          </div>
+          <div className="settings-row">
             <label>全局限速</label>
             <input
               className="limit-input"
               placeholder="不限速"
-              value={limit}
-              onChange={(e) => setLimit(e.target.value)}
+              value={draft.globalLimit}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, globalLimit: e.target.value }))
+              }
             />
             <span className="unit">KB/s</span>
-            <button className="btn small" onClick={applyLimit}>
-              应用
-            </button>
           </div>
           <div className="settings-row">
-            <label>下载目录</label>
-            <code>{settings.download_dir}</code>
+            <label>单任务连接数</label>
+            <input
+              className="limit-input"
+              type="number"
+              min={1}
+              max={64}
+              value={draft.maxConnections}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, maxConnections: e.target.value }))
+              }
+            />
+            <span className="unit">1–64</span>
+          </div>
+          <div className="settings-row">
+            <label>同时下载任务数</label>
+            <input
+              className="limit-input"
+              type="number"
+              min={0}
+              max={64}
+              value={draft.maxConcurrentTasks}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, maxConcurrentTasks: e.target.value }))
+              }
+            />
+            <span className="unit">0 = 不限</span>
+          </div>
+          <div className="settings-row">
+            <label>默认下载工具</label>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={draft.defaultDownloadTool}
+                onChange={(e) =>
+                  setDraft((d) => ({
+                    ...d,
+                    defaultDownloadTool: e.target.checked,
+                    // 默认下载工具意味着开机就在后台待命
+                    autoStart: e.target.checked ? true : d.autoStart
+                  }))
+                }
+              />
+              <span>浏览器下载自动交给 IDM Shadow</span>
+            </label>
+          </div>
+          <div className="settings-row">
+            <label>开机自启</label>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={draft.autoStart}
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, autoStart: e.target.checked }))
+                }
+              />
+              <span>开机后自动在后台运行</span>
+            </label>
+          </div>
+          <div className="settings-row">
+            <button className="btn primary" onClick={saveSettings}>
+              保存设置
+            </button>
           </div>
         </div>
       )}
@@ -370,7 +521,10 @@ export default function App() {
                 <button
                   className="btn icon"
                   title="删除任务"
-                  onClick={() => guard(() => api.removeTask(task.id, false))}
+                  onClick={() => {
+                    setDeleteTarget({ id: task.id, filename: task.filename });
+                    setDeleteFile(true);
+                  }}
                 >
                   <Trash2 size={14} />
                 </button>
@@ -394,6 +548,31 @@ export default function App() {
         <span className="dot-sep">·</span>
         <span>bridge 127.0.0.1:{settings?.port ?? "-"}</span>
       </footer>
+
+      {deleteTarget && (
+        <div className="modal-backdrop" onClick={() => setDeleteTarget(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>确定删除吗？</h2>
+            <p className="modal-text">{deleteTarget.filename}</p>
+            <label className="switch modal-check">
+              <input
+                type="checkbox"
+                checked={deleteFile}
+                onChange={(e) => setDeleteFile(e.target.checked)}
+              />
+              <span>是否删除已下载的缓存文件</span>
+            </label>
+            <div className="modal-actions">
+              <button className="btn" onClick={() => setDeleteTarget(null)}>
+                取消
+              </button>
+              <button className="btn danger" onClick={confirmDelete}>
+                删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

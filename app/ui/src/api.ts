@@ -31,6 +31,10 @@ export interface SettingsDto {
   port: number;
   token: string;
   download_dir: string;
+  max_connections: number;
+  max_concurrent_tasks: number;
+  default_download_tool: boolean;
+  auto_start: boolean;
 }
 
 export const api = {
@@ -44,10 +48,21 @@ export const api = {
   removeTask: (id: string, deleteFile: boolean) =>
     invoke<void>("remove_task", { id, deleteFile }),
   getSettings: () => invoke<SettingsDto>("get_settings"),
+  updateSettings: (patch: SettingsPatch) =>
+    invoke<void>("update_settings", patch as unknown as Record<string, unknown>),
   setGlobalLimit: (bytesPerSecond: number | null) =>
     invoke<void>("set_global_limit", { bytesPerSecond }),
   revealFile: (path: string) => invoke<void>("reveal_file", { path })
 };
+
+export interface SettingsPatch {
+  downloadDir?: string;
+  globalLimit?: number;
+  maxConnections?: number;
+  maxConcurrentTasks?: number;
+  defaultDownloadTool?: boolean;
+  autoStart?: boolean;
+}
 
 export function formatSize(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return "—";

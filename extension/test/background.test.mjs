@@ -90,16 +90,20 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode };`
 );
 
 const fetchCalls = [];
+let settingsResponse = { default_download_tool: false };
 const fakeFetch = async (url, options = {}) => {
   fetchCalls.push({ url, options });
   return {
     ok: true,
     status: 200,
-    json: async () => ({ ok: true, tasks: [] }),
+    json: async () =>
+      url.endsWith('/api/v1/settings')
+        ? settingsResponse
+        : { ok: true, tasks: [] },
     text: async () => ''
   };
 };
@@ -234,6 +238,44 @@ await test('同一个下载不会重复接管', async () => {
   });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(fetchCalls.length, afterFirst, '同一个 id 不该重复投递');
+});
+
+await test('跟随应用模式：应用说是默认下载工具就自动接管', async () => {
+  storage.mode = 'follow-app';
+  settingsResponse = { default_download_tool: true };
+
+  await api.syncWithApp();
+  assert.equal(api.effectiveMode(await api.settings()), 'auto');
+
+  calls.downloads.length = 0;
+  await listeners.onCreated({
+    id: 21,
+    url: 'https://example.com/follow.bin',
+    filename: 'follow.bin'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls.downloads.length, 1, '默认下载工具时应当自动接管');
+});
+
+await test('跟随应用模式：应用说不是就不自动接管', async () => {
+  storage.mode = 'follow-app';
+  settingsResponse = { default_download_tool: false };
+
+  await api.syncWithApp();
+  assert.equal(api.effectiveMode(await api.settings()), 'ask');
+
+  calls.downloads.length = 0;
+  calls.notifications.length = 0;
+  await listeners.onCreated({
+    id: 22,
+    url: 'https://example.com/follow2.bin',
+    filename: 'follow2.bin'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls.downloads.length, 0, '不是默认下载工具时不该取消下载');
+  assert.equal(calls.notifications.length, 1, '应该弹提示让用户确认');
+
+  storage.mode = 'auto';
 });
 
 console.log('');

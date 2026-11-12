@@ -8,14 +8,43 @@ const DEFAULTS = {
   bridgeUrl: 'http://127.0.0.1:16888',
   token: '',
   // off: 不接管；ask: 弹提示由用户确认；auto: 直接接管
+  // 'follow-app': 跟随桌面应用的"设为默认下载工具"开关
   mode: 'ask',
   autoLaunch: true,
   handled: {}
 };
 
+// 桌面应用里勾了"设为默认下载工具"，扩展就自动接管。
+// 单一事实来源在桌面应用，这里只是服从它。
+let followAppMode = true;
+
 async function settings() {
   const stored = await chrome.storage.local.get(DEFAULTS);
   return { ...DEFAULTS, ...stored };
+}
+
+/// 当前应当用什么接管方式。
+function effectiveMode(s) {
+  if (s.mode === 'follow-app') {
+    return followAppMode ? 'auto' : 'ask';
+  }
+  return s.mode;
+}
+
+/// 向桌面应用打听一下"我是不是默认下载工具"。
+async function syncWithApp() {
+  const s = await settings();
+  if (!s.token) return;
+  try {
+    const resp = await fetch(apiUrl('/api/v1/settings', s), {
+      headers: { 'X-IDM-Shadow-Token': s.token }
+    });
+    if (!resp.ok) return;
+    const body = await resp.json();
+    followAppMode = Boolean(body.default_download_tool);
+  } catch (err) {
+    // 应用没开就保持原样
+  }
 }
 
 async function saveSettings(patch) {
@@ -155,10 +184,11 @@ async function isHandled(id) {
 // 拦截浏览器下载。
 chrome.downloads.onCreated.addListener(async (item) => {
   const s = await settings();
-  if (s.mode === 'off') return;
+  const mode = effectiveMode(s);
+  if (mode === 'off') return;
   if (await isHandled(item.id)) return;
 
-  if (s.mode === 'auto') {
+  if (mode === 'auto') {
     const ok = await capture(item);
     if (ok) {
       try {
@@ -221,6 +251,7 @@ chrome.runtime.onInstalled.addListener(() => {
     });
   });
   chrome.alarms.create('refresh-badge', { periodInMinutes: 1 });
+  syncWithApp();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -255,8 +286,14 @@ async function updateBadge() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'refresh-badge') updateBadge();
+  if (alarm.name === 'refresh-badge') {
+    syncWithApp();
+    updateBadge();
+  }
 });
+
+// 定期问桌面应用"默认下载工具"的开关有没有变。
+chrome.alarms.create('sync-app-mode', { periodInMinutes: 1 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === 'capture-url') {
