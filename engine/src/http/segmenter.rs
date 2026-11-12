@@ -244,16 +244,25 @@ impl Segmenter {
                     return out;
                 }
 
-                let total_w: f64 = owner_weight + recipients.iter().map(|(_, v)| *v).sum();
+                // 按速率比例累出切点
+                let mut prefix = Vec::with_capacity(recipients.len() + 1);
+                let mut acc = owner_weight;
+                prefix.push(acc);
+                for (_, w) in &recipients {
+                    acc += *w;
+                    prefix.push(acc);
+                }
+                let total_w = acc;
                 if total_w <= 0.0 {
                     return out;
                 }
 
-                let mut bounds = vec![t_start];
-                let mut acc = owner_weight;
-                for (_, w) in &recipients {
-                    acc += *w;
-                    let mut cut = t_start + ((len as f64) * (acc / total_w)) as u64;
+                let parts = recipients.len() + 1;
+                let mut bounds = Vec::with_capacity(parts + 1);
+                bounds.push(t_start);
+                for i in 1..parts {
+                    // prefix[i - 1] 是第 i 块之前的累积权重
+                    let mut cut = t_start + ((len as f64) * (prefix[i - 1] / total_w)) as u64;
                     let last = *bounds.last().unwrap();
                     if cut <= last {
                         cut = last + 1;
@@ -264,10 +273,6 @@ impl Segmenter {
                     bounds.push(cut);
                 }
                 bounds.push(t_end);
-                bounds.dedup();
-                if bounds.len() < 3 {
-                    return out;
-                }
 
                 self.works.remove(tail_idx);
 
@@ -305,20 +310,28 @@ impl Segmenter {
     /// 校验不变式。返回 Err 说明区间出现了重叠或空洞。
     pub fn check_invariants(&self) -> Result<(), String> {
         let expected = self.done.complement(self.total);
-        let mut actual: Vec<(u64, u64)> = self.works.iter().map(|w| (w.start, w.end)).collect();
-        actual.sort_unstable();
+
+        // works 之间允许相邻（不同持有者），但不允许重叠。
+        for pair in self.works.windows(2) {
+            if pair[0].end > pair[1].start {
+                return Err(format!("区间重叠：{:?} 与 {:?}", pair[0], pair[1]));
+            }
+        }
+
+        // 把相邻的 works 合并成极大区间，再和补集比较。
+        let mut actual: Vec<(u64, u64)> = Vec::with_capacity(self.works.len());
+        for w in &self.works {
+            match actual.last_mut() {
+                Some(last) if w.start <= last.1 => last.1 = last.1.max(w.end),
+                _ => actual.push((w.start, w.end)),
+            }
+        }
 
         if actual != expected {
             return Err(format!(
                 "区间划分不一致：期望 {:?}，实际 {:?}（done={}）",
                 expected, actual, self.done
             ));
-        }
-
-        for pair in actual.windows(2) {
-            if pair[0].1 > pair[1].0 {
-                return Err(format!("区间重叠：{:?} 与 {:?}", pair[0], pair[1]));
-            }
         }
 
         let undone: u64 = actual.iter().map(|(s, e)| e - s).sum();
@@ -444,7 +457,8 @@ mod tests {
             guard += 1;
             for w in 0..4 {
                 if seg.current_range(w).is_none() {
-                    seg.assign(w, 300).unwrap();
+                    // 没有待分配的区间时，这个 worker 只能先闲着
+                    let _ = seg.assign(w, 300);
                 }
                 seg.complete(w, 100);
             }

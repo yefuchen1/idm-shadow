@@ -264,8 +264,10 @@ pub fn filename_from_content_disposition(value: &str) -> Option<String> {
         let rest = &value[idx + "filename*".len()..];
         let rest = rest.trim_start().trim_start_matches('=').trim();
         // 形如 UTF-8''%E4%B8%AD%E6%96%87.txt
-        let mut parts = rest.splitn(2, '\'');
+        // RFC 5987 的格式是 charset'language'value，两个单引号都是分隔符。
+        let mut parts = rest.splitn(3, '\'');
         let charset = parts.next().unwrap_or("");
+        let _language = parts.next().unwrap_or("");
         let encoded = parts.next().unwrap_or("");
         let decoded = percent_decode(encoded);
         if let Some(name) = decoded {

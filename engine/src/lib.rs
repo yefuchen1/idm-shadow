@@ -6,9 +6,11 @@
 pub mod http;
 pub mod interval;
 pub mod limiter;
+pub mod manager;
 pub mod store;
 pub mod task;
 
 pub use interval::IntervalSet;
+pub use manager::{DownloadManager, TaskEvent};
 pub use store::Store;
 pub use task::{EngineKind, Task, TaskError, TaskId, TaskRequest, TaskStatus};

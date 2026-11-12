@@ -24,15 +24,26 @@ impl IntervalSet {
             return;
         }
 
-        // 找到第一个可能与新区间相接或相交的位置。
-        let idx = self
-            .ranges
-            .partition_point(|&(s, e)| e.saturating_add(1) < start);
+        // 第一个可能与新区间相交或相接的下标：end >= start 的第一个。
+        let idx = self.ranges.partition_point(|&(_s, e)| e < start);
 
         let mut new_start = start;
         let mut new_end = end;
+        let mut first = idx;
         let mut removed = 0usize;
 
+        // 向前：前一个区间可能与新区间相交或相接。
+        if idx > 0 {
+            let (s, e) = self.ranges[idx - 1];
+            if e >= start {
+                new_start = new_start.min(s);
+                new_end = new_end.max(e);
+                first = idx - 1;
+                removed += 1;
+            }
+        }
+
+        // 向后：吃掉所有与新区间（或已合并部分）相交的区间。
         for i in idx..self.ranges.len() {
             let (s, e) = self.ranges[i];
             if s > new_end {
@@ -43,7 +54,8 @@ impl IntervalSet {
             removed += 1;
         }
 
-        self.ranges.splice(idx..idx + removed, [(new_start, new_end)]);
+        self.ranges
+            .splice(first..first + removed, [(new_start, new_end)]);
     }
 
     /// 已覆盖的字节总数。

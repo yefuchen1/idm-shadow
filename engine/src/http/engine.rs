@@ -19,7 +19,7 @@ use super::{build_client, is_permanent_client_error, probe, status_to_error, Req
 use crate::interval::IntervalSet;
 use crate::limiter::RateLimiter;
 use crate::store::Store;
-use crate::task::{Task, TaskId};
+use crate::task::Task;
 
 /// 下载参数。
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
             max_connections: 8,
-            min_segment_size: 1024 * 1024,
+            min_segment_size: 256 * 1024,
             max_segment_size: 64 * 1024 * 1024,
             rebalance_interval: Duration::from_secs(2),
             drop_ratio: 0.15,
@@ -82,13 +82,23 @@ pub struct TaskProgress {
 pub struct EngineCtx {
     /// 置为 true 表示取消。
     pub cancel: watch::Receiver<bool>,
+    /// 取消信号的发送端。引擎自己也要能叫停所有 worker。
+    pub cancel_tx: watch::Sender<bool>,
     /// 进度上报通道。
     pub progress: mpsc::UnboundedSender<TaskProgress>,
 }
 
 impl EngineCtx {
-    pub fn new(cancel: watch::Receiver<bool>, progress: mpsc::UnboundedSender<TaskProgress>) -> Self {
-        Self { cancel, progress }
+    pub fn new(
+        cancel: watch::Receiver<bool>,
+        cancel_tx: watch::Sender<bool>,
+        progress: mpsc::UnboundedSender<TaskProgress>,
+    ) -> Self {
+        Self {
+            cancel,
+            cancel_tx,
+            progress,
+        }
     }
 }
 
@@ -185,14 +195,14 @@ impl HttpEngine {
         task: &Task,
         rctx: &RequestContext,
         meta: &ResourceMeta,
-        mut ctx: EngineCtx,
+        ctx: EngineCtx,
     ) -> Result<()> {
         let path = task.target_path();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
 
-        let mut resp = rctx
+        let resp = rctx
             .apply(self.client.get(&rctx.url))
             .send()
             .await
@@ -211,7 +221,6 @@ impl HttpEngine {
         let mut stream = resp.bytes_stream();
         let mut last_report = Instant::now();
         let mut last_bytes = 0u64;
-        let mut speed = 0u64;
 
         while let Some(chunk) = stream.next().await {
             if *ctx.cancel.borrow() {
@@ -226,7 +235,7 @@ impl HttpEngine {
             let now = Instant::now();
             if now.duration_since(last_report) >= Duration::from_millis(500) {
                 let elapsed = now.duration_since(last_report).as_secs_f64().max(0.001);
-                speed = ((offset - last_bytes) as f64 / elapsed) as u64;
+                let speed = ((offset - last_bytes) as f64 / elapsed) as u64;
                 last_bytes = offset;
                 last_report = now;
                 let _ = ctx.progress.send(TaskProgress {
@@ -260,7 +269,7 @@ impl HttpEngine {
         &self,
         task: &Task,
         rctx: &RequestContext,
-        meta: &ResourceMeta,
+        _meta: &ResourceMeta,
         total: u64,
         done: IntervalSet,
         ctx: EngineCtx,
@@ -312,13 +321,11 @@ impl HttpEngine {
             }));
         }
 
-        let result = self
-            .supervise(task, shared.clone(), total, ctx)
-            .await;
+        let cancel_tx = ctx.cancel_tx.clone();
+        let result = self.supervise(task, shared.clone(), total, ctx).await;
 
         // 无论成功失败都要通知 worker 收工
-        let mut cancel = ctx.cancel.clone();
-        let _ = cancel.send(true);
+        let _ = cancel_tx.send(true);
         for w in workers {
             let _ = w.await;
         }
@@ -512,11 +519,20 @@ async fn worker_loop(
         let range = {
             let mut seg = shared.segmenter.lock().await;
             if seg.remaining() == 0 {
+                tracing::debug!(worker = id, "没有剩余区间，退出");
                 break;
             }
             match seg.current_range(id) {
                 Some(r) => Some(r),
-                None => seg.assign(id, config.max_segment_size),
+                None => {
+                    // 每条连接只拿剩余量的四分之一左右，剩下的留给其它连接，
+                    // 这样多连接才真的能并行铺开。
+                    let remaining = seg.remaining();
+                    let workers = shared.alive.len().max(1) as u64;
+                    let chunk = (remaining / (workers * 4))
+                        .clamp(config.min_segment_size, config.max_segment_size);
+                    seg.assign(id, chunk)
+                }
             }
         };
 
@@ -574,14 +590,32 @@ async fn worker_loop(
                 Ok(c) => c,
                 Err(err) => {
                     tracing::warn!(worker = id, "读取中断: {err}");
+                    retries += 1;
+                    if retries > config.max_retries {
+                        tracing::error!(worker = id, "重试次数用尽");
+                        shared.alive[id].store(false, Ordering::Relaxed);
+                        shared.segmenter.lock().await.release(id);
+                        break;
+                    }
                     break;
                 }
             };
 
-            // 区间可能已被重分割：不属于我了就停手重发
+            // 区间可能已被重分割：不属于我了就停手重发。
+            // complete() 会推进区间起点，所以这里比对自己的偏移，而不是起点。
             let current = shared.segmenter.lock().await.current_range(id);
-            if current != Some((rstart, rend)) {
-                break;
+            match current {
+                Some((s, e)) if e == rend && s == rstart + written => {}
+                _ => {
+                    tracing::debug!(
+                        worker = id,
+                        current = ?current,
+                        expect_start = rstart + written,
+                        expect_end = rend,
+                        "区间已变化，中断当前请求"
+                    );
+                    break;
+                }
             }
 
             shared.limiter.acquire(chunk.len() as u64).await;
@@ -621,16 +655,18 @@ async fn worker_loop(
         // 5. 重新同步区间（可能被重分割或释放）
         let current = shared.segmenter.lock().await.current_range(id);
         match current {
+            Some((s, e)) if s >= rend => {
+                // 这一段下完了，重新领活
+                continue;
+            }
             Some((s, e)) => {
                 if e <= s {
                     shared.segmenter.lock().await.release(id);
                 } else {
+                    // 区间被缩短了，按新区间重新发请求，从 s 接着下
                     rstart = s;
                     rend = e;
-                    if written >= rend - rstart {
-                        // 这一段下完了，继续下一段
-                        continue;
-                    }
+                    written = 0;
                 }
             }
             None => {

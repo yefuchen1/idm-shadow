@@ -329,7 +329,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task> {
         error,
         etag: row.get("etag")?,
         last_modified: row.get("last_modified")?,
-        accepts_ranges: row.get::<_, i64>("accept_ranges")? != 0,
+        accepts_ranges: row.get::<_, i64>("accepts_ranges")? != 0,
         created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),

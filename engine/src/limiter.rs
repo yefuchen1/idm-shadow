@@ -17,6 +17,12 @@ struct Inner {
     last: Instant,
 }
 
+/// 一次取配额的结果。
+enum Acquire {
+    Go,
+    Wait(Duration),
+}
+
 impl RateLimiter {
     pub fn new(limit: Option<u64>) -> Self {
         Self {
@@ -44,33 +50,35 @@ impl RateLimiter {
     /// 等待直到可以取走 `n` 字节的配额。
     pub async fn acquire(&self, n: u64) {
         loop {
-            let wait = {
+            // 锁的作用域必须结束在 await 之前，否则 future 没法跨线程。
+            let action = {
                 let mut inner = self.inner.lock().unwrap();
-                let Some(limit) = inner.limit else {
-                    return;
-                };
-                if limit == 0 {
-                    // 0 表示暂停传输，但保留可恢复的能力
-                    drop(inner);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
+                match inner.limit {
+                    None => Acquire::Go,
+                    Some(0) => Acquire::Wait(Duration::from_millis(200)),
+                    Some(limit) => {
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(inner.last).as_secs_f64();
+                        inner.last = now;
+                        inner.tokens =
+                            (inner.tokens + elapsed * limit as f64).min(limit as f64);
+
+                        if inner.tokens >= n as f64 {
+                            inner.tokens -= n as f64;
+                            Acquire::Go
+                        } else {
+                            let missing = n as f64 - inner.tokens;
+                            let secs = missing / limit as f64;
+                            Acquire::Wait(Duration::from_secs_f64(secs.clamp(0.01, 1.0)))
+                        }
+                    }
                 }
-
-                let now = Instant::now();
-                let elapsed = now.duration_since(inner.last).as_secs_f64();
-                inner.last = now;
-                inner.tokens = (inner.tokens + elapsed * limit as f64).min(limit as f64);
-
-                if inner.tokens >= n as f64 {
-                    inner.tokens -= n as f64;
-                    return;
-                }
-
-                let missing = n as f64 - inner.tokens;
-                let secs = missing / limit as f64;
-                Duration::from_secs_f64(secs.clamp(0.01, 1.0))
             };
-            tokio::time::sleep(wait).await;
+
+            match action {
+                Acquire::Go => return,
+                Acquire::Wait(d) => tokio::time::sleep(d).await,
+            }
         }
     }
 
@@ -120,8 +128,8 @@ mod tests {
         assert!(!limiter.try_acquire(900));
 
         let start = Instant::now();
-        limiter.acquire(300).await;
-        assert!(start.elapsed() >= Duration::from_millis(200));
+        limiter.acquire(900).await;
+        assert!(start.elapsed() >= Duration::from_millis(300));
     }
 
     #[tokio::test]
