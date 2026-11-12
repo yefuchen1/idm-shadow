@@ -18,6 +18,78 @@ const DEFAULTS = {
 // 单一事实来源在桌面应用，这里只是服从它。
 let followAppMode = true;
 
+// downloadId → 任务 id。文件名定下来后要回填。
+const taskByDownload = {};
+
+/// 改任务的文件名。
+async function renameTask(taskId, filename) {
+  if (!taskId || !filename) return;
+  const s = await settings();
+  try {
+    await fetch(apiUrl(`/api/v1/tasks/${taskId}`, s), {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-IDM-Shadow-Token': s.token
+      },
+      body: JSON.stringify({ filename })
+    });
+  } catch (err) {
+    console.warn('[IDM Shadow] 回填文件名失败', err);
+  }
+}
+
+/// 等 Chrome 把最终文件名定下来。
+/// 下载项刚创建时只有临时名，要等它真正开始写文件才有真名字。
+async function waitForFilename(downloadId, retries = 20) {
+  for (let i = 0; i < retries; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    try {
+      const items = await chrome.downloads.search({ id: downloadId });
+      if (items.length === 0) continue;
+      const name = items[0].filename || '';
+      // "download" 和 "download (2)" 都是临时名
+      if (name && !/^download( \(\d+\))?$/.test(name)) {
+        return name.split(/[\\/]/).pop();
+      }
+    } catch (err) {
+      // 下载可能已经被我们取消了
+    }
+  }
+  return null;
+}
+
+/// 自己问服务器要文件名。
+///
+/// Chrome 给的名字在接管场景下不可靠——我们很快就把浏览器下载取消了，
+/// 它可能永远停在 "download (2)" 这种临时名上。
+/// 直接读响应头里的 Content-Disposition 最靠谱，跟 Chrome 的状态无关。
+async function filenameFromServer(url) {
+  try {
+    const resp = await fetch(url, { method: 'HEAD' });
+    const disposition = resp.headers.get('content-disposition');
+    if (!disposition) return null;
+
+    // filename*=UTF-8''xxx 优先
+    const starMatch = /filename\*\s*=\s*([^']*)'([^']*)'([^;]+)/i.exec(disposition);
+    if (starMatch) {
+      try {
+        return decodeURIComponent(starMatch[3].trim().replace(/^"|"$/g, ''));
+      } catch (err) {
+        // 解码失败就用普通的
+      }
+    }
+
+    const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(disposition);
+    if (plain) {
+      return plain[1].trim();
+    }
+  } catch (err) {
+    // 服务器不支持 HEAD 或者网络不通
+  }
+  return null;
+}
+
 async function settings() {
   const stored = await chrome.storage.local.get(DEFAULTS);
   return { ...DEFAULTS, ...stored };
@@ -121,9 +193,15 @@ async function capture(item) {
   // blob / data URL 由页面内生命周期决定，引擎取不到
   if (/^(blob|data|chrome-extension|edge):/i.test(url)) return false;
 
+  // 文件名优先问服务器要——Chrome 给的名字在接管场景下不可靠，
+// 我们把浏览器下载取消掉之后它可能永远停在 "download (2)"。
+  const serverName = await filenameFromServer(url);
+  const chromeName = filenameByDownload[item.id] || item.filename;
+  const finalName = serverName || chromeName;
+
   const payload = {
     url,
-    filename: item.filename || undefined,
+    filename: finalName || undefined,
     // chrome.downloads 用的是 referrer（两个 r），内容脚本发过来的是 referer。
     // 两个都认，免得丢掉来源页信息——不少站点靠 Referer 校验才肯给文件。
     referer: item.referrer || item.referer || undefined,
@@ -136,7 +214,15 @@ async function capture(item) {
   };
 
   try {
-    await createTask(payload);
+    const task = await createTask(payload);
+    if (task && task.id && item.id !== undefined) {
+      taskByDownload[item.id] = task.id;
+    }
+    // 名字还是临时名（比如 "download"），再等等 Chrome 定好
+    if (task && task.id && finalName && /^download( \(\d+\))?$/.test(finalName)) {
+      const final = await waitForFilename(item.id);
+      if (final) await renameTask(task.id, final);
+    }
     await markHandled(item.id, true);
     await updateBadge();
     return true;
@@ -160,6 +246,19 @@ async function capture(item) {
     return false;
   }
 }
+
+// Chrome 确定最终文件名时会触发这个事件。
+// 下载项刚创建时只给个临时名（"download"），真正的名字要等这里。
+//
+// 事件顺序：onDeterminingFilename 先于 onCreated，而 onCreated 里
+// 要 await 一次网络请求，所以那时候文件名事件已经过去了。
+// 因此这里先把文件名按 downloadId 记下来，onCreated 里再取。
+const filenameByDownload = {};
+
+chrome.downloads.onDeterminingFilename.addListener(async (item, suggest) => {
+  const filename = suggest && suggest.filename ? suggest.filename : item.filename;
+  if (filename) filenameByDownload[item.id] = filename;
+});
 
 async function markHandled(id, handled) {
   const s = await settings();
