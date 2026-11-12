@@ -51,6 +51,10 @@ const chrome = {
   },
   downloads: {
     onCreated: { addListener: (fn) => (listeners.onCreated = fn) },
+    onDeterminingFilename: {
+      addListener: (fn) => (listeners.onDeterminingFilename = fn)
+    },
+    onChanged: { addListener: (fn) => (listeners.onChanged = fn) },
     cancel: record('downloads'),
     search: async () => []
   },

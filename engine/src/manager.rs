@@ -211,6 +211,9 @@ impl DownloadManager {
         if task.engine == crate::task::EngineKind::Auto && looks_like_hls(&task.url) {
             task.engine = crate::task::EngineKind::Hls;
         }
+        if task.engine == crate::task::EngineKind::Auto && crate::bt::looks_like_bt(&task.url) {
+            task.engine = crate::task::EngineKind::Bt;
+        }
 
         // 需要确认保存位置的：先写到暂存文件，用户选完再转存。
         // 暂存目录和最终目录同卷，转存时 rename 是原子操作。
@@ -337,6 +340,51 @@ impl DownloadManager {
             let result = match task.engine {
                 crate::task::EngineKind::Hls => {
                     crate::hls::download_playlist(&task, &ctx).await
+                }
+                crate::task::EngineKind::Bt => {
+                    // BT 库是阻塞式、线程模型的，放到专用线程上跑，
+                    // 别占着 tokio 的工作线程。
+                    let bt_task = task.clone();
+                    let bt_ctx = ctx.clone();
+                    // 跨线程用标准 channel：tokio 的 mpsc 在这两个线程模型之间
+                    // 不好搭（BT 线程是阻塞的，转发线程是 async 的）。
+                    let (tx, rx) = std::sync::mpsc::channel::<crate::http::engine::TaskProgress>();
+
+                    let handle = std::thread::spawn(move || {
+                        let mut report =
+                            |downloaded: u64, total: u64, speed: u64, peers: usize| {
+                                let _ = tx.send(crate::http::engine::TaskProgress {
+                                    downloaded,
+                                    total: Some(total),
+                                    speed,
+                                    connections: peers,
+                                    segments: Vec::new(),
+                                    note: None,
+                                });
+                            };
+                        crate::bt::download(&bt_task, &bt_ctx, &mut report)
+                    });
+
+                    // 把 BT 线程的进度转回 tokio 通道
+                    let bt_progress = ctx.progress.clone();
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                    tokio::spawn(async move {
+                        // 把 BT 线程的进度转回 tokio 通道
+                        while let Ok(p) = rx.recv() {
+                            let _ = bt_progress.send(p);
+                        }
+                        let _ = done_tx.send(());
+                    });
+
+                    // 等待 BT 线程结束
+                    let joined = tokio::task::spawn_blocking(move || handle.join()).await;
+                    let _ = done_rx.await;
+
+                    match joined {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(_panic)) => Err(anyhow!("BT 线程 panic")),
+                        Err(err) => Err(anyhow!("BT 线程异常: {err}")),
+                    }
                 }
                 _ => engine.download(&task, ctx).await,
             };

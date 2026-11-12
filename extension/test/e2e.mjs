@@ -79,6 +79,20 @@ async function listTasks() {
   const body = await resp.json();
   return body.tasks || [];
 }
+
+/// 清掉上次测试留下的任务和文件，保证每次都是干净的环境。
+async function resetState() {
+  const resp = await fetch(`http://127.0.0.1:${PORT}/api/v1/tasks`, {
+    headers: { 'X-IDM-Shadow-Token': TOKEN }
+  });
+  const body = await resp.json();
+  for (const task of body.tasks || []) {
+    await fetch(`http://127.0.0.1:${PORT}/api/v1/tasks/${task.id}?delete_file=true`, {
+      method: 'DELETE',
+      headers: { 'X-IDM-Shadow-Token': TOKEN }
+    });
+  }
+}
 const payload = Buffer.alloc(512 * 1024);
 for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
 
@@ -105,6 +119,8 @@ try {
     throw new Error('桌面应用的 bridge 没起来');
   }
   log('bridge 已就绪');
+
+  await resetState();
 
   browser = await chromium.launchPersistentContext(profileDir, {
     headless: false,

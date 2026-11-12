@@ -4,6 +4,7 @@
 //! 任务模型、字节区间集合、分段与动态重分割、落盘与持久化、限速。
 
 pub mod http;
+pub mod bt;
 pub mod hls;
 pub mod interval;
 pub mod limiter;

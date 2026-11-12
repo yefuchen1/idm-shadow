@@ -86,6 +86,7 @@ pub struct TaskProgress {
 }
 
 /// 传给引擎的运行期上下文。
+#[derive(Clone)]
 pub struct EngineCtx {
     /// 置为 true 表示取消。
     pub cancel: watch::Receiver<bool>,

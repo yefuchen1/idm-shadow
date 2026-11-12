@@ -5,10 +5,14 @@
   "description": "IDM Shadow：复刻 IDM 的下载工具，支持油猴脚本对接",
   "scripts": {
     "test": "node extension/test/background.test.mjs && node userscript/test/bridge.test.mjs",
+    "test:e2e": "node extension/test/e2e.mjs",
     "test:rust": "cargo test --workspace",
     "test:all": "npm run test:rust && npm test",
     "ui:build": "npm --prefix app/ui run build",
     "ui:dev": "npm --prefix app/ui run dev",
     "server": "cargo run -p idm-shadow-engine --example test_server"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
   }
 }
