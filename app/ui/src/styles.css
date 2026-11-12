@@ -185,11 +185,13 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: nowrap;
 }
 
 .settings-row label {
-  width: 90px;
+  flex: 0 0 96px;
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .settings-row code {
@@ -223,11 +225,16 @@ body {
   gap: 7px;
   cursor: pointer;
   color: var(--text);
+  flex: 1;
+  min-width: 0;
 }
 
 .switch input {
   margin: 0;
   cursor: pointer;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
 }
 
 .btn.danger {

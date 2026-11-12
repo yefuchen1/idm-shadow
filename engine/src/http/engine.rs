@@ -336,12 +336,11 @@ impl HttpEngine {
         // 单任务的连接数以任务上的设置为准，引擎的全局配置只作为默认值。
         // 之前这里只看全局配置，导致 PATCH 改单任务连接数完全不生效。
         let global = self.config.read().await;
-        let connections = if task.max_connections > 0 {
-            task.max_connections as usize
-        } else {
-            global.max_connections
-        }
-        .clamp(1, 64);
+        let connections = task
+            .max_connections
+            .map(|v| v as usize)
+            .unwrap_or(global.max_connections)
+            .clamp(1, 64);
         let config = global.clone();
         let shared = Arc::new(Shared {
             segmenter: Mutex::new(Segmenter::resume(total, done)),

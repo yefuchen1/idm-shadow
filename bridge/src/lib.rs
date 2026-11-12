@@ -80,9 +80,11 @@ pub struct TaskDto {
 }
 
 impl TaskDto {
+    /// `default_max_connections` 是全局设置，任务没单独指定时用它。
     pub fn from_task(
         task: &Task,
         live: Option<&idm_shadow_engine::http::TaskProgress>,
+        default_max_connections: u32,
     ) -> Self {
         Self {
             id: task.id.to_string(),
@@ -95,7 +97,9 @@ impl TaskDto {
             downloaded: task.downloaded,
             speed: live.map(|p| p.speed).unwrap_or(0),
             connections: live.map(|p| p.connections).unwrap_or(0),
-            max_connections: task.max_connections,
+            max_connections: task
+                .max_connections
+                .unwrap_or(default_max_connections),
             error: task.error.as_ref().map(|e| e.message.clone()),
             created_at: task.created_at.to_rfc3339(),
             updated_at: task.updated_at.to_rfc3339(),
@@ -135,7 +139,8 @@ impl CreateTaskBody {
             user_agent: self.user_agent,
             cookies: self.cookies,
             headers: self.headers.into_iter().collect(),
-            max_connections: self.max_connections.unwrap_or(8).clamp(1, 64),
+            // None = 跟随全局设置
+            max_connections: self.max_connections.map(|v| v.clamp(1, 64)),
             engine: self
                 .engine
                 .as_deref()
@@ -259,10 +264,11 @@ async fn list_tasks(State(state): State<BridgeState>) -> Result<Json<Value>, Api
         .list()
         .map_err(|e| ApiError::new("internal", e.to_string()))?;
     let live = state.manager.live_progress().await;
+    let default_max = state.manager.engine().config().await.max_connections as u32;
 
     let list: Vec<TaskDto> = tasks
         .iter()
-        .map(|t| TaskDto::from_task(t, live.get(&t.id)))
+        .map(|t| TaskDto::from_task(t, live.get(&t.id), default_max))
         .collect();
     Ok(Json(json!({ "tasks": list })))
 }
@@ -279,7 +285,8 @@ async fn get_task(
         .ok_or_else(|| ApiError::new("not_found", "任务不存在"))?;
 
     let live = state.manager.live_progress().await;
-    let dto = TaskDto::from_task(&task, live.get(&id));
+    let default_max = state.manager.engine().config().await.max_connections as u32;
+    let dto = TaskDto::from_task(&task, live.get(&id), default_max);
     Ok(Json(json!({ "task": dto })))
 }
 
@@ -309,7 +316,7 @@ async fn patch_task(
         task.dir = dir.into();
     }
     if let Some(n) = body.max_connections {
-        task.max_connections = n.clamp(1, 64);
+        task.max_connections = Some(n.clamp(1, 64));
     }
     task.updated_at = chrono::Utc::now();
 
@@ -464,6 +471,8 @@ async fn update_settings(
     if let Some(dir) = body.download_dir {
         let path = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&path).ok();
+        // 光存数据库不够，还得让正在运行的管理器立刻换过来
+        state.manager.set_default_dir(path.clone()).await;
         state
             .manager
             .store()

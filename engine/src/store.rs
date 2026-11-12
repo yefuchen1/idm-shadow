@@ -60,7 +60,7 @@ impl Store {
                 user_agent      TEXT,
                 cookies         TEXT,
                 headers         TEXT NOT NULL DEFAULT '{}',
-                max_connections INTEGER NOT NULL DEFAULT 8,
+                max_connections INTEGER,
                 error           TEXT,
                 etag            TEXT,
                 last_modified   TEXT,
@@ -85,6 +85,74 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_intervals_task ON intervals(task_id);
             "#,
         )?;
+
+        // 迁移：早期版本把"单任务连接数"存成固定值（默认 8，且 NOT NULL），
+        // 现在这个字段是"覆盖值"，NULL 才表示跟随全局设置。
+        // SQLite 不能直接改列的约束，只能重建表。
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if version < 1 {
+            let not_null = conn
+                .prepare("PRAGMA table_info(tasks)")?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .find(|(name, _)| name == "max_connections")
+                .map(|(_, notnull)| notnull != 0)
+                .unwrap_or(false);
+
+            if not_null {
+                conn.execute_batch(
+                    r#"
+                    PRAGMA foreign_keys = OFF;
+                    BEGIN;
+                    CREATE TABLE tasks_new (
+                        id              TEXT PRIMARY KEY,
+                        engine          TEXT NOT NULL,
+                        url             TEXT NOT NULL,
+                        filename        TEXT NOT NULL,
+                        dir             TEXT NOT NULL,
+                        status          TEXT NOT NULL,
+                        total_size      INTEGER,
+                        downloaded      INTEGER NOT NULL DEFAULT 0,
+                        referer         TEXT,
+                        user_agent      TEXT,
+                        cookies         TEXT,
+                        headers         TEXT NOT NULL DEFAULT '{}',
+                        max_connections INTEGER,
+                        error           TEXT,
+                        etag            TEXT,
+                        last_modified   TEXT,
+                        accepts_ranges  INTEGER NOT NULL DEFAULT 0,
+                        created_at      TEXT NOT NULL,
+                        updated_at      TEXT NOT NULL
+                    );
+                    INSERT INTO tasks_new
+                        SELECT id, engine, url, filename, dir, status, total_size, downloaded,
+                               referer, user_agent, cookies, headers,
+                               CASE WHEN max_connections = 8 THEN NULL ELSE max_connections END,
+                               error, etag, last_modified, accepts_ranges, created_at, updated_at
+                        FROM tasks;
+                    DROP TABLE tasks;
+                    ALTER TABLE tasks_new RENAME TO tasks;
+                    COMMIT;
+                    PRAGMA foreign_keys = ON;
+                    "#,
+                )?;
+            } else {
+                // 已经是可空的了，只需要把老记录里的默认值 8 清掉
+                conn.execute(
+                    "UPDATE tasks SET max_connections = NULL WHERE max_connections = 8",
+                    [],
+                )?;
+            }
+            conn.execute("PRAGMA user_version = 1", [])?;
+        }
         Ok(())
     }
 
@@ -325,7 +393,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task> {
         user_agent: row.get("user_agent")?,
         cookies: row.get("cookies")?,
         headers,
-        max_connections: row.get::<_, i64>("max_connections")? as u32,
+            max_connections: row
+                .get::<_, Option<i64>>("max_connections")?
+                .map(|v| v as u32),
         error,
         etag: row.get("etag")?,
         last_modified: row.get("last_modified")?,

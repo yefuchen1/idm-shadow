@@ -27,9 +27,10 @@ fn parse_id(raw: &str) -> Result<TaskId, String> {
 pub async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskDto>, String> {
     let tasks = state.manager.list().map_err(|e| e.to_string())?;
     let live = state.manager.live_progress().await;
+    let default_max = state.manager.engine().config().await.max_connections as u32;
     Ok(tasks
         .iter()
-        .map(|t| TaskDto::from_task(t, live.get(&t.id)))
+        .map(|t| TaskDto::from_task(t, live.get(&t.id), default_max))
         .collect())
 }
 

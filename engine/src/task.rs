@@ -128,7 +128,8 @@ pub struct Task {
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
     pub headers: BTreeMap<String, String>,
-    pub max_connections: u32,
+    /// 本任务的连接数覆盖。None = 跟随全局设置。
+    pub max_connections: Option<u32>,
     pub error: Option<TaskError>,
     /// 断点续传用的资源指纹。ETag 变化意味着资源已变，不能续传。
     pub etag: Option<String>,
@@ -194,7 +195,8 @@ pub struct TaskRequest {
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
     pub headers: BTreeMap<String, String>,
-    pub max_connections: u32,
+    /// 单任务连接数覆盖。None = 跟随全局设置。
+    pub max_connections: Option<u32>,
     pub engine: EngineKind,
 }
 
@@ -208,7 +210,7 @@ impl Default for TaskRequest {
             user_agent: None,
             cookies: None,
             headers: BTreeMap::new(),
-            max_connections: 8,
+            max_connections: None,
             engine: EngineKind::Auto,
         }
     }
