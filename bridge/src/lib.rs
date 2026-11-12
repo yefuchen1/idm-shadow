@@ -195,6 +195,25 @@ pub fn router(state: BridgeState) -> Router {
         .with_state(state)
 }
 
+/// 启动本地 HTTP 服务。端口被占用时返回错误。
+pub async fn serve(state: BridgeState, port: u16) -> anyhow::Result<()> {
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    tracing::info!(port, "bridge 已启动");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// 从 `start` 开始找一个空闲端口。
+pub async fn find_free_port(start: u16) -> Option<u16> {
+    for port in start..start.saturating_add(64) {
+        if tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
 async fn health(State(state): State<BridgeState>) -> Json<Value> {
     Json(json!({
         "ok": true,
