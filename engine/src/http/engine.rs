@@ -88,6 +88,33 @@ pub struct EngineCtx {
     pub progress: mpsc::UnboundedSender<TaskProgress>,
 }
 
+/// 引擎在任务结束时返回的原因。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FinishReason {
+    /// 正常下完。
+    Completed,
+    /// 被暂停了。
+    Paused,
+    /// 被用户取消。
+    Cancelled,
+}
+
+impl FinishReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FinishReason::Completed => "completed",
+            FinishReason::Paused => "paused",
+            FinishReason::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for FinishReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl EngineCtx {
     pub fn new(
         cancel: watch::Receiver<bool>,
@@ -536,7 +563,7 @@ async fn worker_loop(
             }
         };
 
-        let Some((mut rstart, mut rend)) = range else {
+        let Some((rstart, rend)) = range else {
             // 没活干，等下一次分配
             tokio::time::sleep(Duration::from_millis(150)).await;
             continue;
@@ -652,27 +679,15 @@ async fn worker_loop(
             window_start = Instant::now();
         }
 
-        // 5. 重新同步区间（可能被重分割或释放）
+        // 5. 重新领活。
+        // 区间被缩短或释放时，下一轮会重新拿到区间并按新区间发请求，
+        // 所以这里不需要保留旧状态。
         let current = shared.segmenter.lock().await.current_range(id);
         match current {
-            Some((s, e)) if s >= rend => {
-                // 这一段下完了，重新领活
-                continue;
+            Some((s, e)) if e <= s => {
+                shared.segmenter.lock().await.release(id);
             }
-            Some((s, e)) => {
-                if e <= s {
-                    shared.segmenter.lock().await.release(id);
-                } else {
-                    // 区间被缩短了，按新区间重新发请求，从 s 接着下
-                    rstart = s;
-                    rend = e;
-                    written = 0;
-                }
-            }
-            None => {
-                // 区间被释放或已完成，重新领活
-                continue;
-            }
+            _ => {}
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! 桌面应用和本地 HTTP API 都通过它操作任务，保证两条入口看到同一份状态。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,17 +28,29 @@ pub enum TaskEvent {
 
 struct Running {
     cancel: watch::Sender<bool>,
+    /// 用户对当前任务的意图。引擎只知道"被叫停了"，
+    /// 是暂停还是取消，得由这里记账。
+    intent: Arc<Mutex<Intent>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Intent {
+    Active,
+    Paused,
+    Cancelled,
 }
 
 pub struct DownloadManager {
     store: Arc<Store>,
     engine: Arc<HttpEngine>,
-    running: Mutex<HashMap<TaskId, Running>>,
+    running: Arc<Mutex<HashMap<TaskId, Running>>>,
+    /// 正在收尾的任务。收尾期间不接受新的 pause/cancel 意图。
+    finishing: Arc<Mutex<HashSet<TaskId>>>,
     /// 实时进度快照，UI 与桥接接口读它拿速度。
     live: Arc<Mutex<HashMap<TaskId, TaskProgress>>>,
     events: broadcast::Sender<TaskEvent>,
     limiter: Arc<RateLimiter>,
-    default_dir: PathBuf,
+    default_dir: tokio::sync::RwLock<PathBuf>,
 }
 
 impl DownloadManager {
@@ -49,11 +61,12 @@ impl DownloadManager {
         Ok(Self {
             store,
             engine,
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
+            finishing: Arc::new(Mutex::new(HashSet::new())),
             live: Arc::new(Mutex::new(HashMap::new())),
             events,
             limiter: Arc::new(RateLimiter::new(None)),
-            default_dir,
+        default_dir: tokio::sync::RwLock::new(default_dir),
         })
     }
 
@@ -79,12 +92,12 @@ impl DownloadManager {
         self.engine.set_global_limit(limit);
     }
 
-    pub fn set_default_dir(&mut self, dir: PathBuf) {
-        self.default_dir = dir;
+    pub async fn set_default_dir(&self, dir: PathBuf) {
+        *self.default_dir.write().await = dir;
     }
 
-    pub fn default_dir(&self) -> &PathBuf {
-        &self.default_dir
+    pub async fn default_dir(&self) -> PathBuf {
+        self.default_dir.read().await.clone()
     }
 
     /// 新建任务。落到队列里等待启动。
@@ -93,11 +106,12 @@ impl DownloadManager {
             return Err(anyhow!("URL 不能为空"));
         }
 
+        let default_dir = self.default_dir().await;
         let dir = req
             .dir
             .as_ref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.default_dir.clone());
+            .unwrap_or(default_dir);
 
         let filename = req
             .filename
@@ -128,6 +142,11 @@ impl DownloadManager {
             }
         }
 
+        // 收尾中的任务不接受重新启动
+        if self.finishing.lock().await.contains(&id) {
+            return Err(anyhow!("任务正在收尾，请稍候"));
+        }
+
         let task = self
             .store
             .get_task(id)?
@@ -138,19 +157,27 @@ impl DownloadManager {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let intent = Arc::new(Mutex::new(Intent::Active));
         self.running
             .lock()
             .await
             .insert(id, Running {
                 cancel: cancel_tx.clone(),
+                intent: intent.clone(),
             });
 
         let store = self.store.clone();
         let engine = self.engine.clone();
         let events = self.events.clone();
         let live = self.live.clone();
+        let task_intent = intent.clone();
+        let running = self.running.clone();
+        let finishing = self.finishing.clone();
 
         tokio::spawn(async move {
+            let manager_finishing = finishing.clone();
+            manager_finishing.lock().await.insert(id);
+
             let (progress_tx, mut progress_rx) =
                 tokio::sync::mpsc::unbounded_channel::<TaskProgress>();
 
@@ -173,31 +200,40 @@ impl DownloadManager {
                 crate::http::engine::EngineCtx::new(cancel_rx, cancel_tx.clone(), progress_tx);
             let result = engine.download(&task, ctx).await;
 
-            match result {
-                Ok(()) => {
+            let intent = *task_intent.lock().await;
+
+            match (result, intent) {
+                (Ok(()), _) => {
                     let _ = store.set_status(id, TaskStatus::Completed, None);
                     let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Completed));
                     tracing::info!(task = %id, "任务完成");
                 }
-                Err(err) => {
-                    let cancelled = err.to_string().contains("已取消");
-                    let status = if cancelled {
-                        TaskStatus::Cancelled
-                    } else {
-                        TaskStatus::Error
-                    };
-                    let error = if cancelled {
-                        None
-                    } else {
-                        Some(TaskError::new("download_failed", err.to_string()))
-                    };
-                    let _ = store.set_status(id, status, error.as_ref());
-                    let _ = events.send(TaskEvent::StatusChanged(id, status));
+                (Err(_), Intent::Paused) => {
+                    // 暂停：保留已完成区间，等用户继续
+                    let _ = store.set_status(id, TaskStatus::Paused, None);
+                    let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Paused));
+                    tracing::info!(task = %id, "任务已暂停");
+                }
+                (Err(_), Intent::Cancelled) => {
+                    let _ = store.set_status(id, TaskStatus::Cancelled, None);
+                    let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Cancelled));
+                    tracing::info!(task = %id, "任务已取消");
+                }
+                (Err(err), Intent::Active) => {
+                    let error = Some(TaskError::new("download_failed", err.to_string()));
+                    let _ = store.set_status(id, TaskStatus::Error, error.as_ref());
+                    let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Error));
                     tracing::warn!(task = %id, "任务失败: {err}");
                 }
             }
 
-            progress_task.abort();
+            // 通道已经关闭，这里 recv 会立刻返回 None，等它把队列里
+            // 最后一条进度消息处理完再收工。
+            let _ = progress_task.await;
+
+            // 任务结束：从运行表里摘掉，这样"继续"才能重新启动它。
+            running.lock().await.remove(&id);
+            manager_finishing.lock().await.remove(&id);
         });
 
         Ok(())
@@ -207,6 +243,7 @@ impl DownloadManager {
     pub async fn pause(&self, id: TaskId) -> Result<()> {
         let running = self.running.lock().await;
         if let Some(r) = running.get(&id) {
+            *r.intent.lock().await = Intent::Paused;
             let _ = r.cancel.send(true);
         }
         drop(running);
@@ -227,6 +264,7 @@ impl DownloadManager {
     pub async fn cancel(&self, id: TaskId) -> Result<()> {
         let running = self.running.lock().await;
         if let Some(r) = running.get(&id) {
+            *r.intent.lock().await = Intent::Cancelled;
             let _ = r.cancel.send(true);
         }
         drop(running);

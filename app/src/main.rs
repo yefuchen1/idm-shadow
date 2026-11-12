@@ -78,7 +78,9 @@ fn main() {
 
             // 恢复上次的设置
             if let Some(dir) = store.get_setting("download_dir")? {
-                manager.set_default_dir(std::path::PathBuf::from(dir));
+                tauri::async_runtime::block_on(
+                    manager.set_default_dir(std::path::PathBuf::from(dir)),
+                );
             }
             if let Some(limit) = store
                 .get_setting("global_limit")?
@@ -87,19 +89,23 @@ fn main() {
                 manager.set_global_limit(if limit == 0 { None } else { Some(limit) });
             }
 
-            // token：优先用上次存的，没有就生成一个新的
-            let token = match store.get_setting("bridge_token")? {
-                Some(t) if !t.is_empty() => t,
-                _ => {
-                    let t = make_token();
-                    store.set_setting("bridge_token", &t)?;
-                    t
-                }
+            // token：环境变量 > 上次存的 > 新生成的。
+            // 环境变量方便脚本化调用和自动化测试。
+            let token = match std::env::var("IDM_SHADOW_TOKEN") {
+                Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                _ => match store.get_setting("bridge_token")? {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        let t = make_token();
+                        store.set_setting("bridge_token", &t)?;
+                        t
+                    }
+                },
             };
 
             // 本地 HTTP API
-            let port = idm_shadow_bridge::find_free_port(16888)
-                .await
+            // setup 回调是同步的，这里用 Tauri 的阻塞运行时跑一小段异步。
+            let port = tauri::async_runtime::block_on(idm_shadow_bridge::find_free_port(16888))
                 .unwrap_or(16888);
             store.set_setting("bridge_port", &port.to_string())?;
 

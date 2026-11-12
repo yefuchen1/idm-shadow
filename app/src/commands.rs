@@ -99,7 +99,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsDto, Str
     Ok(SettingsDto {
         port: state.bridge_port,
         token: state.token.clone(),
-        download_dir: state.manager.default_dir().to_string_lossy().to_string(),
+        download_dir: state.manager.default_dir().await.to_string_lossy().to_string(),
     })
 }
 

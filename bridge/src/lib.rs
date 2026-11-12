@@ -400,7 +400,7 @@ async fn get_settings(State(state): State<BridgeState>) -> Result<Json<Value>, A
         .map_err(|e| ApiError::new("internal", e.to_string()))?;
     Ok(Json(json!({
         "port": state.port,
-        "download_dir": state.manager.default_dir().to_string_lossy(),
+        "download_dir": state.manager.default_dir().await.to_string_lossy(),
         "settings": settings,
     })))
 }

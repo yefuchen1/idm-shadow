@@ -12,7 +12,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
 
     let menu = Menu::with_items(app, &[&show, &pause_all, &resume_all, &quit])?;
 
-    let mut builder = TrayIconBuilder::with_id("main")
+    let builder = TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().cloned().unwrap())
         .menu(&menu)
         .show_menu_on_left_click(false)
