@@ -65,6 +65,9 @@ impl Store {
                 etag            TEXT,
                 last_modified   TEXT,
                 accepts_ranges  INTEGER NOT NULL DEFAULT 0,
+                staging_path    TEXT,
+                final_path      TEXT,
+                needs_confirm   INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
@@ -129,6 +132,9 @@ impl Store {
                         etag            TEXT,
                         last_modified   TEXT,
                         accepts_ranges  INTEGER NOT NULL DEFAULT 0,
+                        staging_path    TEXT,
+                        final_path      TEXT,
+                        needs_confirm   INTEGER NOT NULL DEFAULT 0,
                         created_at      TEXT NOT NULL,
                         updated_at      TEXT NOT NULL
                     );
@@ -136,7 +142,9 @@ impl Store {
                         SELECT id, engine, url, filename, dir, status, total_size, downloaded,
                                referer, user_agent, cookies, headers,
                                CASE WHEN max_connections = 8 THEN NULL ELSE max_connections END,
-                               error, etag, last_modified, accepts_ranges, created_at, updated_at
+                               error, etag, last_modified, accepts_ranges,
+                               staging_path, final_path, needs_confirm,
+                               created_at, updated_at
                         FROM tasks;
                     DROP TABLE tasks;
                     ALTER TABLE tasks_new RENAME TO tasks;
@@ -153,6 +161,12 @@ impl Store {
             }
             conn.execute("PRAGMA user_version = 1", [])?;
         }
+
+        // v2：IDM 式确认流程需要暂存路径、最终路径与确认标记
+        add_column_if_missing(conn, "staging_path", "TEXT")?;
+        add_column_if_missing(conn, "final_path", "TEXT")?;
+        add_column_if_missing(conn, "needs_confirm", "INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute("PRAGMA user_version = 2", [])?;
         Ok(())
     }
 
@@ -167,8 +181,10 @@ impl Store {
             INSERT INTO tasks (
                 id, engine, url, filename, dir, status, total_size, downloaded,
                 referer, user_agent, cookies, headers, max_connections, error,
-                etag, last_modified, accepts_ranges, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                etag, last_modified, accepts_ranges,
+                staging_path, final_path, needs_confirm, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                      ?18, ?19, ?20, ?21, ?22)
             "#,
             params![
                 task.id.to_string(),
@@ -188,6 +204,9 @@ impl Store {
                 task.etag,
                 task.last_modified,
                 task.accepts_ranges as i64,
+                task.staging_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                task.final_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                task.needs_confirm as i64,
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
             ],
@@ -204,7 +223,8 @@ impl Store {
                 total_size = ?7, downloaded = ?8, referer = ?9, user_agent = ?10,
                 cookies = ?11, headers = ?12, max_connections = ?13, error = ?14,
                 etag = ?15, last_modified = ?16, accepts_ranges = ?17,
-                updated_at = ?18
+                staging_path = ?18, final_path = ?19, needs_confirm = ?20,
+                updated_at = ?21
             WHERE id = ?1
             "#,
             params![
@@ -225,6 +245,9 @@ impl Store {
                 task.etag,
                 task.last_modified,
                 task.accepts_ranges as i64,
+                task.staging_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                task.final_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                task.needs_confirm as i64,
                 task.updated_at.to_rfc3339(),
             ],
         )?;
@@ -400,6 +423,13 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task> {
         etag: row.get("etag")?,
         last_modified: row.get("last_modified")?,
         accepts_ranges: row.get::<_, i64>("accepts_ranges")? != 0,
+        staging_path: row
+            .get::<_, Option<String>>("staging_path")?
+            .map(PathBuf::from),
+        final_path: row
+            .get::<_, Option<String>>("final_path")?
+            .map(PathBuf::from),
+        needs_confirm: row.get::<_, i64>("needs_confirm")? != 0,
         created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),
@@ -407,6 +437,22 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task> {
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),
     })
+}
+
+/// 加一列（不存在才加）。SQLite 没有 `ADD COLUMN IF NOT EXISTS`。
+fn add_column_if_missing(conn: &Connection, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if names.iter().any(|n| n == column) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "ALTER TABLE tasks ADD COLUMN {column} {decl};"
+    ))?;
+    Ok(())
 }
 
 #[cfg(test)]

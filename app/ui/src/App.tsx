@@ -46,6 +46,8 @@ export default function App() {
     filename: string;
   } | null>(null);
   const [deleteFile, setDeleteFile] = useState(true);
+  const [confirmTarget, setConfirmTarget] = useState<TaskDto | null>(null);
+  const [confirmDir, setConfirmDir] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -140,6 +142,48 @@ export default function App() {
         t.filename.toLowerCase().includes(q) || t.url.toLowerCase().includes(q)
     );
   }, [tasks, query]);
+
+  // 有任务在等确认，就弹窗。下载这时候已经在跑了。
+  useEffect(() => {
+    const pending = tasks.find(
+      (t) => t.needs_confirm && t.status === "awaiting_confirm"
+    );
+    if (pending && !confirmTarget) {
+      setConfirmTarget(pending);
+      setConfirmDir(settings?.download_dir ?? "");
+    }
+  }, [tasks, confirmTarget, settings]);
+
+  async function confirmDownload(useCustomDir: boolean) {
+    if (!confirmTarget) return;
+    const target = confirmTarget;
+    const dir = confirmDir.trim();
+    setConfirmTarget(null);
+    await guard(async () => {
+      await api.confirmTask(
+        target.id,
+        useCustomDir && dir ? dir : undefined
+      );
+    });
+  }
+
+  async function cancelDownload() {
+    if (!confirmTarget) return;
+    const target = confirmTarget;
+    setConfirmTarget(null);
+    await guard(() => api.cancelConfirmedTask(target.id));
+  }
+
+  async function pickConfirmDir() {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: confirmDir
+    });
+    if (typeof picked === "string") {
+      setConfirmDir(picked);
+    }
+  }
 
   async function submit() {
     const value = url.trim();
@@ -568,6 +612,49 @@ export default function App() {
               </button>
               <button className="btn danger" onClick={confirmDelete}>
                 删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmTarget && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h2>下载此文件</h2>
+            <p className="modal-text">{confirmTarget.filename}</p>
+            <div className="confirm-actions">
+              <button
+                className="btn primary"
+                onClick={() => confirmDownload(false)}
+              >
+                直接下载
+              </button>
+              <button
+                className="btn"
+                onClick={() => confirmDownload(true)}
+              >
+                另存为…
+              </button>
+            </div>
+            <div className="confirm-dir">
+              <input
+                className="dir-input"
+                placeholder="保存位置"
+                value={confirmDir}
+                onChange={(e) => setConfirmDir(e.target.value)}
+              />
+              <button
+                className="btn small"
+                title="浏览文件夹"
+                onClick={pickConfirmDir}
+              >
+                <FolderCog size={13} />
+              </button>
+            </div>
+            <div className="modal-actions">
+              <button className="btn" onClick={cancelDownload}>
+                取消
               </button>
             </div>
           </div>

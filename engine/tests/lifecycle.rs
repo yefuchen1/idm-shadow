@@ -397,3 +397,170 @@ async fn raising_the_limit_lets_queued_tasks_start() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn confirm_flow_stages_then_transfers_to_chosen_path() {
+    let body: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/c.bin"),
+            filename: Some("c.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 需要确认时，暂存路径要准备好，状态是待确认
+    let created = mgr.get(task.id).unwrap().unwrap();
+    assert!(created.needs_confirm);
+    assert_eq!(created.status, TaskStatus::AwaitingConfirm);
+    assert!(created.staging_path.is_some(), "应当准备好暂存路径");
+
+    // 确认到一个别的目录
+    let custom = dir.join("custom");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("c.bin")))
+        .await
+        .unwrap();
+
+    let confirmed = mgr.get(task.id).unwrap().unwrap();
+    assert!(!confirmed.needs_confirm);
+    assert!(confirmed.final_path.is_some());
+
+    // 开始下载，等它完成
+    mgr.start(task.id).await.unwrap();
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "任务应当下载完成");
+
+    // 文件应当出现在用户选的位置
+    let final_file = custom.join("c.bin");
+    assert!(final_file.exists(), "文件应当转存到用户选择的位置");
+    let content = std::fs::read(&final_file).unwrap();
+    assert!(content == body, "转存后的文件内容必须一致");
+
+    // 暂存文件应当已经不在了
+    let staging = confirmed.staging_path.clone().unwrap();
+    assert!(!staging.exists(), "暂存文件应当被转存掉");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn cancel_with_cleanup_removes_staged_file() {
+    let body: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-cancel");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/x.bin"),
+            filename: Some("x.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    mgr.start(task.id).await.unwrap();
+    // 等它写了一点到暂存文件
+    let started = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.downloaded > 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(started, "下载应当已经开始");
+
+    let staging = mgr.get(task.id).unwrap().unwrap().staging_path.clone().unwrap();
+    assert!(staging.exists(), "暂存文件应该存在");
+
+    mgr.cancel_with_cleanup(task.id).await.unwrap();
+
+    assert!(!staging.exists(), "取消后暂存文件应当被删掉");
+    let after = mgr.get(task.id).unwrap().unwrap();
+    assert_eq!(after.status, TaskStatus::Cancelled);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn confirm_before_start_still_transfers_to_chosen_path() {
+    // 回归测试：用户抢在下载启动之前就确认了保存位置。
+    // 那时任务还没进 running 表，内存槽是空的，
+    // 路径只能从数据库里读回来。之前这里会丢路径，文件落到默认目录。
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-early");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/early.bin"),
+            filename: Some("early.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 先确认，再启动
+    let custom = dir.join("early-target");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("early.bin")))
+        .await
+        .unwrap();
+
+    mgr.start(task.id).await.unwrap();
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "任务应当下载完成");
+
+    let final_file = custom.join("early.bin");
+    assert!(final_file.exists(), "文件应当转存到用户选的位置");
+    let content = std::fs::read(&final_file).unwrap();
+    assert!(content == body, "转存后的内容必须一致");
+
+    // 默认目录里不该有残留
+    assert!(!dir.join("early.bin").exists(), "默认目录不该有文件");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

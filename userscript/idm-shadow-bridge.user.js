@@ -109,6 +109,8 @@
         headers: opts.headers || {},
         engine: opts.engine || 'auto',
         maxConnections: opts.maxConnections,
+        // 让应用弹保存位置确认框（IDM 式流程）
+        needsConfirm: opts.needsConfirm !== false,
         autostart: true
       };
 

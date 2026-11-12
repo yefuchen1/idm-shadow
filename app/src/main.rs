@@ -207,6 +207,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::list_tasks,
             commands::add_task,
+            commands::confirm_task,
+            commands::cancel_confirmed_task,
             commands::pause_task,
             commands::resume_task,
             commands::cancel_task,

@@ -6,6 +6,7 @@ export type TaskStatus =
   | "downloading"
   | "retrying"
   | "paused"
+  | "awaiting_confirm"
   | "completed"
   | "error"
   | "cancelled";
@@ -23,6 +24,7 @@ export interface TaskDto {
   connections: number;
   max_connections: number;
   error: string | null;
+  needs_confirm: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -41,6 +43,10 @@ export const api = {
   listTasks: () => invoke<TaskDto[]>("list_tasks"),
   addTask: (url: string, filename?: string, dir?: string) =>
     invoke<string>("add_task", { url, filename, dir }),
+  confirmTask: (id: string, path?: string) =>
+    invoke<void>("confirm_task", { id, path }),
+  cancelConfirmedTask: (id: string) =>
+    invoke<void>("cancel_confirmed_task", { id }),
   pauseTask: (id: string) => invoke<void>("pause_task", { id }),
   resumeTask: (id: string) => invoke<void>("resume_task", { id }),
   cancelTask: (id: string) => invoke<void>("cancel_task", { id }),
@@ -101,6 +107,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   downloading: "下载中",
   retrying: "重试中",
   paused: "已暂停",
+  awaiting_confirm: "待确认",
   completed: "已完成",
   error: "出错",
   cancelled: "已取消"

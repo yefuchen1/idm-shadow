@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{broadcast, watch, Mutex};
 use uuid::Uuid;
 
@@ -31,6 +31,9 @@ struct Running {
     /// 用户对当前任务的意图。引擎只知道"被叫停了"，
     /// 是暂停还是取消，得由这里记账。
     intent: Arc<Mutex<Intent>>,
+    /// 用户确认的最终保存位置。None = 用默认位置。
+    /// 下载完成后据此转存。
+    final_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -201,7 +204,16 @@ impl DownloadManager {
             .unwrap_or(filename);
 
         let id = Uuid::new_v4();
-        let task = Task::new(id, req, dir, filename);
+        let mut task = Task::new(id, req, dir, filename);
+
+        // 需要确认保存位置的：先写到暂存文件，用户选完再转存。
+        // 暂存目录和最终目录同卷，转存时 rename 是原子操作。
+        if task.needs_confirm {
+            let staging_dir = task.staging_dir();
+            std::fs::create_dir_all(&staging_dir).ok();
+            task.staging_path = Some(staging_dir.join(format!("{id}.part")));
+            task.status = TaskStatus::AwaitingConfirm;
+        }
         self.inner.store.insert_task(&task)?;
         self.inner.events
             .send(TaskEvent::StatusChanged(id, TaskStatus::Queued))
@@ -250,12 +262,17 @@ impl DownloadManager {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let intent = Arc::new(Mutex::new(Intent::Active));
+        // 用户确认的最终位置。confirm_path 会往里写，
+        // 下载完成后据此转存暂存文件。
+        let final_path: Arc<Mutex<Option<PathBuf>>> =
+            Arc::new(Mutex::new(task.final_path.clone()));
         self.inner.running
             .lock()
             .await
             .insert(id, Running {
                 cancel: cancel_tx.clone(),
                 intent: intent.clone(),
+                final_path: final_path.clone(),
             });
 
         let store = self.inner.store.clone();
@@ -312,6 +329,30 @@ impl DownloadManager {
             let result = engine.download(&task, ctx).await;
 
             let intent = *task_intent.lock().await;
+
+            // 下载完成后转存：把暂存文件挪到用户确认的位置。
+            if matches!(result, Ok(())) {
+                // 优先用内存里的确认结果；拿不到就读数据库。
+                // 用户可能在任务启动之前就确认了，那时内存槽是空的，
+                // 但数据库里已经记下了最终位置。
+                let mut target = final_path.lock().await.clone();
+                if target.is_none() {
+                    if let Ok(Some(fresh)) = store.get_task(id) {
+                        target = fresh.final_path.clone();
+                    }
+                }
+                if let Err(err) = finalize_download(&task, target.as_ref()).await {
+                    tracing::error!(task = %id, "转存失败: {err}");
+                    let error = Some(TaskError::new("finalize_failed", err.to_string()));
+                    let _ = store.set_status(id, TaskStatus::Error, error.as_ref());
+                    let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Error));
+                    let _ = progress_task.await;
+                    let _ = phase_task.await;
+                    running.lock().await.remove(&id);
+                    manager_finishing.lock().await.remove(&id);
+                    return;
+                }
+            }
 
             match (result, intent) {
                 (Ok(()), _) => {
@@ -371,6 +412,60 @@ impl DownloadManager {
     pub async fn resume(&self, id: TaskId) -> Result<()> {
         self.inner.store.set_status(id, TaskStatus::Queued, None)?;
         self.start(id).await
+    }
+
+    /// 用户确认保存位置。
+    ///
+    /// `path` 为 None 表示"直接下载"，用默认目录。
+    /// 转存在下载完成时执行。
+    pub async fn confirm_path(&self, id: TaskId, path: Option<PathBuf>) -> Result<()> {
+        let mut task = self
+            .inner
+            .store
+            .get_task(id)?
+            .ok_or_else(|| anyhow!("任务不存在"))?;
+
+        let running = self.inner.running.lock().await;
+        if let Some(r) = running.get(&id) {
+            *r.final_path.lock().await = path.clone();
+        }
+        drop(running);
+
+        // 任务还没进 running 表（用户抢在下载启动前就确认了）：
+        // 把路径存进任务本身，start 时会带上它。
+
+        // 落库，重启后也知道最终位置
+        task.final_path = path.clone();
+        task.needs_confirm = false;
+        self.inner.store.update_task(&task)?;
+
+        // 已经进入 AwaitingConfirm 的，改回正常状态
+        if task.status == TaskStatus::AwaitingConfirm {
+            self.inner
+                .store
+                .set_status(id, TaskStatus::Downloading, None)?;
+            self.inner
+                .events
+                .send(TaskEvent::StatusChanged(id, TaskStatus::Downloading))
+                .ok();
+        }
+        Ok(())
+    }
+
+    /// 用户取消（带确认弹窗的那种）。会删掉已下载的暂存文件。
+    pub async fn cancel_with_cleanup(&self, id: TaskId) -> Result<()> {
+        self.cancel(id).await?;
+
+        // 删掉暂存文件
+        if let Ok(Some(task)) = self.inner.store.get_task(id) {
+            if let Some(staging) = task.staging_path {
+                let _ = tokio::fs::remove_file(&staging).await;
+                if let Some(dir) = staging.parent() {
+                    let _ = tokio::fs::remove_dir(dir).await;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 取消任务。
@@ -474,6 +569,47 @@ pub fn default_download_dir() -> PathBuf {
         }
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// 下载完成后的收尾：把暂存文件挪到最终位置。
+///
+/// 没有暂存文件（不需要确认的流程）就直接返回。
+/// 转存用 rename：同一卷内是原子操作，10GB 文件也是瞬间完成。
+async fn finalize_download(task: &Task, target: Option<&PathBuf>) -> Result<()> {
+    let Some(staging) = task.staging_path.as_ref() else {
+        return Ok(());
+    };
+
+    let final_path = match target {
+        Some(p) => p.clone(),
+        None => task.target_path(),
+    };
+
+    if !staging.exists() {
+        // 没有暂存文件，说明已经转存过了
+        return Ok(());
+    }
+
+    if let Some(parent) = final_path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    // 同卷用 rename，跨卷 rename 会失败，这时退回"复制 + 删除"
+    match tokio::fs::rename(staging, &final_path).await {
+        Ok(()) => {}
+        Err(_) => {
+            tokio::fs::copy(staging, &final_path)
+                .await
+                .with_context(|| format!("转存到 {} 失败", final_path.display()))?;
+            let _ = tokio::fs::remove_file(staging).await;
+        }
+    }
+
+    // 清掉暂存目录（空了就删）
+    if let Some(staging_dir) = task.staging_path.as_ref().and_then(|p| p.parent()) {
+        let _ = tokio::fs::remove_dir(staging_dir).await;
+    }
+    Ok(())
 }
 
 /// 引擎类型探测：URL 或响应看起来像 HLS 就走 HLS 引擎。

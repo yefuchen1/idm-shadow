@@ -241,7 +241,7 @@ impl HttpEngine {
         meta: &ResourceMeta,
         ctx: EngineCtx,
     ) -> Result<()> {
-        let path = task.target_path();
+        let path = task.write_path();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
@@ -318,7 +318,7 @@ impl HttpEngine {
         done: IntervalSet,
         ctx: EngineCtx,
     ) -> Result<()> {
-        let path = task.target_path();
+        let path = task.write_path();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }

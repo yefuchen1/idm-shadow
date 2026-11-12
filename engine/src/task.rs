@@ -48,6 +48,8 @@ pub enum TaskStatus {
     Downloading,
     Retrying,
     Paused,
+    /// 等用户确认保存位置。此时下载可能已经在进行中。
+    AwaitingConfirm,
     Completed,
     Error,
     Cancelled,
@@ -61,6 +63,7 @@ impl TaskStatus {
             TaskStatus::Downloading => "downloading",
             TaskStatus::Retrying => "retrying",
             TaskStatus::Paused => "paused",
+            TaskStatus::AwaitingConfirm => "awaiting_confirm",
             TaskStatus::Completed => "completed",
             TaskStatus::Error => "error",
             TaskStatus::Cancelled => "cancelled",
@@ -74,6 +77,7 @@ impl TaskStatus {
             "downloading" => Some(TaskStatus::Downloading),
             "retrying" => Some(TaskStatus::Retrying),
             "paused" => Some(TaskStatus::Paused),
+            "awaiting_confirm" => Some(TaskStatus::AwaitingConfirm),
             "completed" => Some(TaskStatus::Completed),
             "error" => Some(TaskStatus::Error),
             "cancelled" => Some(TaskStatus::Cancelled),
@@ -135,6 +139,13 @@ pub struct Task {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub accepts_ranges: bool,
+    /// 下载先写到这个暂存文件，用户确认后才转存到 `dir/filename`。
+    /// 与最终位置同卷，改名是原子操作。
+    pub staging_path: Option<PathBuf>,
+    /// 用户确认的最终保存位置。None = 用默认位置（不需要转存）。
+    pub final_path: Option<PathBuf>,
+    /// 是否需要用户确认保存位置（IDM 式弹窗流程）。
+    pub needs_confirm: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -156,10 +167,13 @@ impl Task {
             cookies: req.cookies,
             headers: req.headers,
             max_connections: req.max_connections,
+            needs_confirm: req.needs_confirm,
             error: None,
             etag: None,
             last_modified: None,
             accepts_ranges: false,
+            staging_path: None,
+            final_path: None,
             created_at: now,
             updated_at: now,
         }
@@ -168,6 +182,18 @@ impl Task {
     /// 目标文件的完整路径。
     pub fn target_path(&self) -> PathBuf {
         self.dir.join(&self.filename)
+    }
+
+    /// 实际写入的路径：有暂存文件就写暂存文件，否则写最终位置。
+    pub fn write_path(&self) -> PathBuf {
+        self.staging_path
+            .clone()
+            .unwrap_or_else(|| self.target_path())
+    }
+
+    /// 暂存文件所在的目录。
+    pub fn staging_dir(&self) -> PathBuf {
+        self.dir.join(".idmshadow")
     }
 
     /// 已下载比例（0.0 ~ 1.0）。总大小未知时返回 0。
@@ -197,6 +223,8 @@ pub struct TaskRequest {
     pub headers: BTreeMap<String, String>,
     /// 单任务连接数覆盖。None = 跟随全局设置。
     pub max_connections: Option<u32>,
+    /// 是否需要用户确认保存位置（IDM 式弹窗流程）。
+    pub needs_confirm: bool,
     pub engine: EngineKind,
 }
 
@@ -211,6 +239,7 @@ impl Default for TaskRequest {
             cookies: None,
             headers: BTreeMap::new(),
             max_connections: None,
+            needs_confirm: false,
             engine: EngineKind::Auto,
         }
     }

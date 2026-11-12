@@ -130,7 +130,9 @@ async function capture(item) {
     userAgent: navigator.userAgent,
     cookies: await cookieHeader(url),
     engine: 'auto',
-    autostart: true
+    autostart: true,
+    // 让应用弹保存位置确认框（IDM 式流程）
+    needs_confirm: true
   };
 
   try {

@@ -56,6 +56,23 @@
         error: "服务器不支持 Range，无法分段",
         created_at: "2026-11-13T00:00:00Z",
         updated_at: "2026-11-13T00:00:00Z"
+      },
+      {
+        id: "demo-4",
+        engine: "http",
+        url: "https://example.com/awaiting.bin",
+        filename: "awaiting.bin",
+        path: "C:/Users/ROG/Downloads/awaiting.bin",
+        status: "awaiting_confirm",
+        total_size: 1024 * 1024 * 128,
+        downloaded: 1024 * 1024 * 12,
+        speed: 3 * 1024 * 1024,
+        connections: 16,
+        max_connections: 16,
+        error: null,
+        needs_confirm: true,
+        created_at: "2026-11-13T00:00:00Z",
+        updated_at: "2026-11-13T00:00:00Z"
       }
     ];
 
@@ -79,6 +96,23 @@
           case "update_settings":
             Object.assign(settings, args || {});
             return null;
+          case "confirm_task": {
+            // 真实实现会清掉 needs_confirm 并把状态改回 downloading
+            const t = tasks.find((x) => x.id === args.id);
+            if (t) {
+              t.needs_confirm = false;
+              t.status = "downloading";
+            }
+            return null;
+          }
+          case "cancel_confirmed_task": {
+            const t = tasks.find((x) => x.id === args.id);
+            if (t) {
+              t.needs_confirm = false;
+              t.status = "cancelled";
+            }
+            return null;
+          }
           case "remove_task":
             return null;
           case "pause_task":

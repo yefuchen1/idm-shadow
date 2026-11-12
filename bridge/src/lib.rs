@@ -75,6 +75,8 @@ pub struct TaskDto {
     pub connections: usize,
     pub max_connections: u32,
     pub error: Option<String>,
+    /// 是否在等用户确认保存位置。
+    pub needs_confirm: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -101,6 +103,7 @@ impl TaskDto {
                 .max_connections
                 .unwrap_or(default_max_connections),
             error: task.error.as_ref().map(|e| e.message.clone()),
+            needs_confirm: task.needs_confirm,
             created_at: task.created_at.to_rfc3339(),
             updated_at: task.updated_at.to_rfc3339(),
         }
@@ -114,15 +117,22 @@ pub struct CreateTaskBody {
     pub filename: Option<String>,
     pub dir: Option<String>,
     pub referer: Option<String>,
+    /// 浏览器侧习惯用驼峰，所以两种拼法都认。
+    #[serde(alias = "userAgent")]
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// 浏览器侧习惯用驼峰，所以两种拼法都认。
+    #[serde(alias = "maxConnections")]
     pub max_connections: Option<u32>,
     pub engine: Option<String>,
     /// 是否立即开始下载，默认 true。
     #[serde(default = "default_true")]
     pub autostart: bool,
+    /// 是否弹出保存位置确认（IDM 式流程）。默认 false。
+    #[serde(default, alias = "needsConfirm")]
+    pub needs_confirm: bool,
 }
 
 fn default_true() -> bool {
@@ -141,6 +151,7 @@ impl CreateTaskBody {
             headers: self.headers.into_iter().collect(),
             // None = 跟随全局设置
             max_connections: self.max_connections.map(|v| v.clamp(1, 64)),
+            needs_confirm: self.needs_confirm,
             engine: self
                 .engine
                 .as_deref()
@@ -190,6 +201,8 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/v1/tasks/:id/resume", post(resume_task))
         .route("/api/v1/tasks/:id/cancel", post(cancel_task))
         .route("/api/v1/tasks/:id/retry", post(retry_task))
+        .route("/api/v1/tasks/:id/confirm", post(confirm_task))
+        .route("/api/v1/tasks/:id/cancel-confirmed", post(cancel_confirmed_task))
         .route("/api/v1/settings", get(get_settings))
         .route("/api/v1/settings", post(update_settings))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -397,6 +410,59 @@ async fn retry_task(
         .retry(id)
         .await
         .map_err(|e| ApiError::new("internal", e.to_string()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 用户确认保存位置。
+///
+/// `path` 为空表示"直接下载"，用默认目录；
+/// 给了路径就下载完成后转存到那里。
+#[derive(Debug, Default, Deserialize)]
+pub struct ConfirmBody {
+    pub path: Option<String>,
+    /// 只给了目录时，用它加上原文件名。
+    pub dir: Option<String>,
+}
+
+async fn confirm_task(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    Json(body): Json<ConfirmBody>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse_id(&id)?;
+
+    let path = match (body.path, body.dir) {
+        (Some(p), _) if !p.trim().is_empty() => Some(std::path::PathBuf::from(p)),
+        (None, Some(d)) if !d.trim().is_empty() => {
+            let task = state
+                .manager
+                .get(id)
+                .map_err(|e| ApiError::new("internal", e.to_string()))?
+                .ok_or_else(|| ApiError::new("not_found", "任务不存在"))?;
+            Some(std::path::PathBuf::from(d).join(&task.filename))
+        }
+        _ => None,
+    };
+
+    state
+        .manager
+        .confirm_path(id, path)
+        .await
+        .map_err(|e| ApiError::new("confirm_failed", e.to_string()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 用户在确认弹窗里点了取消。已下载的暂存文件会被删掉。
+async fn cancel_confirmed_task(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse_id(&id)?;
+    state
+        .manager
+        .cancel_with_cleanup(id)
+        .await
+        .map_err(|e| ApiError::new("cancel_failed", e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 

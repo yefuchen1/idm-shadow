@@ -149,6 +149,8 @@ await test('捕获下载时 POST 到 bridge，附带 Cookie 与 UA', async () =>
   assert.equal(body.referer, 'https://example.com/page');
   assert.equal(body.cookies, 'session=abc123; theme=dark');
   assert.equal(body.autostart, true);
+  // 走 IDM 式流程：应用会弹保存位置确认框
+  assert.equal(body.needs_confirm, true);
 });
 
 await test('内容脚本传来的 referer 也能被识别', async () => {

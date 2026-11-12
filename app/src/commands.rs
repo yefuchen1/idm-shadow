@@ -40,6 +40,7 @@ pub async fn add_task(
     url: String,
     filename: Option<String>,
     dir: Option<String>,
+    needs_confirm: Option<bool>,
 ) -> Result<String, String> {
     if url.trim().is_empty() {
         return Err("URL 不能为空".to_string());
@@ -49,6 +50,7 @@ pub async fn add_task(
         url,
         filename,
         dir,
+        needs_confirm: needs_confirm.unwrap_or(false),
         ..Default::default()
     };
 
@@ -59,6 +61,38 @@ pub async fn add_task(
         .await
         .map_err(|e| e.to_string())?;
     Ok(task.id.to_string())
+}
+
+/// 用户确认保存位置。`path` 为 None 表示用默认目录。
+#[tauri::command]
+pub async fn confirm_task(
+    state: State<'_, AppState>,
+    id: String,
+    path: Option<String>,
+) -> Result<(), String> {
+    let id = parse_id(&id)?;
+    let path = path
+        .filter(|p| !p.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    state
+        .manager
+        .confirm_path(id, path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 用户在确认弹窗里点了取消：删掉已下载的暂存文件。
+#[tauri::command]
+pub async fn cancel_confirmed_task(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let id = parse_id(&id)?;
+    state
+        .manager
+        .cancel_with_cleanup(id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

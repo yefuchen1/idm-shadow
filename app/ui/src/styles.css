@@ -291,6 +291,23 @@ body {
   margin-top: 18px;
 }
 
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.confirm-actions .btn {
+  flex: 1;
+  justify-content: center;
+}
+
+.confirm-dir {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
 .unit {
   color: var(--muted);
   font-size: 12px;
