@@ -74,6 +74,14 @@ bridge 的 HTTP API（`X-IDM-Shadow-Token` 头或 `?token=` 参数鉴权）：
 
     cargo test --workspace
 
+浏览器侧（扩展与油猴脚本）用 Node 跑：
+
+    npm test
+
+一条命令跑全部：
+
+    npm run test:all
+
 属性测试（proptest）会随机重放分段与续传序列，检查字节区间**永远不重叠、不留洞**。
 这是整个项目正确性的地基——分段的 bug 往往不会立刻崩溃，而是表现为文件损坏。
 

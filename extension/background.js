@@ -95,7 +95,9 @@ async function capture(item) {
   const payload = {
     url,
     filename: item.filename || undefined,
-    referer: item.referrer || undefined,
+    // chrome.downloads 用的是 referrer（两个 r），内容脚本发过来的是 referer。
+    // 两个都认，免得丢掉来源页信息——不少站点靠 Referer 校验才肯给文件。
+    referer: item.referrer || item.referer || undefined,
     userAgent: navigator.userAgent,
     cookies: await cookieHeader(url),
     engine: 'auto',
