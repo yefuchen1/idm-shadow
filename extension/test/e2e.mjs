@@ -10,7 +10,7 @@
 
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, rmSync, openSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -22,9 +22,19 @@ const repoRoot = resolve(here, '..', '..');
 const extDir_source = join(repoRoot, 'extension');
 // 扩展路径里有中文时 Chromium 启不来（spawn UNKNOWN），
 // 先复制到纯 ASCII 的临时目录再用。
-const asciiRoot = mkdtempSync(join(tmpdir(), 'idm-ext-ascii-'));
-const extDir = join(asciiRoot, 'extension');
-cpSync(extDir_source, extDir, { recursive: true });
+//
+// IDM_SHADOW_EXT_DIR 可以指定别的目录——用来直接验证
+// 用户实际加载的那个解压目录（比如 C:\idm-shadow-ext）。
+let extDir;
+let asciiRoot = null;
+if (process.env.IDM_SHADOW_EXT_DIR) {
+  extDir = process.env.IDM_SHADOW_EXT_DIR;
+  console.log(`  用指定的扩展目录: ${extDir}`);
+} else {
+  asciiRoot = mkdtempSync(join(tmpdir(), 'idm-ext-ascii-'));
+  extDir = join(asciiRoot, 'extension');
+  cpSync(extDir_source, extDir, { recursive: true });
+}
 
 const PORT = 16888;
 const TOKEN = 'e2e-extension-token-0123456789';
@@ -53,9 +63,11 @@ function startApp() {
   if (!existsSync(exe)) {
     throw new Error(`找不到 ${exe}，先 cargo build -p idm-shadow-app`);
   }
+  const logFile = join(tmpdir(), 'idm-ext-e2e-app.log');
+  const out = openSync(logFile, 'w');
   return spawn(exe, [], {
     env: { ...process.env, IDM_SHADOW_TOKEN: TOKEN },
-    stdio: 'ignore'
+    stdio: ['ignore', out, out]
   });
 }
 
@@ -72,12 +84,38 @@ async function waitForApi(retries = 40) {
   return false;
 }
 
+// 应用有单实例机制：已经在跑的话，测试再启一个会被转交给它，
+// 于是测试里的 token 和实际服务的对不上，排查起来很费劲。
+// 所以先看一眼端口是不是已经有人占着。
+async function portAlreadyInUse(port) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/api/v1/health`);
+    return resp.ok;
+  } catch (err) {
+    return false;
+  }
+}
+
 async function listTasks() {
   const resp = await fetch(`http://127.0.0.1:${PORT}/api/v1/tasks`, {
     headers: { 'X-IDM-Shadow-Token': TOKEN }
   });
   const body = await resp.json();
   return body.tasks || [];
+}
+
+// 确认连到的是测试自己启的那个实例。
+// 应用是单实例的，端口上要是坐着别的东西（哪怕 token 碰巧对得上），
+// 后面"扩展没投进来"这种报错会让人查错方向。
+async function checkOwnInstance() {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${PORT}/api/v1/tasks`, {
+      headers: { 'X-IDM-Shadow-Token': TOKEN }
+    });
+    return resp.ok;
+  } catch (err) {
+    return false;
+  }
 }
 
 /// 清掉上次测试留下的任务和文件，保证每次都是干净的环境。
@@ -98,6 +136,15 @@ for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
 
 const profileDir = mkdtempSync(join(tmpdir(), 'idm-ext-e2e-'));
 const server = await startFileServer(payload);
+// 应用是单实例的：已经有一个在跑的话，测试启的那个会被转交给它，
+// 于是测试里的 token 和实际服务的对不上——表现是"扩展没投进来"，
+// 但根因在这儿，很容易查错方向。所以先看一眼端口有没有人占着。
+if (await portAlreadyInUse(PORT)) {
+  console.error('端口 ' + PORT + ' 上已经有 IDM Shadow 在跑了，请先关掉它再跑这个测试。');
+  server.close();
+  rmSync(profileDir, { recursive: true, force: true });
+  process.exit(1);
+}
 const app = startApp();
 
 let browser = null;
@@ -119,6 +166,12 @@ try {
     throw new Error('桌面应用的 bridge 没起来');
   }
   log('bridge 已就绪');
+
+  // 确认连到的是测试自己启的实例（token 对得上）。
+  // 不然"扩展没投进来"这种报错会让人查错方向。
+  if (!(await checkOwnInstance())) {
+    throw new Error('端口上的服务不是测试启的那个实例（token 对不上）');
+  }
 
   await resetState();
 
@@ -262,7 +315,7 @@ try {
   app.kill();
   server.close();
   rmSync(profileDir, { recursive: true, force: true });
-  rmSync(asciiRoot, { recursive: true, force: true });
+  if (asciiRoot) rmSync(asciiRoot, { recursive: true, force: true });
 }
 
 console.log('');

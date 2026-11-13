@@ -95,6 +95,47 @@ async function settings() {
   return { ...DEFAULTS, ...stored };
 }
 
+// 端口可能会被占着，应用会往后找。所以从默认端口往后试几个。
+const CANDIDATE_PORTS = [16888, 16889, 16890, 16891, 16892, 16893, 16894, 16895];
+
+/**
+ * 找应用：问它要 bridge 地址和 token。
+ *
+ * 没有这一步的话，用户得手动把 48 位 token 从应用设置页
+ * 抄到扩展设置页里——最容易卡住的一步。
+ *
+ * 引导接口只让浏览器扩展读（普通网站读不到），所以这样
+ * 不会削弱 token 挡住"网站乱塞下载任务"的作用。
+ */
+async function discoverApp() {
+  for (const port of CANDIDATE_PORTS) {
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const resp = await fetch(`${base}/api/v1/bootstrap`, { method: 'GET' });
+      if (!resp.ok) continue;
+      const body = await resp.json();
+      if (!body || !body.token) continue;
+      return { bridgeUrl: base, token: body.token };
+    } catch (err) {
+      // 这个端口没有应用，试试下一个
+    }
+  }
+  return null;
+}
+
+// 自动配置：找到应用就把地址和 token 填上。
+async function autoConfigure(force = false) {
+  const s = await settings();
+  if (!force && s.token && s.bridgeUrl) return s;
+  const found = await discoverApp();
+  if (!found) return s;
+  await chrome.storage.local.set({
+    bridgeUrl: found.bridgeUrl,
+    token: found.token
+  });
+  return { ...s, ...found };
+}
+
 /// 当前应当用什么接管方式。
 function effectiveMode(s) {
   if (s.mode === 'follow-app') {
@@ -192,6 +233,10 @@ async function capture(item) {
   if (!url) return false;
   // blob / data URL 由页面内生命周期决定，引擎取不到
   if (/^(blob|data|chrome-extension|edge):/i.test(url)) return false;
+
+  // 还没配置过就先自动找一下应用。
+  // 装完扩展就能直接用，不用手动抄 token。
+  await autoConfigure();
 
   // 文件名优先问服务器要——Chrome 给的名字在接管场景下不可靠，
 // 我们把浏览器下载取消掉之后它可能永远停在 "download (2)"。
@@ -353,6 +398,18 @@ chrome.runtime.onInstalled.addListener(() => {
   });
   chrome.alarms.create('refresh-badge', { periodInMinutes: 1 });
   syncWithApp();
+});
+
+// 装好扩展就自动找一次应用，把地址和 token 填上。
+// 用户装完就能直接用，不用手动抄 token。
+chrome.runtime.onInstalled.addListener(() => {
+  autoConfigure(true);
+});
+
+// 每次浏览器启动也找一次：
+// 应用可能换了端口（上一个占着），token 也可能重新生成过。
+chrome.runtime.onStartup.addListener(() => {
+  autoConfigure(true);
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {

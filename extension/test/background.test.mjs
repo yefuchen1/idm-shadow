@@ -65,6 +65,7 @@ const chrome = {
   },
   runtime: {
     onInstalled: { addListener: (fn) => (listeners.onInstalled = fn) },
+    onStartup: { addListener: (fn) => (listeners.onStartup = fn) },
     onMessage: { addListener: (fn) => (listeners.onMessage = fn) },
     sendMessage: () => {},
     lastError: null
@@ -94,13 +95,26 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp };`
 );
 
 const fetchCalls = [];
 let settingsResponse = { default_download_tool: false };
+// 引导接口的响应，null 表示"这个端口没有应用"
+let bootstrapResponse = { port: 16888, token: 'auto-found-token' };
 const fakeFetch = async (url, options = {}) => {
   fetchCalls.push({ url, options });
+  if (url.endsWith('/api/v1/bootstrap')) {
+    if (!bootstrapResponse) {
+      throw new Error('连接被拒绝');
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => bootstrapResponse,
+      text: async () => ''
+    };
+  }
   return {
     ok: true,
     status: 200,
@@ -282,6 +296,60 @@ await test('跟随应用模式：应用说不是就不自动接管', async () =>
   assert.equal(calls.notifications.length, 1, '应该弹提示让用户确认');
 
   storage.mode = 'auto';
+});
+
+await test('自动配置：从引导接口拿到地址和 token', async () => {
+  fetchCalls.length = 0;
+  delete storage.token;
+  delete storage.bridgeUrl;
+
+  const found = await api.discoverApp();
+  assert.ok(found, '应该能找到应用');
+  assert.equal(found.bridgeUrl, 'http://127.0.0.1:16888');
+  assert.equal(found.token, 'auto-found-token');
+  assert.ok(
+    fetchCalls.some((c) => c.url.endsWith('/api/v1/bootstrap')),
+    '应该请求了引导接口'
+  );
+});
+
+await test('自动配置：写进 storage，下游就能直接用', async () => {
+  delete storage.token;
+  delete storage.bridgeUrl;
+  storage.mode = 'auto';
+
+  await api.autoConfigure(true);
+
+  assert.equal(storage.bridgeUrl, 'http://127.0.0.1:16888');
+  assert.equal(storage.token, 'auto-found-token');
+
+  // 配好之后，捕获下载就该直接投给应用
+  fetchCalls.length = 0;
+  calls.downloads.length = 0;
+  await listeners.onCreated({
+    id: 77,
+    url: 'https://example.com/auto.bin',
+    filename: 'auto.bin'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const posted = fetchCalls.find((c) => c.url.endsWith('/api/v1/tasks'));
+  assert.ok(posted, '应该把下载投给了应用');
+  const body = JSON.parse(posted.options.body);
+  assert.equal(body.needs_confirm, true, '应该走 IDM 式确认流程');
+});
+
+await test('自动配置：应用没在跑时不乱改已有配置', async () => {
+  bootstrapResponse = null;
+  storage.bridgeUrl = 'http://127.0.0.1:16888';
+  storage.token = 'manual-token';
+
+  const found = await api.discoverApp();
+  assert.equal(found, null, '找不到应用应该返回 null');
+
+  await api.autoConfigure(true);
+  assert.equal(storage.token, 'manual-token', '不该把已有 token 冲掉');
+
+  bootstrapResponse = { port: 16888, token: 'auto-found-token' };
 });
 
 console.log('');

@@ -9,7 +9,8 @@
     "storage",
     "contextMenus",
     "notifications",
-    "alarms"
+    "alarms",
+    "tabs"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

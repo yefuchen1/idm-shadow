@@ -296,6 +296,7 @@ pub fn router(state: BridgeState) -> Router {
 
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/bootstrap", get(bootstrap))
         .merge(protected)
         .layer(cors)
         .with_state(state)
@@ -326,6 +327,41 @@ async fn health(State(state): State<BridgeState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "port": state.port,
     }))
+}
+
+/// 引导接口：让扩展自己找到地址和 token。
+///
+/// 没有这个的话，用户得手动从应用设置里把 48 位 token 抄到
+/// 扩展的设置页里——最容易卡住的一步。
+///
+/// 但 token 正是用来挡住"网站往本地塞下载任务"的，
+/// 所以这里必须只让**浏览器扩展**读：
+///
+/// - 没有 Origin 头 —— 命令行工具（curl 之类），本地程序本来就有全权限
+/// - `chrome-extension://` / `moz-extension://` —— 浏览器扩展
+///
+/// 网站的 Origin 是 `https://xxx`，`file://` 页面是 `null`，
+/// 两者都拿不到 token。
+async fn bootstrap(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let allowed = origin.is_empty()
+        || origin.starts_with("chrome-extension://")
+        || origin.starts_with("moz-extension://");
+
+    if !allowed {
+        let err = ApiError::new("forbidden", "只有浏览器扩展可以读取引导信息");
+        return (StatusCode::FORBIDDEN, Json(err)).into_response();
+    }
+
+    Json(json!({
+        "port": state.port,
+        "token": state.token.as_str(),
+    }))
+    .into_response()
 }
 
 async fn create_task(
