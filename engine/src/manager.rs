@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{broadcast, watch, Mutex};
@@ -808,13 +809,42 @@ async fn finalize_download(task: &Task, target: Option<&PathBuf>) -> Result<()> 
     }
 
     // 同卷用 rename，跨卷 rename 会失败，这时退回"复制 + 删除"
-    match tokio::fs::rename(staging, &final_path).await {
-        Ok(()) => {}
-        Err(_) => {
-            tokio::fs::copy(staging, &final_path)
-                .await
-                .with_context(|| format!("转存到 {} 失败", final_path.display()))?;
-            let _ = tokio::fs::remove_file(staging).await;
+    // rename 在 Windows 上会因为源文件还被下载引擎握着句柄而失败
+    // （共享冲突）。引擎其实已经返回了，只是句柄还没释放干净，
+    // 所以重试几次通常就能成功——rename 是原子的，比退回复制强得多：
+    // 复制过程中目标位置会先出现一个不完整的文件。
+    //
+    // 以前这里一次就退回复制，删除暂存文件的错误还被 let _ = 吞掉，
+    // 于是 .idmshadow/ 下的 .part 文件悄悄留在磁盘上，
+    // 用户那边看到的却是"下载已完成"。
+    let mut renamed = false;
+    let mut last_err = None;
+    for attempt in 0..5u64 {
+        match tokio::fs::rename(staging, &final_path).await {
+            Ok(()) => {
+                renamed = true;
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+    }
+    if !renamed {
+        // 真的不行（比如跨卷），退回复制 + 删除
+        tokio::fs::copy(staging, &final_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "转存到 {} 失败: {:?}",
+                    final_path.display(),
+                    last_err
+                )
+            })?;
+        if let Err(err) = tokio::fs::remove_file(staging).await {
+            // 删不掉就记一笔，别让暂存文件悄悄留在磁盘上。
+            tracing::warn!("暂存文件删除失败，磁盘上会留下残留: {err}");
         }
     }
 

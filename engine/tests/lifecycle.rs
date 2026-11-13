@@ -636,6 +636,73 @@ async fn confirm_after_completion_moves_the_file() {
 }
 
 #[tokio::test]
+async fn confirm_long_after_completion_moves_the_file() {
+    // 下载早就跑完了，用户过了好一会儿才点确认。
+    //
+    // 这是实际使用里最常见的顺序——文件几十兆，下完���用户
+    // 过一会儿才回到对话框点"立即下载"。
+    // 引擎这时候已经彻底收工，转存必须由确认这一侧完成。
+    let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-much-later");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/late.bin"),
+            filename: Some("late.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    mgr.start(task.id).await.unwrap();
+
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.downloaded == body.len() as u64)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "下载应当完成");
+
+    // 让引擎彻底收工：引擎返回、阶段处理跑完、通道关闭。
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let staging = dir.join(".idmshadow").join(format!("{}.part", task.id));
+    assert!(staging.exists(), "暂存文件应当还在等着转存");
+
+    let custom = dir.join("late-target");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("late.bin")))
+        .await
+        .unwrap();
+
+    let final_file = custom.join("late.bin");
+    assert!(
+        final_file.exists(),
+        "引擎早就跑完了，这时确认也必须把文件转存过去"
+    );
+    let content = std::fs::read(&final_file).unwrap();
+    assert!(content == body, "转存后内容必须一致");
+    assert!(!staging.exists(), "暂存文件应当被转存掉");
+
+    let after = mgr.get(task.id).unwrap().unwrap();
+    assert_eq!(after.status, TaskStatus::Completed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn confirm_without_custom_path_lands_in_the_default_dir() {
     // 回归测试：用户点"直接下载"，没指定目录。
     //
