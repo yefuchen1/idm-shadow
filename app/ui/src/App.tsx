@@ -21,9 +21,11 @@ import {
   formatSpeed,
   STATUS_LABEL,
   type SettingsDto,
+  type SegmentDto,
   type TaskDto,
   type TaskStatus
 } from "./api";
+import { SegmentBar } from "./SegmentBar";
 
 const ACTIVE: TaskStatus[] = ["queued", "probing", "downloading", "retrying"];
 
@@ -48,6 +50,7 @@ export default function App() {
   const [deleteFile, setDeleteFile] = useState(true);
   const [confirmTarget, setConfirmTarget] = useState<TaskDto | null>(null);
   const [confirmDir, setConfirmDir] = useState("");
+  const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -83,6 +86,7 @@ export default function App() {
       speed: number;
       connections: number;
       note: string | null;
+      segments: SegmentDto[];
     }>("task-progress", (event) => {
       const p = event.payload;
       setTasks((prev) =>
@@ -94,7 +98,8 @@ export default function App() {
                 total_size: p.total,
                 speed: p.speed,
                 connections: p.connections,
-                note: p.note ?? t.note
+                note: p.note ?? t.note,
+                segments: p.segments ?? t.segments
               }
             : t
         )
@@ -497,26 +502,43 @@ export default function App() {
           </div>
         )}
         {visible.map((task) => {
-          const percent =
-            task.total_size && task.total_size > 0
-              ? Math.min(100, (task.downloaded / task.total_size) * 100)
-              : 0;
           const remaining =
             task.total_size !== null ? task.total_size - task.downloaded : null;
           return (
             <div className={`row ${task.status}`} key={task.id}>
               <div className="col-name">
-                <span className="filename" title={task.path}>
+                <span
+                  className="filename"
+                  title="点击查看各连接明细"
+                  onClick={() =>
+                    setDetailId((cur) => (cur === task.id ? null : task.id))
+                  }
+                >
                   {task.filename}
                 </span>
                 <span className="suburl" title={task.url}>
                   {task.url}
                 </span>
+                {detailId === task.id && task.segments.length > 0 && (
+                  <div className="conn-list">
+                    {task.segments.map((seg, i) => (
+                      <span
+                        key={i}
+                        className="conn-chip"
+                        title={`区间 ${formatSize(seg.start)} – ${formatSize(seg.end)}`}
+                      >
+                        {formatSpeed(seg.speed)}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="col-size">
-                <div className="bar">
-                  <div className="bar-fill" style={{ width: `${percent}%` }} />
-                </div>
+                <SegmentBar
+                  segments={task.segments}
+                  total={task.total_size}
+                  downloaded={task.downloaded}
+                />
                 <span className="subtle">
                   {formatSize(task.downloaded)}
                   {task.total_size !== null

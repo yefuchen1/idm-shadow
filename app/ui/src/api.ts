@@ -27,8 +27,16 @@ export interface TaskDto {
   needs_confirm: boolean;
   /** 产物说明，比如 HLS 合并后是不是标准 mp4。 */
   note: string | null;
+  /** 各连接持有的区间，分段可视化用。 */
+  segments: SegmentDto[];
   created_at: string;
   updated_at: string;
+}
+
+export interface SegmentDto {
+  start: number;
+  end: number;
+  speed: number;
 }
 
 export interface SettingsDto {

@@ -77,8 +77,18 @@ pub struct TaskDto {
     pub error: Option<String>,
     /// 是否在等用户确认保存位置。
     pub needs_confirm: bool,
+    /// 当前各连接持有的区间（分段可视化用）。
+    pub segments: Vec<SegmentDto>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// 一条连接的区间。
+#[derive(Debug, Serialize)]
+pub struct SegmentDto {
+    pub start: u64,
+    pub end: u64,
+    pub speed: u64,
 }
 
 impl TaskDto {
@@ -104,6 +114,18 @@ impl TaskDto {
                 .unwrap_or(default_max_connections),
             error: task.error.as_ref().map(|e| e.message.clone()),
             needs_confirm: task.needs_confirm,
+            segments: live
+                .map(|p| {
+                    p.segments
+                        .iter()
+                        .map(|s| SegmentDto {
+                            start: s.start,
+                            end: s.end,
+                            speed: s.speed,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             created_at: task.created_at.to_rfc3339(),
             updated_at: task.updated_at.to_rfc3339(),
         }

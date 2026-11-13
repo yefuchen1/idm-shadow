@@ -174,6 +174,11 @@ fn main() {
                                     "speed": progress.speed,
                                     "connections": progress.connections,
                                     "note": progress.note,
+                                    "segments": progress.segments.iter().map(|s| serde_json::json!({
+                                        "start": s.start,
+                                        "end": s.end,
+                                        "speed": s.speed,
+                                    })).collect::<Vec<_>>(),
                                 }),
                             );
                         }
