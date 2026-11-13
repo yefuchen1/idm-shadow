@@ -86,6 +86,12 @@ pub struct TaskDto {
     pub segments: Vec<SegmentDto>,
     /// BT 任务的分片状态（piece 校验可视化用）。
     pub pieces: Option<PieceStatusDto>,
+    /// 文件现在还在不在保存位置。
+    ///
+    /// 任务列表用它把"文件已经没了"的条目标灰——
+    /// 用户可能手动删了，或者换了机器。
+    /// 只有真正下完过的任务才检查，下载中的不查（文件还没落地）。
+    pub file_exists: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -126,6 +132,18 @@ pub struct PieceStatusDto {
 }
 
 impl TaskDto {
+    /// 检查下载好的文件还在不在保存位置。
+    ///
+    /// 只对真正下完的任务查：下载中的文件还没落地，
+    /// 查了也是 false，界面上会误标成"文件没了"。
+    fn file_exists(task: &Task) -> Option<bool> {
+        if task.status != idm_shadow_engine::task::TaskStatus::Completed {
+            return None;
+        }
+        let path = task.final_path.clone().unwrap_or_else(|| task.target_path());
+        Some(path.exists())
+    }
+
     /// `default_max_connections` 是全局设置，任务没单独指定时用它。
     pub fn from_task(
         task: &Task,
@@ -145,6 +163,7 @@ impl TaskDto {
                 .unwrap_or_else(|| task.target_path())
                 .to_string_lossy()
                 .to_string(),
+            file_exists: Self::file_exists(task),
             status: task.status.as_str().to_string(),
             total_size: task.total_size,
             downloaded: task.downloaded,

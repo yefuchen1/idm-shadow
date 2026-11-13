@@ -222,18 +222,13 @@ fn main() {
                         }
                         TaskEvent::ConfirmNeeded(id) => {
                             // 有下载在等用户确认保存位置。
-                            // 应用通常待在托盘里、窗口是隐藏的，
-                            // 所以这里要把窗口叫到前面来，
-                            // 否则弹窗渲染了但用户看不见。
+                            // 下载对话框是独立的小窗口，不在这里弹——
+                            // 主窗口是任务列表，可能很长，盖一个模态框
+                            // 两边都别扭。这里只发事件，主窗口那边去开小窗口。
                             let _ = handle.emit(
                                 "task-confirm-needed",
                                 serde_json::json!({ "id": id.to_string() }),
                             );
-                            if let Some(window) = handle.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.unminimize();
-                                let _ = window.set_focus();
-                            }
                         }
                     }
                 }
@@ -268,6 +263,10 @@ fn main() {
             commands::update_settings,
             commands::set_global_limit,
             commands::reveal_file,
+            commands::open_dialog,
+            commands::close_dialog,
+            commands::open_file,
+            commands::show_in_folder,
         ])
         .run(tauri::generate_context!())
         .expect("应用启动失败");

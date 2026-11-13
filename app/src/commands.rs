@@ -3,9 +3,73 @@
 use idm_shadow_bridge::TaskDto;
 use idm_shadow_engine::task::{TaskId, TaskRequest};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager as TauriManager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::AppState;
+
+/// 下载对话框的窗口 label。每个任务一个窗口。
+pub fn dialog_label(task_id: &str) -> String {
+    format!("dlg-{task_id}")
+}
+
+/// 打开（或聚焦）某个任务的下载对话框。
+///
+/// 下载对话框是独立的小窗口，不跟任务列表挤在一起——
+/// 列表可能很长，对话框只有一屏，混在一起两边都不好用。
+#[tauri::command]
+pub async fn open_dialog(
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    let label = dialog_label(&id);
+
+    // 已经开着了就把它叫到前面
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    let url = WebviewUrl::App(format!("dlg.html?task={}", id).into());
+    WebviewWindowBuilder::new(&app, &label, url)
+        .title("IDM Shadow")
+        .inner_size(460.0, 340.0)
+        .min_inner_size(380.0, 280.0)
+        .resizable(false)
+        .always_on_top(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// 关闭某个任务的下载对话框。
+#[tauri::command]
+pub async fn close_dialog(app: AppHandle, id: String) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(&dialog_label(&id)) {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 打开下载好的文件。
+#[tauri::command]
+pub async fn open_file(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// 在文件管理器里定位下载好的文件。
+#[tauri::command]
+pub async fn show_in_folder(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| e.to_string())
+}
 
 #[derive(Debug, Serialize)]
 pub struct SettingsDto {

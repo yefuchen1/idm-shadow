@@ -22,6 +22,7 @@
         connections: 16,
         max_connections: 16,
         error: null,
+        file_exists: true,
         created_at: "2026-11-13T00:00:00Z",
         updated_at: "2026-11-13T00:00:00Z"
       },
@@ -38,6 +39,7 @@
         connections: 0,
         max_connections: 16,
         error: null,
+        file_exists: true,
         created_at: "2026-11-13T00:00:00Z",
         updated_at: "2026-11-13T00:00:00Z"
       },
@@ -47,13 +49,15 @@
         url: "https://example.com/stream.m3u8",
         filename: "stream.mp4",
         path: "C:/Users/ROG/Downloads/stream.mp4",
-        status: "error",
+        status: "completed",
         total_size: null,
         downloaded: 1024 * 1024 * 3,
         speed: 0,
         connections: 0,
         max_connections: 16,
-        error: "服务器不支持 Range，无法分段",
+        error: null,
+        // 文件已经不在保存位置了——界面会把它置灰
+        file_exists: false,
         created_at: "2026-11-13T00:00:00Z",
         updated_at: "2026-11-13T00:00:00Z"
       },
@@ -71,6 +75,7 @@
         max_connections: 16,
         error: null,
         needs_confirm: true,
+        file_exists: true,
         created_at: "2026-11-13T00:00:00Z",
         updated_at: "2026-11-13T00:00:00Z"
       }
@@ -115,6 +120,10 @@
           }
           case "remove_task":
             return null;
+          case "open_dialog":
+          case "close_dialog":
+          case "open_file":
+          case "show_in_folder":
           case "pause_task":
           case "resume_task":
           case "cancel_task":

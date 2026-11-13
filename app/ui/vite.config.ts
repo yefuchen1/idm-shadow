@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -31,14 +31,21 @@ export default defineConfig({
     }
   ],
   clearScreen: false,
+  // 两个入口：主窗口（任务列表）和下载对话框（独立小窗口）
+  build: {
+    outDir: "dist",
+    target: "es2021",
+    rollupOptions: {
+      input: {
+        main: resolve(here, "index.html"),
+        dlg: resolve(here, "dlg.html")
+      }
+    },
+    sourcemap: !!process.env.TAURI_ENV_DEBUG
+  },
   server: {
     port: 1420,
     strictPort: true,
     watch: { ignored: ["**/src-tauri/**"] }
-  },
-  build: {
-    outDir: "dist",
-    target: "es2021",
-    sourcemap: !!process.env.TAURI_ENV_DEBUG
   }
 });

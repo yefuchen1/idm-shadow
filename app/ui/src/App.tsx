@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   Ban,
   Copy,
+  FolderInput,
   FolderOpen,
   FolderCog,
   Pause,
@@ -34,40 +35,6 @@ const ACTIVE: TaskStatus[] = ["queued", "probing", "downloading", "retrying"];
 /** 任务到了这些状态就不用再问用户保存位置了。 */
 const TERMINAL: TaskStatus[] = ["completed", "error", "cancelled"];
 
-/**
- * 确认弹窗里的下载状态。
- *
- * IDM 的行为是"弹窗出现时下载已经在跑了"，所以这里把
- * 已下载 / 总大小 / 速度 / 连接数摆出来，让用户知道
- * 这东西确实在动，不是一个卡住的对话框。
- */
-function ConfirmProgress({ task }: { task: TaskDto }) {
-  const running = task.status === "downloading" || task.status === "awaiting_confirm";
-  if (!running) return null;
-
-  return (
-    <div className="confirm-progress">
-      <div className="confirm-progress-bar">
-        <div
-          className="confirm-progress-fill"
-          style={{
-            width: task.total_size
-              ? `${Math.min(100, (task.downloaded / task.total_size) * 100)}%`
-              : "0%"
-          }}
-        />
-      </div>
-      <span className="confirm-progress-text">
-        {task.total_size
-          ? `${formatSize(task.downloaded)} / ${formatSize(task.total_size)}`
-          : formatSize(task.downloaded)}
-        {task.speed > 0 && ` · ${formatSpeed(task.speed)}`}
-        {task.connections > 0 && ` · ${task.connections} 连接`}
-      </span>
-    </div>
-  );
-}
-
 export default function App() {
   const [tasks, setTasks] = useState<TaskDto[]>([]);
   const [url, setUrl] = useState("");
@@ -87,10 +54,8 @@ export default function App() {
     filename: string;
   } | null>(null);
   const [deleteFile, setDeleteFile] = useState(true);
-  const [confirmTarget, setConfirmTarget] = useState<TaskDto | null>(null);
-  const [confirmDir, setConfirmDir] = useState("");
-  // 已经确认过的任务，不再弹窗
-  const [confirmedIds, setConfirmedIds] = useState<Set<string>>(new Set());
+  // 已经开过下载对话框的任务，不重复开
+  const [dialogOpenIds, setDialogOpenIds] = useState<Set<string>>(new Set());
   const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -204,12 +169,16 @@ export default function App() {
     );
   }, [tasks, query]);
 
-  // 有任务在等确认，就弹窗。下载这时候已经在跑了。
+  // 有任务在等确认，就给它开一个独立的下载对话框小窗口。
+  //
+  // 以前是在主窗口里弹模态框——主窗口是任务列表，可能很长，
+  // 一个对话框盖在上面两边都别扭。现在分成两个窗口：
+  // 列表归列表，对话框归对话框。
   useEffect(() => {
     const pending = tasks.find(
       (t) =>
         t.needs_confirm &&
-        !confirmedIds.has(t.id) &&
+        !dialogOpenIds.has(t.id) &&
         // 失败/取消/完成的任务不再问。
         //
         // 之前这里只查 needs_confirm，可任务失败之后这个标记还留在库里，
@@ -217,58 +186,31 @@ export default function App() {
         // 点"直接下载"会确认错对象。
         !TERMINAL.includes(t.status)
     );
-    if (pending && !confirmTarget) {
-      setConfirmTarget(pending);
-      setConfirmDir(settings?.download_dir ?? "");
+    if (pending) {
+      setDialogOpenIds((prev) => new Set(prev).add(pending.id));
+      api.openDialog(pending.id).catch((err) => {
+        console.warn("[IDM Shadow] 打开下载对话框失败", err);
+        setDialogOpenIds((prev) => {
+          const next = new Set(prev);
+          next.delete(pending.id);
+          return next;
+        });
+      });
     }
-  }, [tasks, confirmTarget, settings, confirmedIds]);
+  }, [tasks, dialogOpenIds]);
 
-  // 弹窗里的下载进度要跟着实时刷新，
-  // 否则 confirmTarget 只是一份建弹窗那一刻的快照，数字不会动。
+  // 任务不再等确认了（确认了/失败了/取消了），把对话框收掉。
   useEffect(() => {
-    if (!confirmTarget) return;
-    const fresh = tasks.find((t) => t.id === confirmTarget.id);
-    if (!fresh || TERMINAL.includes(fresh.status)) {
-      // 弹窗开着的时候任务挂了（下载失败、被取消），
-      // 留着弹窗只会让人点一个已经没意义的"直接下载"。
-      setConfirmTarget(null);
-    } else if (fresh !== confirmTarget) {
-      setConfirmTarget(fresh);
+    for (const t of tasks) {
+      if (!t.needs_confirm && dialogOpenIds.has(t.id)) {
+        setDialogOpenIds((prev) => {
+          const next = new Set(prev);
+          next.delete(t.id);
+          return next;
+        });
+      }
     }
-  }, [tasks, confirmTarget]);
-
-  async function confirmDownload(useCustomDir: boolean) {
-    if (!confirmTarget) return;
-    const target = confirmTarget;
-    const dir = confirmDir.trim();
-    setConfirmTarget(null);
-    setConfirmedIds((prev) => new Set(prev).add(target.id));
-    await guard(async () => {
-      await api.confirmTask(
-        target.id,
-        useCustomDir && dir ? dir : undefined
-      );
-    });
-  }
-
-  async function cancelDownload() {
-    if (!confirmTarget) return;
-    const target = confirmTarget;
-    setConfirmTarget(null);
-    setConfirmedIds((prev) => new Set(prev).add(target.id));
-    await guard(() => api.cancelConfirmedTask(target.id));
-  }
-
-  async function pickConfirmDir() {
-    const picked = await open({
-      directory: true,
-      multiple: false,
-      defaultPath: confirmDir
-    });
-    if (typeof picked === "string") {
-      setConfirmDir(picked);
-    }
-  }
+  }, [tasks, dialogOpenIds]);
 
   async function submit() {
     const value = url.trim();
@@ -582,8 +524,14 @@ export default function App() {
         {visible.map((task) => {
           const remaining =
             task.total_size !== null ? task.total_size - task.downloaded : null;
+          // 文件不见了（被手动删了，或者换了机器）。
+          // 这种条目置灰，末尾换成"删除本条"。
+          const fileGone = task.file_exists === false;
           return (
-            <div className={`row ${task.status}`} key={task.id}>
+            <div
+              className={`row ${task.status}${fileGone ? " file-gone" : ""}`}
+              key={task.id}
+            >
               <div className="col-name">
                 <span
                   className="filename"
@@ -597,6 +545,12 @@ export default function App() {
                 <span className="suburl" title={task.url}>
                   {task.url}
                 </span>
+                <span className="subpath" title={task.path}>
+                  {task.path}
+                </span>
+                {fileGone && (
+                  <span className="subpath gone-note">文件已不在保存位置</span>
+                )}
                 {detailId === task.id && task.segments.length > 0 && (
                   <div className="conn-list">
                     {task.segments.map((seg, i) => (
@@ -648,6 +602,29 @@ export default function App() {
                 )}
               </div>
               <div className="col-actions">
+                {fileGone ? (
+                  // 文件已经没了，"在文件夹中显示"和"删除文件"都没意义，
+                  // 直接给一个"删除本条"。
+                  <button
+                    className="btn small"
+                    title="删除本条记录"
+                    onClick={() => guard(() => api.removeTask(task.id, false))}
+                  >
+                    删除本条
+                  </button>
+                ) : (
+                  <>
+                {task.needs_confirm && !TERMINAL.includes(task.status) && (
+                  // 还在等用户选保存位置。
+                  // 对话框窗口被用户用 X 关掉时，从这里能再叫回来。
+                  <button
+                    className="btn icon"
+                    title="选择保存位置"
+                    onClick={() => guard(() => api.openDialog(task.id))}
+                  >
+                    <FolderInput size={14} />
+                  </button>
+                )}
                 {task.status === "downloading" || task.status === "queued" ? (
                   <button
                     className="btn icon"
@@ -691,6 +668,8 @@ export default function App() {
                     <Ban size={14} />
                   </button>
                 )}
+                  </>
+                )}
               </div>
             </div>
           );
@@ -728,50 +707,6 @@ export default function App() {
         </div>
       )}
 
-      {confirmTarget && (
-        <div className="modal-backdrop">
-          <div className="modal">
-            <h2>下载此文件</h2>
-            <p className="modal-text">{confirmTarget.filename}</p>
-            <ConfirmProgress task={confirmTarget} />
-            <div className="confirm-actions">
-              <button
-                className="btn primary"
-                onClick={() => confirmDownload(false)}
-              >
-                直接下载
-              </button>
-              <button
-                className="btn"
-                onClick={() => confirmDownload(true)}
-              >
-                另存为…
-              </button>
-            </div>
-            <div className="confirm-dir">
-              <span className="confirm-dir-label">保存到</span>
-              <input
-                className="dir-input"
-                placeholder={settings?.download_dir ?? "默认下载目录"}
-                value={confirmDir}
-                onChange={(e) => setConfirmDir(e.target.value)}
-              />
-              <button
-                className="btn small"
-                title="浏览文件夹"
-                onClick={pickConfirmDir}
-              >
-                <FolderCog size={13} />
-              </button>
-            </div>
-            <div className="modal-actions">
-              <button className="btn" onClick={cancelDownload}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

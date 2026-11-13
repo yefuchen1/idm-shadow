@@ -505,6 +505,34 @@ body {
   white-space: nowrap;
 }
 
+.subpath {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 文件已经不在保存位置的条目：整条置灰，
+   跟正常列表一眼能区分开。 */
+.row.file-gone {
+  opacity: 0.45;
+}
+
+.row.file-gone .filename {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.row.file-gone .gone-note {
+  color: var(--red);
+  opacity: 0.9;
+}
+
+.row.file-gone:hover {
+  opacity: 0.75;
+}
+
 .col-size {
   display: flex;
   flex-direction: column;
@@ -653,4 +681,180 @@ body {
 
 .dot-sep {
   color: #c8cdd4;
+}
+
+/* 下载对话框：独立的小窗口 */
+.dlg-body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.dlg {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+
+.dlg-head {
+  border-bottom: 1px solid var(--border-soft);
+  padding-bottom: 10px;
+}
+
+.dlg-title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.dlg-filename {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dlg-sub {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dlg-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.dlg-actions .btn {
+  flex: 1;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+.dlg-dir {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.dlg-dir-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dlg-dir .dir-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.dlg-dir .btn {
+  flex: 0 0 auto;
+}
+
+.dlg-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dlg-progress-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+}
+
+.dlg-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.dlg-progress-info {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dlg-progress-stats {
+  display: flex;
+  gap: 10px;
+}
+
+.dlg-done {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.dlg-done-mark {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #35a853;
+  color: #fff;
+  font-size: 13px;
+  line-height: 22px;
+  text-align: center;
+}
+
+.dlg-done-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.dlg-done-path {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dlg-auto {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* 出错/取消时的那个叉 */
+.dlg-done-mark.failed {
+  background: var(--red);
+}
+
+/* 底部一排（比如"取消"），右对齐 */
+.dlg-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.btn.ghost {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.btn.ghost:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted);
 }

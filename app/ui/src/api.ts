@@ -31,6 +31,8 @@ export interface TaskDto {
   segments: SegmentDto[];
   /** BT 任务的分片状态，piece 校验可视化用。 */
   pieces: PieceStatusDto | null;
+  /** 文件现在还在不在保存位置。null = 不适用（还没下完）。 */
+  file_exists: boolean | null;
   created_at: string;
   updated_at: string;
 }
@@ -79,6 +81,10 @@ export const api = {
   /** 确认保存位置。dir 是目录（空表示用默认目录），最终路径 = 目录 + 原文件名。 */
   confirmTask: (id: string, dir?: string) =>
     invoke<void>("confirm_task", { id, dir }),
+  openDialog: (id: string) => invoke<void>("open_dialog", { id }),
+  closeDialog: (id: string) => invoke<void>("close_dialog", { id }),
+  openFile: (path: string) => invoke<void>("open_file", { path }),
+  showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   cancelConfirmedTask: (id: string) =>
     invoke<void>("cancel_confirmed_task", { id }),
   pauseTask: (id: string) => invoke<void>("pause_task", { id }),
