@@ -15,6 +15,10 @@ use bittorrent_rs::session::{SessionEvent, TorrentSession};
 use crate::http::engine::EngineCtx;
 use crate::task::Task;
 
+pub mod listener;
+
+use listener::InboundConfig;
+
 /// 下载磁力链接或 .torrent 文件。
 pub fn download(
     task: &Task,
@@ -46,6 +50,19 @@ pub fn download(
     session
         .start_download()
         .context("启动 BT 下载失败")?;
+
+    // 入站监听：bittorrent-rs 自己只做主动连接，
+    // 我们补上接受别人连过来的那一半。
+    let inbound_port = listener::find_port(6881).unwrap_or(6881);
+    let inbound_cfg = InboundConfig {
+        port: inbound_port,
+        enabled: true,
+    };
+    let inbound_handle = listener::spawn_inbound_listener(&inbound_cfg, |stream| {
+        // 入站连接交给库里的 peer 会话处理
+        handle_inbound_peer(stream);
+    })?;
+    let _ = &inbound_handle;
 
     // 订阅事件，主要用来知道下载结束
     let events = session.subscribe();
@@ -92,6 +109,76 @@ pub fn download(
         Ok(())
     } else {
         Err(anyhow!("BT 下载未完成"))
+    }
+}
+
+/// 处理一个入站连接。
+///
+/// bittorrent-rs 的 peer 会话处理是内部函数，这里用它的公开 API
+/// 走一遍握手 + 消息循环：先读 handshake，再按库的消息格式收发。
+fn handle_inbound_peer(mut stream: std::net::TcpStream) {
+    use std::io::{Read, Write};
+
+    // 1. 读 68 字节的 handshake
+    let mut hs = [0u8; 68];
+    if stream.read_exact(&mut hs).is_err() {
+        return;
+    }
+    if &hs[1..20] != b"BitTorrent protocol" && &hs[0..19] != b"BitTorrent protocol" {
+        return;
+    }
+
+    // 2. 回 handshake：<19>"BitTorrent protocol"<8 reserved><20 infohash>
+    //    info_hash 从对方发来的那份里取（第 28..48 字节）
+    let mut reply = Vec::with_capacity(68);
+    reply.push(19);
+    reply.extend_from_slice(b"BitTorrent protocol");
+    reply.extend_from_slice(&[0u8; 8]);
+    reply.extend_from_slice(&hs[28..48]);
+    reply.extend_from_slice(b"-IDMS-0001-000000000");
+    if stream.write_all(&reply).is_err() {
+        return;
+    }
+
+    // 3. 消息循环
+    //    长度前缀 + id + 负载
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        while buf.len() < 4 {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len > 1024 * 1024 {
+            return;
+        }
+        while buf.len() < 4 + len {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let id = buf[4];
+        let _body = buf[5..4 + len].to_vec();
+        buf.drain(..4 + len);
+
+        match id {
+            // interested
+            2 => {
+                let mut unchoke = Vec::new();
+                unchoke.extend_from_slice(&1u32.to_be_bytes());
+                unchoke.push(1);
+                if stream.write_all(&unchoke).is_err() {
+                    return;
+                }
+            }
+            // keep-alive
+            0 => {}
+            _ => {}
+        }
     }
 }
 

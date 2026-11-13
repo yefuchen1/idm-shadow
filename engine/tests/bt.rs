@@ -498,3 +498,42 @@ fn temp_dir_is_created() {
     assert!(dir.exists());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 入站监听：能接受连接，并且把连接交给处理函数。
+#[test]
+fn inbound_listener_accepts_connections() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let port = idm_shadow_engine::bt::listener::find_port(46000).unwrap();
+    let cfg = idm_shadow_engine::bt::listener::InboundConfig {
+        port,
+        enabled: true,
+    };
+
+    // 起监听，收到连接后往通道里丢一个字节
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = idm_shadow_engine::bt::listener::spawn_inbound_listener(&cfg, move |mut stream| {
+        let mut b = [0u8; 1];
+        let _ = stream.read_exact(&mut b);
+        let _ = tx.send(b[0]);
+    })
+    .unwrap()
+    .expect("监听线程应当起来了");
+
+    // 稍等一下让监听就绪
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 连上去
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("应当能连上");
+    conn.write_all(b"X").unwrap();
+    conn.flush().unwrap();
+
+    // 处理函数应当收到
+    let got = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("处理函数应当收到数据");
+    assert_eq!(got, b'X');
+
+    drop(handle);
+}
