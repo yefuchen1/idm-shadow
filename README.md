@@ -125,16 +125,27 @@ BT 任务下面那条分片条，一格代表一段 piece：
 前置：Rust（MSVC）、Node.js、Visual Studio Build Tools（C++ 工作负载 + Windows SDK）、
 WebView2 运行时。
 
-    # 编译桌面应用
-    cargo build --release -p idm-shadow-app
-
-    # 前端产物
-    cd app/ui && npm install && npm run build && cd ../..
+    # 一条命令搞定（前端 + 后端）
+    npm run app:build
 
     # 跑起来
-    cargo run -p idm-shadow-app
+    npm run app
 
-开发时用 `cargo tauri dev` 可以前后端热更新。
+或者手动来（顺序不能反）：
+
+    cd app/ui && npm install && npm run build && cd ../..
+    cargo build --release -p idm-shadow-app
+    ./target/release/idm-shadow-app.exe
+
+**界面加载不出来的话，八成是忘了先构建前端。**
+
+这个应用的界面是打包进 exe 的。如果直接 `cargo run -p idm-shadow-app`
+而 `app/ui/dist` 不存在或者过期，你会看到窗口里是
+「无法访问此页面 / localhost 拒绝连接」——那不是应用崩了，
+是界面根本没加载出来，浏览器组件在报错。
+
+开发时想要前后端热更新，用 `cargo tauri dev`（需要 tauri CLI），
+它会自己起开发服务器并连上去。
 
 ## 油猴对接步骤
 

@@ -21,5 +21,20 @@ tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
 
+[features]
+# 没有这个 feature，Tauri 会认为这是开发构建，
+# 界面去连 tauri.conf.json 里的 devUrl（http://localhost:1420）。
+# 那个开发服务器一停，编译出来的 exe 就只剩一个
+# "无法访问此页面 / localhost 拒绝连接"的错误页——
+# 看起来像应用崩了，其实是界面根本没加载出来。
+#
+# 打开这个 feature，前端资源就会打包进 exe，程序自带界面，
+# 不依赖任何开发服务器。
+#
+# 想用热重载开发界面的话（需要 tauri CLI）：
+#   cargo tauri dev --no-default-features
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

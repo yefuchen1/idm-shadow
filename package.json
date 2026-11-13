@@ -10,6 +10,8 @@
     "test:all": "npm run test:rust && npm test",
     "ui:build": "npm --prefix app/ui run build",
     "ui:dev": "npm --prefix app/ui run dev",
+    "app:build": "npm run ui:build && cargo build --release -p idm-shadow-app",
+    "app": "cargo run --release -p idm-shadow-app",
     "server": "cargo run -p idm-shadow-engine --example test_server"
   },
   "devDependencies": {
