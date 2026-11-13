@@ -59,9 +59,12 @@ SAMPLE-AES 之类属于 DRM 范畴，会明确报错而不是产出乱码文件�
 DHT / PEX / Tracker / uTP 都有）。原计划的 `bip` crate 编译不了——它要 nightly，
 `bip-rs` 那个 `bittorrent` crate 0.2.0 又是个空壳。
 
-**已知限制：这个库只有主动连接，没有入站 TCP 监听。** 也就是说我们能主动连
-别人，别人连不上我们。对 NAT 后面的用户影响比较实际：拿不到 Incoming 连接，
-速度会受影响。真要解决得自己加监听，或者换 libtorrent-rasterbar。
+这个库本身只有主动连接，没有入站 TCP 监听——我们能主动连别人，别人连不上
+我们。对 NAT 后面的用户影响比较实际：拿不到 Incoming 连接，速度会受影响。
+
+我们在 [`engine/src/bt/listener.rs`](engine/src/bt/listener.rs) 里补上了入站
+这一半：自己起 TCP 监听（默认 6881，端口被占用就往后找），接受别人连过来的
+连接。
 
 另外 BT 生态里不少做种者会拒绝与纯吸血端交换数据，实际可用性要打折。
 
