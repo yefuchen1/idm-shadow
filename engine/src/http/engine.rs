@@ -73,6 +73,67 @@ pub struct SegmentInfo {
     pub speed: u64,
 }
 
+/// BT 分片的状态。
+///
+/// 一个 BT 任务由若干 piece（分片）组成，每个 piece 有独立的 SHA1。
+/// 引擎把每个 piece 的状态报上来，界面就能画出"哪些块已经拿到、
+/// 哪些块还在要、哪些块校验失败"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieceState {
+    /// 还没拿到
+    Missing,
+    /// 已经拿到并通过哈希校验
+    Verified,
+    /// 一格里有下好的也有没下好的
+    Partial,
+    /// 拿到了但哈希对不上——要么是坏的，要么是传输中损坏
+    Corrupted,
+}
+
+/// 一个 piece 的状态快照。
+#[derive(Debug, Clone, Copy)]
+pub struct PieceInfo {
+    /// piece 在种子里的序号
+    pub index: u32,
+    pub state: PieceState,
+    /// 有多少个 peer 手上有这块（swarm 里的稀缺度）
+    pub availability: u16,
+}
+
+/// 一格分片状态。
+///
+/// 大种子有两万多个分片，逐个往界面推太重
+/// （每次进度更新一兆多），所以降采样成若干格。
+#[derive(Debug, Clone, Copy)]
+pub struct PieceCell {
+    /// 这一格覆盖的分片区间（含端点）
+    pub from: u32,
+    pub to: u32,
+    /// 这一格的状态，取区间里最"坏"的那个
+    pub state: PieceState,
+    /// 这一格里最稀缺的那块，有几个 peer 持有。
+    /// 越少说明越难下，值得优先拿。
+    pub availability: u16,
+}
+
+/// BT 任务的分片状态汇总。
+#[derive(Debug, Clone, Default)]
+pub struct PieceStatus {
+    /// 一共多少个 piece
+    pub total: u32,
+    /// 已经校验通过的
+    pub verified: u32,
+    /// 当前判定为坏块的（正在重传）
+    pub corrupted: u32,
+    /// 累计校验失败次数（重传统计）。
+    ///
+    /// 和 `corrupted` 的区别：`corrupted` 是"此刻有哪几块是坏的"，
+    /// 这个是"整个下载过程中一共坏过多少次"。
+    pub verification_failures: u64,
+    /// 降采样后的分片状态，用来画图
+    pub cells: Vec<PieceCell>,
+}
+
 /// 进度快照。
 #[derive(Debug, Clone, Default)]
 pub struct TaskProgress {
@@ -81,6 +142,11 @@ pub struct TaskProgress {
     pub speed: u64,
     pub connections: usize,
     pub segments: Vec<SegmentInfo>,
+    /// BT 引擎才有：分片状态。
+    pub pieces: Option<PieceStatus>,
+    /// BT 引擎才有：累计校验了多少块、其中多少块是坏的。
+    pub verified_pieces: Option<u64>,
+    pub corrupted_pieces: Option<u64>,
     /// 产物说明。HLS 合并后会说明是 mp4 还是原始 TS。
     pub note: Option<String>,
 }
@@ -306,6 +372,7 @@ impl HttpEngine {
                         speed,
                     }],
                     note: None,
+                    ..Default::default()
                 });
             }
         }
@@ -318,6 +385,7 @@ impl HttpEngine {
             connections: 0,
             segments: Vec::new(),
             note: None,
+            ..Default::default()
         });
         Ok(())
     }
@@ -542,6 +610,7 @@ impl HttpEngine {
             connections,
             segments,
             note: None,
+            ..Default::default()
         }
     }
 }

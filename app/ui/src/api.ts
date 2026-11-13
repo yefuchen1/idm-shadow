@@ -29,6 +29,8 @@ export interface TaskDto {
   note: string | null;
   /** 各连接持有的区间，分段可视化用。 */
   segments: SegmentDto[];
+  /** BT 任务的分片状态，piece 校验可视化用。 */
+  pieces: PieceStatusDto | null;
   created_at: string;
   updated_at: string;
 }
@@ -37,6 +39,27 @@ export interface SegmentDto {
   start: number;
   end: number;
   speed: number;
+}
+
+export type PieceState = "missing" | "partial" | "verified" | "corrupted";
+
+export interface PieceCellDto {
+  /** 这一格覆盖的分片区间（含端点） */
+  from: number;
+  to: number;
+  state: PieceState;
+  /** 这一格里最稀缺的那块，有几个 peer 持有 */
+  availability: number;
+}
+
+export interface PieceStatusDto {
+  total: number;
+  verified: number;
+  corrupted: number;
+  /** 累计校验失败次数（重传统计） */
+  verification_failures: number;
+  /** 降采样后的格子，用来画图 */
+  cells: PieceCellDto[];
 }
 
 export interface SettingsDto {
@@ -53,8 +76,9 @@ export const api = {
   listTasks: () => invoke<TaskDto[]>("list_tasks"),
   addTask: (url: string, filename?: string, dir?: string) =>
     invoke<string>("add_task", { url, filename, dir }),
-  confirmTask: (id: string, path?: string) =>
-    invoke<void>("confirm_task", { id, path }),
+  /** 确认保存位置。dir 是目录（空表示用默认目录），最终路径 = 目录 + 原文件名。 */
+  confirmTask: (id: string, dir?: string) =>
+    invoke<void>("confirm_task", { id, dir }),
   cancelConfirmedTask: (id: string) =>
     invoke<void>("cancel_confirmed_task", { id }),
   pauseTask: (id: string) => invoke<void>("pause_task", { id }),

@@ -79,6 +79,8 @@ pub struct TaskDto {
     pub needs_confirm: bool,
     /// 当前各连接持有的区间（分段可视化用）。
     pub segments: Vec<SegmentDto>,
+    /// BT 任务的分片状态（piece 校验可视化用）。
+    pub pieces: Option<PieceStatusDto>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -89,6 +91,33 @@ pub struct SegmentDto {
     pub start: u64,
     pub end: u64,
     pub speed: u64,
+}
+
+/// BT 分片状态。
+#[derive(Debug, Serialize)]
+pub struct PieceCellDto {
+    /// 这一格覆盖的分片区间（含端点）
+    pub from: u32,
+    pub to: u32,
+    /// missing / partial / verified / corrupted
+    pub state: String,
+    /// 这一格里最稀缺的那块，有几个 peer 持有
+    pub availability: u16,
+}
+
+/// BT 分片状态汇总。
+#[derive(Debug, Serialize)]
+pub struct PieceStatusDto {
+    /// 一共多少块
+    pub total: u32,
+    /// 已经校验通过的
+    pub verified: u32,
+    /// 当前判定为坏块的（正在重传）
+    pub corrupted: u32,
+    /// 累计校验失败次数（重传统计）
+    pub verification_failures: u64,
+    /// 降采样后的格子，用来画图
+    pub cells: Vec<PieceCellDto>,
 }
 
 impl TaskDto {
@@ -103,7 +132,14 @@ impl TaskDto {
             engine: task.engine.as_str().to_string(),
             url: task.url.clone(),
             filename: task.filename.clone(),
-            path: task.target_path().to_string_lossy().to_string(),
+            // 用户在确认弹窗里选了别的位置时，文件其实落在 final_path。
+            // 这里要报最终位置，不然"在文件夹中显示"会指错地方。
+            path: task
+                .final_path
+                .clone()
+                .unwrap_or_else(|| task.target_path())
+                .to_string_lossy()
+                .to_string(),
             status: task.status.as_str().to_string(),
             total_size: task.total_size,
             downloaded: task.downloaded,
@@ -126,6 +162,35 @@ impl TaskDto {
                         .collect()
                 })
                 .unwrap_or_default(),
+            pieces: live.and_then(|p| p.pieces.as_ref()).map(|ps| PieceStatusDto {
+                total: ps.total,
+                verified: ps.verified,
+                corrupted: ps.corrupted,
+                verification_failures: ps.verification_failures,
+                cells: ps
+                    .cells
+                    .iter()
+                    .map(|c| PieceCellDto {
+                        from: c.from,
+                        to: c.to,
+                        state: match c.state {
+                            idm_shadow_engine::http::engine::PieceState::Missing => {
+                                "missing".to_string()
+                            }
+                            idm_shadow_engine::http::engine::PieceState::Verified => {
+                                "verified".to_string()
+                            }
+                            idm_shadow_engine::http::engine::PieceState::Partial => {
+                                "partial".to_string()
+                            }
+                            idm_shadow_engine::http::engine::PieceState::Corrupted => {
+                                "corrupted".to_string()
+                            }
+                        },
+                        availability: c.availability,
+                    })
+                    .collect(),
+            }),
             created_at: task.created_at.to_rfc3339(),
             updated_at: task.updated_at.to_rfc3339(),
         }

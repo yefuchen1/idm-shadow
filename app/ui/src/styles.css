@@ -308,6 +308,106 @@ body {
   align-items: center;
 }
 
+.confirm-dir-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.confirm-dir .dir-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 路径输入框会把旁边的图标按钮挤扁，按钮不许缩。 */
+.confirm-dir .btn {
+  flex: 0 0 auto;
+}
+
+/* 弹窗里的下载进度：IDM 式流程里下载已经在跑了，
+   把数字摆出来用户才知道没卡住。 */
+.confirm-progress {
+  margin: 0 0 14px;
+}
+
+.confirm-progress-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+}
+
+.confirm-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.confirm-progress-text {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* BT 分片可视化 */
+.piece-wrap {
+  margin-top: 6px;
+}
+
+.piece-bar {
+  display: flex;
+  gap: 1px;
+  height: 9px;
+  width: 100%;
+  padding: 1px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+}
+
+.piece-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 1px;
+}
+
+.piece-cell.verified {
+  background: #35a853;
+}
+
+.piece-cell.partial {
+  background: #9ad0a5;
+}
+
+.piece-cell.corrupted {
+  background: var(--red);
+}
+
+.piece-cell.missing {
+  background: #c9d1da;
+}
+
+.piece-legend {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.piece-stat.verified {
+  color: #35a853;
+}
+
+.piece-stat.corrupted {
+  color: var(--red);
+}
+
 .unit {
   color: var(--muted);
   font-size: 12px;

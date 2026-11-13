@@ -206,6 +206,31 @@ try {
     }
     check('任务带上了正确的文件名', named, task.filename);
 
+    // 任务在等用户确认保存位置——这正是 IDM 式流程该有的样子。
+    // 界面上会弹"下载此文件"，用户点了才转存。
+    let waiting = false;
+    for (let i = 0; i < 20; i++) {
+      const tasks = await listTasks();
+      const cur = tasks.find((t) => t.id === task.id);
+      if (cur && cur.status === 'awaiting_confirm') {
+        waiting = true;
+        task = cur;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    check('任务在等用户确认保存位置', waiting, task.status);
+
+    // 模拟用户在弹窗里点"直接下载"（不指定目录，用默认位置）
+    await fetch(`http://127.0.0.1:${PORT}/api/v1/tasks/${task.id}/confirm`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-IDM-Shadow-Token': TOKEN
+      },
+      body: JSON.stringify({})
+    });
+
     let done = false;
     for (let i = 0; i < 60; i++) {
       const tasks = await listTasks();

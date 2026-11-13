@@ -24,6 +24,11 @@ use crate::task::{
 pub enum TaskEvent {
     Progress(TaskId, TaskProgress),
     StatusChanged(TaskId, TaskStatus),
+    /// 有任务在等用户确认保存位置。
+    ///
+    /// 桌面应用靠这个事件把窗口弹出来——应用常驻托盘，
+    /// 窗口是隐藏的，光有状态变化用户是看不到弹窗的。
+    ConfirmNeeded(TaskId),
 }
 
 struct Running {
@@ -31,9 +36,21 @@ struct Running {
     /// 用户对当前任务的意图。引擎只知道"被叫停了"，
     /// 是暂停还是取消，得由这里记账。
     intent: Arc<Mutex<Intent>>,
-    /// 用户确认的最终保存位置。None = 用默认位置。
-    /// 下载完成后据此转存。
-    final_path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+/// 一个任务在"等确认"这件事上的状态。
+///
+/// 它挂在 manager 上而不是 Running 上，因为下载引擎跑完之后
+/// Running 条目就被摘掉了，但用户可能这时才点确认——
+/// 状态得比引擎活得久。
+#[derive(Debug, Default)]
+struct ConfirmState {
+    /// 用户确认的最终保存位置。
+    final_path: Option<PathBuf>,
+    /// 引擎是否已经跑完（下载结束）。
+    engine_finished: bool,
+    /// 暂存文件是否已经转存过。保证只转存一次。
+    transferred: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +81,11 @@ struct Inner {
     max_concurrent_tasks: Arc<Mutex<Option<usize>>>,
     /// 排队等待的任务。超过并发上限时先进这里。
     pending: Arc<Mutex<VecDeque<TaskId>>>,
+    /// 各任务"等确认"的状态。
+    ///
+    /// 下载结束和用户确认会同时发生，得靠这个把它们串起来，
+    /// 否则会出现"文件正被下载引擎写，同时又被转存走"的撕裂。
+    confirms: Arc<Mutex<HashMap<TaskId, ConfirmState>>>,
 }
 
 impl DownloadManager {
@@ -83,6 +105,7 @@ impl DownloadManager {
                 default_dir: tokio::sync::RwLock::new(default_dir),
                 max_concurrent_tasks: Arc::new(Mutex::new(None)),
                 pending: Arc::new(Mutex::new(VecDeque::new())),
+                confirms: Arc::new(Mutex::new(HashMap::new())),
             }),
         })
     }
@@ -217,6 +240,10 @@ impl DownloadManager {
 
         // 需要确认保存位置的：先写到暂存文件，用户选完再转存。
         // 暂存目录和最终目录同卷，转存时 rename 是原子操作。
+        //
+        // 关键：状态是 AwaitingConfirm，但下载**照样立刻开始**——
+        // 这跟 IDM 一样（弹窗出现时下载已经在跑）。
+        // 状态只是"在等用户点确认"，不代表没在下载。
         if task.needs_confirm {
             let staging_dir = task.staging_dir();
             std::fs::create_dir_all(&staging_dir).ok();
@@ -225,8 +252,14 @@ impl DownloadManager {
         }
         self.inner.store.insert_task(&task)?;
         self.inner.events
-            .send(TaskEvent::StatusChanged(id, TaskStatus::Queued))
+            .send(TaskEvent::StatusChanged(id, task.status))
             .ok();
+        if task.needs_confirm {
+            // 通知应用：有任务在等确认。
+            // 应用据此把窗口弹到前面——否则窗口藏在托盘里，
+            // 用户根本不知道有个下载在等他点确认。
+            self.inner.events.send(TaskEvent::ConfirmNeeded(id)).ok();
+        }
         Ok(task)
     }
 
@@ -271,24 +304,31 @@ impl DownloadManager {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let intent = Arc::new(Mutex::new(Intent::Active));
-        // 用户确认的最终位置。confirm_path 会往里写，
-        // 下载完成后据此转存暂存文件。
-        let final_path: Arc<Mutex<Option<PathBuf>>> =
-            Arc::new(Mutex::new(task.final_path.clone()));
         self.inner.running
             .lock()
             .await
             .insert(id, Running {
                 cancel: cancel_tx.clone(),
                 intent: intent.clone(),
-                final_path: final_path.clone(),
             });
+
+        // 确认状态挂在 manager 上，比引擎活得久：
+        // 用户可能在下载结束之后才点确认。
+        let confirms = self.inner.confirms.clone();
+        {
+            let mut map = confirms.lock().await;
+            let entry = map.entry(id).or_default();
+            entry.final_path = task.final_path.clone();
+            entry.engine_finished = false;
+            entry.transferred = false;
+        }
 
         let store = self.inner.store.clone();
         let engine = self.inner.engine.clone();
         let events = self.inner.events.clone();
         let live = self.inner.live.clone();
         let task_intent = intent.clone();
+        let task_confirms = confirms.clone();
         let running = self.inner.running.clone();
         let finishing = self.inner.finishing.clone();
         tokio::spawn(async move {
@@ -308,8 +348,21 @@ impl DownloadManager {
                         "downloading" => TaskStatus::Downloading,
                         _ => continue,
                     };
-                    let _ = phase_store.set_status(id, status, None);
-                    let _ = phase_events.send(TaskEvent::StatusChanged(id, status));
+                    // 如果任务还在等用户确认，状态保持 AwaitingConfirm，
+                    // 不然界面上的确认弹窗就没了。
+                    let current = phase_store
+                        .get_task(id)
+                        .ok()
+                        .flatten()
+                        .map(|t| t.status)
+                        .unwrap_or(status);
+                    let final_status = if current == TaskStatus::AwaitingConfirm {
+                        TaskStatus::AwaitingConfirm
+                    } else {
+                        status
+                    };
+                    let _ = phase_store.set_status(id, final_status, None);
+                    let _ = phase_events.send(TaskEvent::StatusChanged(id, final_status));
                 }
             });
 
@@ -325,8 +378,15 @@ impl DownloadManager {
                 }
             });
 
-            let _ = store.set_status(id, TaskStatus::Probing, None);
-            let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Probing));
+            // 等确认的任务保持 AwaitingConfirm 状态，
+            // 这样界面上的确认弹窗不会消失（下载其实已经在跑了）。
+            let probing_status = if task.needs_confirm {
+                TaskStatus::AwaitingConfirm
+            } else {
+                TaskStatus::Probing
+            };
+            let _ = store.set_status(id, probing_status, None);
+            let _ = events.send(TaskEvent::StatusChanged(id, probing_status));
 
             let ctx =
                 crate::http::engine::EngineCtx::new(
@@ -346,43 +406,19 @@ impl DownloadManager {
                     // 别占着 tokio 的工作线程。
                     let bt_task = task.clone();
                     let bt_ctx = ctx.clone();
-                    // 跨线程用标准 channel：tokio 的 mpsc 在这两个线程模型之间
-                    // 不好搭（BT 线程是阻塞的，转发线程是 async 的）。
-                    let (tx, rx) = std::sync::mpsc::channel::<crate::http::engine::TaskProgress>();
-
-                    let handle = std::thread::spawn(move || {
-                        let mut report =
-                            |downloaded: u64, total: u64, speed: u64, peers: usize| {
-                                let _ = tx.send(crate::http::engine::TaskProgress {
-                                    downloaded,
-                                    total: Some(total),
-                                    speed,
-                                    connections: peers,
-                                    segments: Vec::new(),
-                                    note: None,
-                                });
-                            };
-                        crate::bt::download(&bt_task, &bt_ctx, &mut report)
-                    });
-
-                    // 把 BT 线程的进度转回 tokio 通道
-                    let bt_progress = ctx.progress.clone();
-                    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-                    tokio::spawn(async move {
-                        // 把 BT 线程的进度转回 tokio 通道
-                        while let Ok(p) = rx.recv() {
-                            let _ = bt_progress.send(p);
-                        }
-                        let _ = done_tx.send(());
-                    });
-
-                    // 等待 BT 线程结束
-                    let joined = tokio::task::spawn_blocking(move || handle.join()).await;
-                    let _ = done_rx.await;
+                    // 进度直接用 ctx 里的 tokio 通道发——
+                    // tokio 的 mpsc sender 是 Send + Sync，跨线程发没问题，
+                    // 不需要中间再套一层转发线程。
+                    //
+                    // 之前那层转发用 std::sync::mpsc 的 recv()，
+                    // 那是阻塞调用，会占死一个 tokio 工作线程。
+                    let joined = tokio::task::spawn_blocking(move || {
+                        crate::bt::download(&bt_task, &bt_ctx)
+                    })
+                    .await;
 
                     match joined {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(_panic)) => Err(anyhow!("BT 线程 panic")),
+                        Ok(result) => result,
                         Err(err) => Err(anyhow!("BT 线程异常: {err}")),
                     }
                 }
@@ -391,35 +427,73 @@ impl DownloadManager {
 
             let intent = *task_intent.lock().await;
 
-            // 下载完成后转存：把暂存文件挪到用户确认的位置。
+            // 下载结束了。转存要同时满足两个条件：
+            //  1. 引擎跑完了（engine_finished）
+            //  2. 用户确认过位置了（final_path 有值）
+            //
+            // 两者都齐了才动文件。这样就不会出现
+            // "文件正被下载引擎写，同时被转存走"的撕裂。
             if matches!(result, Ok(())) {
-                // 优先用内存里的确认结果；拿不到就读数据库。
-                // 用户可能在任务启动之前就确认了，那时内存槽是空的，
-                // 但数据库里已经记下了最终位置。
-                let mut target = final_path.lock().await.clone();
-                if target.is_none() {
-                    if let Ok(Some(fresh)) = store.get_task(id) {
-                        target = fresh.final_path.clone();
+                let ready = {
+                    let mut map = task_confirms.lock().await;
+                    let c = map.entry(id).or_default();
+                    c.engine_finished = true;
+                    // 用户抢在下载结束之前确认过，位置从数据库兜底读回来
+                    if c.final_path.is_none() {
+                        if let Ok(Some(fresh)) = store.get_task(id) {
+                            c.final_path = fresh.final_path.clone();
+                        }
                     }
-                }
-                if let Err(err) = finalize_download(&task, target.as_ref()).await {
-                    tracing::error!(task = %id, "转存失败: {err}");
-                    let error = Some(TaskError::new("finalize_failed", err.to_string()));
-                    let _ = store.set_status(id, TaskStatus::Error, error.as_ref());
-                    let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Error));
-                    let _ = progress_task.await;
-                    let _ = phase_task.await;
-                    running.lock().await.remove(&id);
-                    manager_finishing.lock().await.remove(&id);
-                    return;
+                    c.final_path.is_some() && !c.transferred
+                };
+
+                if ready {
+                    let target = {
+                        let mut map = task_confirms.lock().await;
+                        let c = map.entry(id).or_default();
+                        if c.transferred {
+                            None
+                        } else {
+                            c.transferred = true;
+                            c.final_path.clone()
+                        }
+                    };
+                    if let Some(target) = target {
+                        if let Err(err) = finalize_download(&task, Some(&target)).await {
+                            tracing::error!(task = %id, "转存失败: {err}");
+                            let error = Some(TaskError::new("finalize_failed", err.to_string()));
+                            let _ = store.set_status(id, TaskStatus::Error, error.as_ref());
+                            let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Error));
+                            let _ = progress_task.await;
+                            let _ = phase_task.await;
+                            running.lock().await.remove(&id);
+                            manager_finishing.lock().await.remove(&id);
+                            return;
+                        }
+                    }
                 }
             }
 
             match (result, intent) {
                 (Ok(()), _) => {
-                    let _ = store.set_status(id, TaskStatus::Completed, None);
-                    let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Completed));
-                    tracing::info!(task = %id, "任务完成");
+                    // 还没确认位置的话，状态保持 AwaitingConfirm，
+                    // 等用户点确认时再转存并置为完成。
+                    let awaiting = {
+                        let map = task_confirms.lock().await;
+                        task.needs_confirm
+                            && map
+                                .get(&id)
+                                .map(|c| c.final_path.is_none())
+                                .unwrap_or(true)
+                    };
+                    let status = if awaiting {
+                        TaskStatus::AwaitingConfirm
+                    } else {
+                        TaskStatus::Completed
+                    };
+                    let _ = store.set_status(id, status, None);
+                    let _ = events.send(TaskEvent::StatusChanged(id, status));
+                    tracing::info!(task = %id, status = ?status, "下载结束");
                 }
                 (Err(_), Intent::Paused) => {
                     // 暂停：保留已完成区间，等用户继续
@@ -428,11 +502,16 @@ impl DownloadManager {
                     tracing::info!(task = %id, "任务已暂停");
                 }
                 (Err(_), Intent::Cancelled) => {
+                    // 取消了就没什么可确认的了，把标记清掉，
+                    // 不然下次打开界面还会拿这个任务弹窗。
+                    clear_needs_confirm(&store, id);
                     let _ = store.set_status(id, TaskStatus::Cancelled, None);
                     let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Cancelled));
                     tracing::info!(task = %id, "任务已取消");
                 }
                 (Err(err), Intent::Active) => {
+                    // 同上：失败的任务不该再问保存位置。
+                    clear_needs_confirm(&store, id);
                     let error = Some(TaskError::new("download_failed", err.to_string()));
                     let _ = store.set_status(id, TaskStatus::Error, error.as_ref());
                     let _ = events.send(TaskEvent::StatusChanged(id, TaskStatus::Error));
@@ -486,48 +565,60 @@ impl DownloadManager {
             .get_task(id)?
             .ok_or_else(|| anyhow!("任务不存在"))?;
 
-        let running = self.inner.running.lock().await;
-        if let Some(r) = running.get(&id) {
-            *r.final_path.lock().await = path.clone();
-        }
-        drop(running);
-
-        // 任务还没进 running 表（用户抢在下载启动前就确认了）：
-        // 把路径存进任务本身，start 时会带上它。
+        // 解析最终落盘位置。
+        //
+        // 关键：没给路径时也要解析成默认位置（目录 + 原文件名），
+        // 不能留成 None——留成 None 的话，下载完成那一步
+        // 会以为"用户还没确认"，把文件永远留在暂存目录里。
+        let resolved = match path {
+            Some(p) => p,
+            None => task.target_path(),
+        };
 
         // 落库，重启后也知道最终位置
-        task.final_path = path.clone();
+        task.final_path = Some(resolved.clone());
         task.needs_confirm = false;
         self.inner.store.update_task(&task)?;
 
-        // 下载已经完成才确认：文件已经转到默认位置了，再挪一次。
-        if task.status == TaskStatus::Completed {
-            if let Some(target) = path {
-                if let Some(staging) = task.staging_path.as_ref() {
-                    // 已经转存过了，把最终文件挪到新位置
-                    let current = task.target_path();
-                    if current.exists() && current != target {
-                        if let Some(parent) = target.parent() {
-                            tokio::fs::create_dir_all(parent).await.ok();
-                        }
-                        let moved = tokio::fs::rename(&current, &target).await.is_ok()
-                            || {
-                                let copied = tokio::fs::copy(&current, &target).await.is_ok();
-                                if copied {
-                                    let _ = tokio::fs::remove_file(&current).await;
-                                }
-                                copied
-                            };
-                        if moved {
-                            let _ = tokio::fs::remove_file(staging).await;
-                        }
-                    }
-                }
+        // 和下载结束那一步协调。
+        //
+        // 只有"引擎已经跑完"的时候才转存暂存文件。
+        // 之前这里用的是 downloaded > 0 来判断"下载完了"，
+        // 可下载中途 downloaded 也大于 0——于是会在下载引擎
+        // 还在往暂存文件里写的时候把它挪走，文件直接损坏。
+        //
+        // 现在：确认只负责记录位置；转存由"引擎跑完"那一侧触发。
+        let mut transfer_now = false;
+        {
+            let mut map = self.inner.confirms.lock().await;
+            let c = map.entry(id).or_default();
+            c.final_path = Some(resolved.clone());
+            // 引擎已经跑完的话，现在就可以转存
+            if c.engine_finished && !c.transferred {
+                c.transferred = true;
+                transfer_now = true;
             }
+        }
+
+        if transfer_now {
+            if let Err(err) = finalize_download(&task, Some(&resolved)).await {
+                let error = Some(TaskError::new("finalize_failed", err.to_string()));
+                self.inner.store.set_status(id, TaskStatus::Error, error.as_ref())?;
+                self.inner
+                    .events
+                    .send(TaskEvent::StatusChanged(id, TaskStatus::Error))
+                    .ok();
+                return Err(err);
+            }
+            self.inner.store.set_status(id, TaskStatus::Completed, None)?;
+            self.inner
+                .events
+                .send(TaskEvent::StatusChanged(id, TaskStatus::Completed))
+                .ok();
             return Ok(());
         }
 
-        // 已经进入 AwaitingConfirm 的，改回正常状态
+        // 还在下载中：状态改回下载中，等下载结束那一步转存。
         if task.status == TaskStatus::AwaitingConfirm {
             self.inner
                 .store
@@ -582,9 +673,33 @@ impl DownloadManager {
         let task = self.inner.store.get_task(id)?;
         if let Some(task) = &task {
             if delete_file {
-                let path = task.target_path();
-                if path.exists() {
-                    tokio::fs::remove_file(&path).await.ok();
+                // 三个位置都得清：
+                //  - final_path：用户确认后文件落的地方
+                //  - target_path：默认位置（没确认过，或者选了默认目录）
+                //  - staging_path：还在暂存目录里的半成品
+                //
+                // 之前只删 target_path，用户选了别的位置时
+                // 真正的文件会变成删不掉的孤儿。
+                let mut paths = vec![task.target_path()];
+                if let Some(final_path) = task.final_path.clone() {
+                    if !paths.contains(&final_path) {
+                        paths.push(final_path);
+                    }
+                }
+                if let Some(staging) = task.staging_path.clone() {
+                    if !paths.contains(&staging) {
+                        paths.push(staging);
+                    }
+                }
+
+                for path in paths {
+                    if path.exists() {
+                        tokio::fs::remove_file(&path).await.ok();
+                    }
+                }
+                // 暂存目录空了就删掉
+                if let Some(staging) = task.staging_path.as_ref().and_then(|p| p.parent()) {
+                    let _ = tokio::fs::remove_dir(staging).await;
                 }
             }
         }
@@ -593,6 +708,8 @@ impl DownloadManager {
             let _ = r.cancel.send(true);
         }
         drop(running);
+        // 这个任务的确认状态也一并清掉
+        self.inner.confirms.lock().await.remove(&id);
         self.inner.store.delete_task(id)?;
         Ok(())
     }
@@ -706,6 +823,19 @@ async fn finalize_download(task: &Task, target: Option<&PathBuf>) -> Result<()> 
         let _ = tokio::fs::remove_dir(staging_dir).await;
     }
     Ok(())
+}
+
+/// 任务不再需要用户确认保存位置时，清掉这个标记。
+///
+/// 失败或取消之后标记还留在库里的话，下次打开界面
+/// 还会拿这个早就没意义的任务弹窗——之前就出过这个毛病。
+fn clear_needs_confirm(store: &Store, id: TaskId) {
+    if let Ok(Some(mut task)) = store.get_task(id) {
+        if task.needs_confirm {
+            task.needs_confirm = false;
+            let _ = store.update_task(&task);
+        }
+    }
 }
 
 /// 引擎类型探测：URL 或响应看起来像 HLS 就走 HLS 引擎。

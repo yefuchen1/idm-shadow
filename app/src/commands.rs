@@ -68,12 +68,24 @@ pub async fn add_task(
 pub async fn confirm_task(
     state: State<'_, AppState>,
     id: String,
-    path: Option<String>,
+    dir: Option<String>,
 ) -> Result<(), String> {
     let id = parse_id(&id)?;
-    let path = path
-        .filter(|p| !p.trim().is_empty())
-        .map(std::path::PathBuf::from);
+    // 只给目录时，目录 + 原文件名才是最终落盘位置。
+    //
+    // 之前这里把目录直接当成了完整路径，结果文件会落在
+    // "D:\chosen-dir" 这个目录名上，而不是 "D:\chosen-dir\原文件名"。
+    let path = match dir.filter(|d| !d.trim().is_empty()) {
+        Some(d) => {
+            let task = state
+                .manager
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "任务不存在".to_string())?;
+            Some(std::path::PathBuf::from(d).join(&task.filename))
+        }
+        None => None,
+    };
     state
         .manager
         .confirm_path(id, path)

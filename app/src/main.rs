@@ -179,6 +179,23 @@ fn main() {
                                         "end": s.end,
                                         "speed": s.speed,
                                     })).collect::<Vec<_>>(),
+                                    "pieces": progress.pieces.as_ref().map(|ps| serde_json::json!({
+                                        "total": ps.total,
+                                        "verified": ps.verified,
+                                        "corrupted": ps.corrupted,
+                                        "verification_failures": ps.verification_failures,
+                                        "cells": ps.cells.iter().map(|c| serde_json::json!({
+                                            "from": c.from,
+                                            "to": c.to,
+                                            "state": match c.state {
+                                                idm_shadow_engine::http::engine::PieceState::Missing => "missing",
+                                                idm_shadow_engine::http::engine::PieceState::Verified => "verified",
+                                                idm_shadow_engine::http::engine::PieceState::Partial => "partial",
+                                                idm_shadow_engine::http::engine::PieceState::Corrupted => "corrupted",
+                                            },
+                                            "availability": c.availability,
+                                        })).collect::<Vec<_>>(),
+                                    })),
                                 }),
                             );
                         }
@@ -190,6 +207,21 @@ fn main() {
                                     "status": status.as_str(),
                                 }),
                             );
+                        }
+                        TaskEvent::ConfirmNeeded(id) => {
+                            // 有下载在等用户确认保存位置。
+                            // 应用通常待在托盘里、窗口是隐藏的，
+                            // 所以这里要把窗口叫到前面来，
+                            // 否则弹窗渲染了但用户看不见。
+                            let _ = handle.emit(
+                                "task-confirm-needed",
+                                serde_json::json!({ "id": id.to_string() }),
+                            );
+                            if let Some(window) = handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
                         }
                     }
                 }

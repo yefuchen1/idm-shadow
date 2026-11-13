@@ -85,6 +85,7 @@ pub async fn download_playlist(
                 connections: done,
                 segments: Vec::new(),
                 note: None,
+                ..Default::default()
             });
         },
     )
@@ -108,6 +109,7 @@ pub async fn download_playlist(
         connections: 0,
         segments: Vec::new(),
         note: Some(note),
+        ..Default::default()
     });
 
     tracing::info!(

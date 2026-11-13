@@ -566,8 +566,11 @@ async fn confirm_before_start_still_transfers_to_chosen_path() {
 }
 #[tokio::test]
 async fn confirm_after_completion_moves_the_file() {
-    // 回归测试：下载很快，先下完了，用户才点确认。
-    // 这时文件已经转存到默认位置，确认应当把它挪到新位置。
+    // 回归测试：下载很快时，用户点确认之前文件就下完了。
+    //
+    // IDM 式的流程是：文件先落在暂存位置，用户确认后才转存。
+    // 所以下载完成时，文件应该在 .idmshadow/ 下的暂存文件里，
+    // 默认目录不该有东西；确认之后才出现在用户选的位置。
     let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -588,6 +591,89 @@ async fn confirm_after_completion_moves_the_file() {
         .unwrap();
 
     mgr.start(task.id).await.unwrap();
+
+    // 等下载完成。注意状态是 AwaitingConfirm（还在等用户点确认），
+    // 不是 Completed——文件下完了但还没转存。
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.downloaded == body.len() as u64)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "下载应当完成");
+
+    // 文件在暂存位置，默认目录是干净的
+    assert!(
+        !dir.join("late.bin").exists(),
+        "确认之前默认目录不该有文件"
+    );
+    let staging = dir.join(".idmshadow").join(format!("{}.part", task.id));
+    assert!(staging.exists(), "暂存文件应当存在");
+
+    // 用户确认另一个位置
+    let custom = dir.join("late-target");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("late.bin")))
+        .await
+        .unwrap();
+
+    let final_file = custom.join("late.bin");
+    assert!(final_file.exists(), "确认后文件应当出现在目标位置");
+    assert!(!staging.exists(), "暂存文件应当被转存掉");
+
+    let content = std::fs::read(&final_file).unwrap();
+    assert!(content == body, "转存后内容必须一致");
+
+    // 状态变成已完成
+    let after = mgr.get(task.id).unwrap().unwrap();
+    assert_eq!(after.status, TaskStatus::Completed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn confirm_without_custom_path_lands_in_the_default_dir() {
+    // 回归测试：用户点"直接下载"，没指定目录。
+    //
+    // 之前 confirm_path 把"没给路径"原样记成 None，
+    // 下载完成那一步看到 final_path 是 None，就以为
+    // "用户还没确认"，把文件永远留在 .idmshadow 暂存目录里，
+    // 界面上还显示成"待确认"——下载完了却不见文件。
+    //
+    // 现在没给路径就解析成 默认目录 + 原文件名。
+    let body: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-default");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/default.bin"),
+            filename: Some("default.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 直接下载：不给路径
+    mgr.confirm_path(task.id, None).await.unwrap();
+
+    let confirmed = mgr.get(task.id).unwrap().unwrap();
+    assert!(
+        confirmed.final_path.is_some(),
+        "确认后必须记下最终位置，否则文件会卡在暂存目录"
+    );
+
+    mgr.start(task.id).await.unwrap();
     let done = wait_for(
         || {
             mgr.get(task.id)
@@ -600,26 +686,199 @@ async fn confirm_after_completion_moves_the_file() {
     .await;
     assert!(done, "任务应当下载完成");
 
-    // 默认位置已经有文件了
-    assert!(dir.join("late.bin").exists(), "默认位置应当有文件");
+    // 文件应当在默认目录里
+    let final_file = dir.join("default.bin");
+    assert!(
+        final_file.exists(),
+        "直接下载后文件应当出现在默认目录，而不是留在暂存目录"
+    );
+    let content = std::fs::read(&final_file).unwrap();
+    assert!(content == body, "内容必须一致");
 
-    // 这时候用户才确认另一个位置
-    let custom = dir.join("late-target");
-    std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("late.bin")))
+    // 暂存目录不该有残留
+    let staging = dir.join(".idmshadow").join(format!("{}.part", task.id));
+    assert!(!staging.exists(), "暂存文件应当被转存掉");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn confirm_while_downloading_keeps_running_until_the_file_lands() {
+    // 回归测试：下载进行中点确认。
+    //
+    // 确认只是记录最终位置，不该打断下载。
+    // 下载结束后再转存到那个位置。
+    let body: Vec<u8> = (0..800_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-live");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/live.bin"),
+            filename: Some("live.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
         .await
         .unwrap();
 
+    mgr.start(task.id).await.unwrap();
+
+    // 等下载真的动起来
+    let started = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.downloaded > 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(started, "下载应当已经开始");
+
+    // 下载中确认到另一个目录
+    let custom = dir.join("live-target");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("live.bin")))
+        .await
+        .unwrap();
+
+    // 确认不该把任务打断——状态回到下载中
+    let mid = mgr.get(task.id).unwrap().unwrap();
+    assert_eq!(mid.status, TaskStatus::Downloading);
+    assert!(!mid.needs_confirm);
+
+    // 等它下完
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(40),
+    )
+    .await;
+    assert!(done, "确认之后下载应当继续并完成");
+
+    let final_file = custom.join("live.bin");
+    assert!(final_file.exists(), "文件应当转存到确认的位置");
+    let content = std::fs::read(&final_file).unwrap();
+    assert!(content == body, "内容必须一致");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn removing_a_task_deletes_the_file_it_actually_landed_on() {
+    // 回归测试：用户在确认弹窗里选了别的目录，文件落在那儿。
+    //
+    // 之前删除任务只删默认目录里的路径，用户选的位置上
+    // 那个真文件会变成删不掉的孤儿，白占磁盘。
+    let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("remove-final");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/rm.bin"),
+            filename: Some("rm.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let custom = dir.join("rm-target");
+    std::fs::create_dir_all(&custom).unwrap();
+    mgr.confirm_path(task.id, Some(custom.join("rm.bin")))
+        .await
+        .unwrap();
+
+    mgr.start(task.id).await.unwrap();
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "任务应当下载完成");
+
+    let final_file = custom.join("rm.bin");
+    assert!(final_file.exists(), "文件应当在用户选的位置");
+
+    // 删除任务并勾上"删除文件"
+    mgr.remove(task.id, true).await.unwrap();
+
     assert!(
-        custom.join("late.bin").exists(),
-        "确认后文件应当被挪到新位置"
+        !final_file.exists(),
+        "用户选的位置上的文件也应当被删掉，不能留孤儿"
     );
     assert!(
-        !dir.join("late.bin").exists(),
-        "默认位置不该残留文件"
+        !dir.join("rm.bin").exists(),
+        "默认位置也不该残留文件"
     );
-    let content = std::fs::read(custom.join("late.bin")).unwrap();
-    assert!(content == body, "挪动之后内容必须一致");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_failed_task_stops_asking_for_a_save_location() {
+    // 回归测试：任务在等确认的时候下载失败。
+    //
+    // 之前 needs_confirm 标记会一直留在库里，
+    // 于是界面下次打开还会拿这个早就失败的任务弹确认框——
+    // 而且因为任务列表按创建顺序排，弹出来的往往还是它，
+    // 用户看到的是错的文件名，点"直接下载"会确认错对象。
+    let dir = temp_dir("confirm-fail");
+    let mgr = manager(&dir);
+
+    // 指向一个不存在的地址，任务会 404
+    let task = mgr
+        .add(TaskRequest {
+            url: "http://127.0.0.1:1/nope.bin".to_string(),
+            filename: Some("nope.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    mgr.start(task.id).await.unwrap();
+
+    let failed = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Error)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(failed, "任务应当失败");
+
+    let after = mgr.get(task.id).unwrap().unwrap();
+    assert!(
+        !after.needs_confirm,
+        "任务失败之后不该再弹保存位置确认框"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

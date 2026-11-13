@@ -22,12 +22,51 @@ import {
   STATUS_LABEL,
   type SettingsDto,
   type SegmentDto,
+  type PieceStatusDto,
   type TaskDto,
   type TaskStatus
 } from "./api";
 import { SegmentBar } from "./SegmentBar";
+import { PieceBar } from "./PieceBar";
 
 const ACTIVE: TaskStatus[] = ["queued", "probing", "downloading", "retrying"];
+
+/** 任务到了这些状态就不用再问用户保存位置了。 */
+const TERMINAL: TaskStatus[] = ["completed", "error", "cancelled"];
+
+/**
+ * 确认弹窗里的下载状态。
+ *
+ * IDM 的行为是"弹窗出现时下载已经在跑了"，所以这里把
+ * 已下载 / 总大小 / 速度 / 连接数摆出来，让用户知道
+ * 这东西确实在动，不是一个卡住的对话框。
+ */
+function ConfirmProgress({ task }: { task: TaskDto }) {
+  const running = task.status === "downloading" || task.status === "awaiting_confirm";
+  if (!running) return null;
+
+  return (
+    <div className="confirm-progress">
+      <div className="confirm-progress-bar">
+        <div
+          className="confirm-progress-fill"
+          style={{
+            width: task.total_size
+              ? `${Math.min(100, (task.downloaded / task.total_size) * 100)}%`
+              : "0%"
+          }}
+        />
+      </div>
+      <span className="confirm-progress-text">
+        {task.total_size
+          ? `${formatSize(task.downloaded)} / ${formatSize(task.total_size)}`
+          : formatSize(task.downloaded)}
+        {task.speed > 0 && ` · ${formatSpeed(task.speed)}`}
+        {task.connections > 0 && ` · ${task.connections} 连接`}
+      </span>
+    </div>
+  );
+}
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskDto[]>([]);
@@ -50,6 +89,8 @@ export default function App() {
   const [deleteFile, setDeleteFile] = useState(true);
   const [confirmTarget, setConfirmTarget] = useState<TaskDto | null>(null);
   const [confirmDir, setConfirmDir] = useState("");
+  // 已经确认过的任务，不再弹窗
+  const [confirmedIds, setConfirmedIds] = useState<Set<string>>(new Set());
   const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -87,6 +128,7 @@ export default function App() {
       connections: number;
       note: string | null;
       segments: SegmentDto[];
+      pieces: PieceStatusDto | null;
     }>("task-progress", (event) => {
       const p = event.payload;
       setTasks((prev) =>
@@ -99,7 +141,8 @@ export default function App() {
                 speed: p.speed,
                 connections: p.connections,
                 note: p.note ?? t.note,
-                segments: p.segments ?? t.segments
+                segments: p.segments ?? t.segments,
+                pieces: p.pieces ?? t.pieces
               }
             : t
         )
@@ -119,11 +162,22 @@ export default function App() {
       }
     );
 
+    // 有任务在等确认：立刻拉一次任务列表。
+    // 不等轮询（1.5 秒一次）——浏览器点了下载之后，
+    // 用户盯着屏幕等弹窗，这个延迟是能感觉到的。
+    const unlistenConfirm = listen<{ id: string }>(
+      "task-confirm-needed",
+      () => {
+        refresh();
+      }
+    );
+
     const timer = window.setInterval(refresh, 1500);
     return () => {
       window.clearInterval(timer);
       unlistenProgress.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
+      unlistenConfirm.then((fn) => fn());
     };
   }, [refresh]);
 
@@ -153,19 +207,42 @@ export default function App() {
   // 有任务在等确认，就弹窗。下载这时候已经在跑了。
   useEffect(() => {
     const pending = tasks.find(
-      (t) => t.needs_confirm && t.status === "awaiting_confirm"
+      (t) =>
+        t.needs_confirm &&
+        !confirmedIds.has(t.id) &&
+        // 失败/取消/完成的任务不再问。
+        //
+        // 之前这里只查 needs_confirm，可任务失败之后这个标记还留在库里，
+        // 于是弹窗弹的是那个早就失败的老任务——文件名都是错的，
+        // 点"直接下载"会确认错对象。
+        !TERMINAL.includes(t.status)
     );
     if (pending && !confirmTarget) {
       setConfirmTarget(pending);
       setConfirmDir(settings?.download_dir ?? "");
     }
-  }, [tasks, confirmTarget, settings]);
+  }, [tasks, confirmTarget, settings, confirmedIds]);
+
+  // 弹窗里的下载进度要跟着实时刷新，
+  // 否则 confirmTarget 只是一份建弹窗那一刻的快照，数字不会动。
+  useEffect(() => {
+    if (!confirmTarget) return;
+    const fresh = tasks.find((t) => t.id === confirmTarget.id);
+    if (!fresh || TERMINAL.includes(fresh.status)) {
+      // 弹窗开着的时候任务挂了（下载失败、被取消），
+      // 留着弹窗只会让人点一个已经没意义的"直接下载"。
+      setConfirmTarget(null);
+    } else if (fresh !== confirmTarget) {
+      setConfirmTarget(fresh);
+    }
+  }, [tasks, confirmTarget]);
 
   async function confirmDownload(useCustomDir: boolean) {
     if (!confirmTarget) return;
     const target = confirmTarget;
     const dir = confirmDir.trim();
     setConfirmTarget(null);
+    setConfirmedIds((prev) => new Set(prev).add(target.id));
     await guard(async () => {
       await api.confirmTask(
         target.id,
@@ -178,6 +255,7 @@ export default function App() {
     if (!confirmTarget) return;
     const target = confirmTarget;
     setConfirmTarget(null);
+    setConfirmedIds((prev) => new Set(prev).add(target.id));
     await guard(() => api.cancelConfirmedTask(target.id));
   }
 
@@ -539,6 +617,9 @@ export default function App() {
                   total={task.total_size}
                   downloaded={task.downloaded}
                 />
+                {task.engine === "bt" && task.pieces && (
+                  <PieceBar pieces={task.pieces} />
+                )}
                 <span className="subtle">
                   {formatSize(task.downloaded)}
                   {task.total_size !== null
@@ -652,6 +733,7 @@ export default function App() {
           <div className="modal">
             <h2>下载此文件</h2>
             <p className="modal-text">{confirmTarget.filename}</p>
+            <ConfirmProgress task={confirmTarget} />
             <div className="confirm-actions">
               <button
                 className="btn primary"
@@ -667,9 +749,10 @@ export default function App() {
               </button>
             </div>
             <div className="confirm-dir">
+              <span className="confirm-dir-label">保存到</span>
               <input
                 className="dir-input"
-                placeholder="保存位置"
+                placeholder={settings?.download_dir ?? "默认下载目录"}
                 value={confirmDir}
                 onChange={(e) => setConfirmDir(e.target.value)}
               />
