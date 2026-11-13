@@ -59,7 +59,21 @@ const chrome = {
     search: async () => []
   },
   notifications: {
-    create: record('notifications'),
+    // 真实浏览器会校验通知的必填字段（type/iconUrl/title/message），
+    // 少一个就抛 "Some of the required properties are missing"。
+    // mock 也照着校验，免得这种错误等到实机才发现。
+    create: (...args) => {
+      const [, opts] = args;
+      const missing = ['type', 'iconUrl', 'title', 'message'].filter(
+        (k) => !opts || !opts[k]
+      );
+      if (missing.length) {
+        throw new Error(
+          `Some of the required properties are missing: ${missing.join(', ')}`
+        );
+      }
+      calls.notifications.push(args);
+    },
     onButtonClicked: { addListener: (fn) => (listeners.onButton = fn) },
     clear: () => {}
   },
@@ -67,6 +81,7 @@ const chrome = {
     onInstalled: { addListener: (fn) => (listeners.onInstalled = fn) },
     onStartup: { addListener: (fn) => (listeners.onStartup = fn) },
     onMessage: { addListener: (fn) => (listeners.onMessage = fn) },
+    getURL: (p) => `chrome-extension://test-id/${p}`,
     sendMessage: () => {},
     lastError: null
   },

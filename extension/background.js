@@ -358,6 +358,9 @@ async function notifyAsk(item) {
   try {
     await chrome.notifications.create(id, {
       type: 'basic',
+      // MV3 的通知必须有图标，否则报
+      // "Some of the required properties are missing: type, iconUrl, title and message"
+      iconUrl: chrome.runtime.getURL('icon32.png'),
       title: '用 IDM Shadow 下载？',
       message: item.filename || item.url,
       buttons: [{ title: '交给 IDM Shadow' }],

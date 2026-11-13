@@ -26,7 +26,18 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "IDM Shadow"
+    "default_title": "IDM Shadow",
+    "default_icon": {
+      "16": "icon32.png",
+      "32": "icon32.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon32.png",
+    "32": "icon32.png",
+    "128": "icon.png"
   },
   "options_page": "options.html"
 }

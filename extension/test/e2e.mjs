@@ -205,6 +205,21 @@ try {
   await optPage.click('#save');
   log('扩展设置已写入');
 
+  // 「自动配置」按钮：装好扩展后不用手抄 token。
+  // 顺带验证引导接口在真实浏览器里能通（Origin 是扩展 origin）。
+  await optPage.fill('#token', '');
+  await optPage.click('#auto');
+  await optPage.waitForFunction(
+    () => document.getElementById('autoMsg').textContent.includes('配置好了'),
+    { timeout: 10000 }
+  ).catch(() => {});
+  const autoMsg = await optPage.textContent('#autoMsg');
+  check('自动配置能找到应用并填好 token', autoMsg.includes('配置好了'), autoMsg);
+
+  // 切回 auto 模式继续测接管
+  await optPage.selectOption('#mode', 'auto');
+  await optPage.click('#save');
+
   const before = await listTasks();
 
   // 打开一个会触发下载的页面
@@ -307,6 +322,42 @@ try {
   const after = await listTasks();
   check('只投递了一个任务', after.length === before.length + 1,
     `${before.length} -> ${after.length}`);
+
+  // ask 模式：弹通知让用户确认，不直接接管。
+  //
+  // 这条路要过 chrome.notifications，而 MV3 的通知必须带 iconUrl，
+  // 少一个字段就抛 "Some of the required properties are missing"。
+  // 之前这个错误只有实机才看得到——单元测试的 mock 不校验通知形状。
+  await optPage.selectOption('#mode', 'ask');
+  await optPage.click('#save');
+
+  // 看看扩展的 service worker 有没有报错
+  const sw = browser.serviceWorkers()[0];
+  const errors = [];
+  if (sw) {
+    sw.on('console', (msg) => {
+      if (msg.type() === 'error') errors.push(msg.text());
+    });
+  }
+
+  const page2 = await browser.newPage();
+  try {
+    await page2.goto(`http://127.0.0.1:${SERVER_PORT}/file2.bin`);
+  } catch (err) {
+    if (!/Download is starting/i.test(err.message)) throw err;
+  }
+  await new Promise((r) => setTimeout(r, 2500));
+
+  const missingProps = errors.filter((e) =>
+    /required properties are missing/i.test(e)
+  );
+  check('ask 模式的通知没有缺字段', missingProps.length === 0,
+    missingProps[0] || errors.join(' | '));
+
+  // ask 模式不该自动投递给应用
+  const afterAsk = await listTasks();
+  check('ask 模式不会自动接管', afterAsk.length === after.length,
+    `${after.length} -> ${afterAsk.length}`);
 } catch (err) {
   failures += 1;
   console.error('FAIL  测试执行出错:', err.message);
