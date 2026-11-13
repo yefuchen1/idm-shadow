@@ -221,7 +221,18 @@ async function launchApp(url, name) {
   if (name) params.set('name', name);
   const target = params.toString() ? `idmshadow://dl?${params.toString()}` : 'idmshadow://';
   try {
-    await chrome.tabs.create({ url: target, active: false });
+    // 协议链接只能靠开标签页来触发，但 Edge 会把这个标签页
+    // 显示成「无法访问此页面」的错误页——用完就关掉。
+    const tab = await chrome.tabs.create({ url: target, active: false });
+    if (tab && tab.id !== undefined) {
+      setTimeout(async () => {
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch (err) {
+          // 标签页已经关了
+        }
+      }, 1200);
+    }
   } catch (err) {
     console.warn('[IDM Shadow] 唤起应用失败', err);
   }

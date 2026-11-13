@@ -83,8 +83,30 @@ $('mode').addEventListener('change', (event) => {
 });
 
 $('open').addEventListener('click', () => {
-  chrome.tabs.create({ url: 'idmshadow://' });
+  // 让应用把主窗口叫到前面。
+  //
+  // 以前这里用的是 chrome.tabs.create({ url: 'idmshadow://' })，
+  // Edge 会开一个标签页去加载协议链接，然后把
+  // 「无法访问此页面 / localhost 拒绝连接」的错误页留在那儿。
+  // 走 bridge 接口就没这个问题。
+  showAppWindow();
 });
+
+async function showAppWindow() {
+  const s = await chrome.storage.local.get({
+    bridgeUrl: 'http://127.0.0.1:16888',
+    token: ''
+  });
+  if (!s.token) return;
+  try {
+    await fetch(`${s.bridgeUrl}/api/v1/ui/show`, {
+      method: 'POST',
+      headers: { 'X-IDM-Shadow-Token': s.token }
+    });
+  } catch (err) {
+    // 应用没在跑，忽略
+  }
+}
 
 $('options').addEventListener('click', () => {
   chrome.runtime.openOptionsPage();

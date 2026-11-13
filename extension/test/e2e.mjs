@@ -358,6 +358,20 @@ try {
   const afterAsk = await listTasks();
   check('ask 模式不会自动接管', afterAsk.length === after.length,
     `${after.length} -> ${afterAsk.length}`);
+
+  // popup 的「打开主界面」不该开出标签页。
+  //
+  // 以前这里用 chrome.tabs.create({ url: 'idmshadow://' })，
+  // Edge 会开一个标签页去加载协议链接，然后把
+  // 「无法访问此页面 / localhost 拒绝连接」的错误页留在那儿。
+  const popupPage = await browser.newPage();
+  await popupPage.goto(`chrome-extension://${extId}/popup.html`);
+  const tabsBefore = browser.pages().length;
+  await popupPage.click('#open');
+  await new Promise((r) => setTimeout(r, 1500));
+  const tabsAfter = browser.pages().length;
+  check('点「打开主界面」不会开出错误标签页', tabsAfter === tabsBefore,
+    `${tabsBefore} -> ${tabsAfter}`);
 } catch (err) {
   failures += 1;
   console.error('FAIL  测试执行出错:', err.message);

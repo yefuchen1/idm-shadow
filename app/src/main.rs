@@ -128,10 +128,22 @@ fn main() {
                 .unwrap_or(16888);
             store.set_setting("bridge_port", &port.to_string())?;
 
+            // AppHandle 是 Send + Sync，能进 Arc 闭包；App 不是。
+            let app_handle = app.handle().clone();
             let bridge_state = idm_shadow_bridge::BridgeState {
                 manager: manager.clone(),
                 token: Arc::new(token.clone()),
                 port,
+                // 扩展点「打开主界面」时调它，把窗口叫到前面。
+                // 用 AppHandle 而不是 App——后者不是 Sync，进不了 Arc。
+                show_ui: Some(Arc::new(move || {
+                    let handle = app_handle.clone();
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                })),
             };
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = idm_shadow_bridge::serve(bridge_state, port).await {

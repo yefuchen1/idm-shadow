@@ -29,6 +29,11 @@ pub struct BridgeState {
     pub manager: Arc<DownloadManager>,
     pub token: Arc<String>,
     pub port: u16,
+    /// 把桌面应用的窗口叫到前面。
+    ///
+    /// 扩展点「打开主界面」时会调它。bridge 本身不该知道 Tauri，
+    /// 所以这里放个回调，由 app 那边接上。
+    pub show_ui: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// 统一错误响应。
@@ -290,6 +295,7 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/v1/tasks/:id/retry", post(retry_task))
         .route("/api/v1/tasks/:id/confirm", post(confirm_task))
         .route("/api/v1/tasks/:id/cancel-confirmed", post(cancel_confirmed_task))
+        .route("/api/v1/ui/show", post(show_ui))
         .route("/api/v1/settings", get(get_settings))
         .route("/api/v1/settings", post(update_settings))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -348,11 +354,7 @@ async fn bootstrap(State(state): State<BridgeState>, headers: HeaderMap) -> Resp
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let allowed = origin.is_empty()
-        || origin.starts_with("chrome-extension://")
-        || origin.starts_with("moz-extension://");
-
-    if !allowed {
+    if !bootstrap_origin_allowed(origin) {
         let err = ApiError::new("forbidden", "只有浏览器扩展可以读取引导信息");
         return (StatusCode::FORBIDDEN, Json(err)).into_response();
     }
@@ -589,6 +591,20 @@ async fn cancel_confirmed_task(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// 把桌面应用的窗口叫到前面。
+///
+/// 扩展点「打开主界面」时调它。
+///
+/// 以前扩展是用 `chrome.tabs.create({url: 'idmshadow://'})` 唤起的——
+/// 那会让 Edge 开一个标签页去加载协议链接，然后把「无法访问此页面」
+/// 的错误页留在那儿。走接口就没这问题。
+async fn show_ui(State(state): State<BridgeState>) -> Result<Json<Value>, ApiError> {
+    if let Some(cb) = state.show_ui.as_ref() {
+        cb();
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn get_settings(State(state): State<BridgeState>) -> Result<Json<Value>, ApiError> {
     let settings = state
         .manager
@@ -730,5 +746,34 @@ pub fn status_label(status: &str) -> &'static str {
         "error" => "出错",
         "cancelled" => "已取消",
         _ => "未知",
+    }
+}
+
+/// 引导接口放行哪些来源。
+///
+/// token 是用来挡住"网站乱往本地塞下载任务"的，
+/// 所以这个判断必须严：只有浏览器扩展能读到 token。
+fn bootstrap_origin_allowed(origin: &str) -> bool {
+    origin.is_empty()
+        || origin.starts_with("chrome-extension://")
+        || origin.starts_with("moz-extension://")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_allows_extensions_and_cli_but_not_web_pages() {
+        // 浏览器扩展
+        assert!(bootstrap_origin_allowed("chrome-extension://abc123"));
+        assert!(bootstrap_origin_allowed("moz-extension://abc123"));
+        // 命令行工具（没有 Origin 头）
+        assert!(bootstrap_origin_allowed(""));
+        // 网站
+        assert!(!bootstrap_origin_allowed("https://evil.example.com"));
+        assert!(!bootstrap_origin_allowed("http://localhost"));
+        // file:// 页面发的是 null
+        assert!(!bootstrap_origin_allowed("null"));
     }
 }
