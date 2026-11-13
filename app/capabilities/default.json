@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "默认权限。主窗口是任务列表，dlg-* 是下载对话框小窗口。",
+  "windows": ["main", "dlg-*"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:default",
+    "opener:allow-open-path"
+  ]
+}

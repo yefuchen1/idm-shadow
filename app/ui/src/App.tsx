@@ -240,13 +240,19 @@ export default function App() {
   }
 
   async function pickFolder() {
-    const picked = await open({
-      directory: true,
-      multiple: false,
-      defaultPath: draft.downloadDir
-    });
-    if (typeof picked === "string") {
-      setDraft((d) => ({ ...d, downloadDir: picked }));
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: draft.downloadDir
+      });
+      if (typeof picked === "string") {
+        setDraft((d) => ({ ...d, downloadDir: picked }));
+      }
+    } catch (err) {
+      // 静默失败会让人以为按钮坏了，把原因摆出来。
+      console.warn("[IDM Shadow] 选文件夹失败", err);
+      setError(String(err));
     }
   }
 

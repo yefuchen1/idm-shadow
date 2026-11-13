@@ -27,6 +27,11 @@ function DownloadDialog() {
   const [phase, setPhase] = useState<Phase>("choose");
   const [autoClose, setAutoClose] = useState(false);
   const [busy, setBusy] = useState(false);
+  // 出错就把原因摆出来。
+  //
+  // 之前这里什么都不显示，插件调用被权限拦掉的时候，
+  // 用户看到的就是"点了没反应"——最难查的那种。
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api
@@ -97,35 +102,51 @@ function DownloadDialog() {
 
   async function start(useCustomDir: boolean) {
     if (!task) return;
-    let target = dir.trim();
-    // "另存为"没填目录就先弹选文件夹，省得按了没反应。
-    if (useCustomDir && !target) {
-      const picked = await pickDir();
-      if (!picked) return;
-      target = picked;
-    }
     setBusy(true);
     try {
+      let target = dir.trim();
+      // "另存为"没填目录就先弹选文件夹，省得按了没反应。
+      if (useCustomDir && !target) {
+        const picked = await pickDir();
+        if (!picked) return;
+        target = picked;
+      }
       await api.confirmTask(task.id, target || undefined);
       setPhase("downloading");
     } catch (err) {
       console.warn("[IDM Shadow] 确认失败", err);
+      setError(String(err));
     } finally {
       setBusy(false);
     }
   }
 
   async function pickDir(): Promise<string | null> {
-    const picked = await open({
-      directory: true,
-      multiple: false,
-      defaultPath: dir || targetDir || undefined
-    });
-    if (typeof picked === "string") {
-      setDir(picked);
-      return picked;
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: dir || targetDir || undefined
+      });
+      if (typeof picked === "string") {
+        setDir(picked);
+        return picked;
+      }
+    } catch (err) {
+      console.warn("[IDM Shadow] 选文件夹失败", err);
+      setError(String(err));
     }
     return null;
+  }
+
+  async function openIn(path: string, mode: "open" | "reveal") {
+    try {
+      if (mode === "open") await api.openFile(path);
+      else await api.showInFolder(path);
+    } catch (err) {
+      console.warn("[IDM Shadow] 打开文件失败", err);
+      setError(String(err));
+    }
   }
 
   async function cancelAll() {
@@ -231,11 +252,14 @@ function DownloadDialog() {
           <div className="dlg-actions">
             <button
               className="btn primary"
-              onClick={() => api.openFile(task.path)}
+              onClick={() => openIn(task.path, "open")}
             >
               立即打开
             </button>
-            <button className="btn" onClick={() => api.showInFolder(task.path)}>
+            <button
+              className="btn"
+              onClick={() => openIn(task.path, "reveal")}
+            >
               打开文件所在位置
             </button>
             <button className="btn" onClick={() => api.closeDialog(task.id)}>
@@ -287,6 +311,12 @@ function DownloadDialog() {
             </button>
           </div>
         </>
+      )}
+
+      {error && (
+        <div className="dlg-error" title={error}>
+          {error}
+        </div>
       )}
     </div>
   );

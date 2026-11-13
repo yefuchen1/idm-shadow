@@ -841,6 +841,22 @@ body {
   background: var(--red);
 }
 
+/* 出错时把原因摆出来。
+   之前插件调用被权限拦掉、界面却什么都不显示，
+   用户只看到"点了没反应"，最难查。 */
+.dlg-error {
+  padding: 7px 9px;
+  border: 1px solid var(--red);
+  border-radius: 4px;
+  background: rgba(192, 57, 43, 0.06);
+  color: var(--red);
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: break-all;
+  max-height: 64px;
+  overflow: hidden;
+}
+
 /* 底部一排（比如"取消"），右对齐 */
 .dlg-foot {
   display: flex;
