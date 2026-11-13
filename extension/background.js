@@ -41,8 +41,23 @@ function looksLikeImage(text) {
   return IMAGE_EXT.test(path);
 }
 
+// 本地文件：浏览器不会为这些触发"下载"，但页面另存、file:// 打开、
+// 或者某些站点用 a[download] 指向本地资源时会。
+//
+// 用户右键另存的图片已经在他自己的盘上了，没有"下载"这回事——
+// 拦下来只会让人莫名其妙。交给浏览器自己处理。
+function isLocalFile(item) {
+  const url = item.url || '';
+  if (/^file:/i.test(url)) return true;
+  // 已经落到本地的路径（Chrome 给的 filename 是完整路径）。
+  // 注意只认盘符开头的绝对路径，别把普通的相对文件名误判。
+  if (/^[a-zA-Z]:[\\/]/.test(item.filename || '')) return true;
+  return false;
+}
+
 // 这个下载要不要放过去不管。
 async function shouldSkip(item) {
+  if (isLocalFile(item)) return true;
   const s = await settings();
   if (!s.skipImages) return false;
   return looksLikeImage(item.url) || looksLikeImage(item.filename);
@@ -400,53 +415,18 @@ chrome.downloads.onCreated.addListener(async (item) => {
       }
       return;
     }
-    // 接管失败（blob: 地址、应用没起来等），
-    // 至少通知用户一声，别让下载凭空消失。
-    await notifyAsk(item);
+    // 接管失败（blob: 地址、应用没起来等）。
+    //
+    // 什么都不做——不弹气泡，也不取消浏览器下载，让浏览器自己下完。
+    // 以前这里会弹一个"用 IDM Shadow 下载？"的通知，可那句话
+    // 又没取消下载，用户看到的只是莫名其妙地问一句要不要用 IDM，
+    // 点不点都一样。要的是"能用 IDM 就用，用不了就别吭声"。
     return;
   }
 
-  await notifyAsk(item);
-});
-
-async function notifyAsk(item) {
-  const s = await settings();
-  if (!s.token) return;
-
-  const id = `ask-${item.id}`;
-  try {
-    await chrome.notifications.create(id, {
-      type: 'basic',
-      // MV3 的通知必须有图标，否则报
-      // "Some of the required properties are missing: type, iconUrl, title and message"
-      iconUrl: chrome.runtime.getURL('icon32.png'),
-      title: '用 IDM Shadow 下载？',
-      message: item.filename || item.url,
-      buttons: [{ title: '交给 IDM Shadow' }],
-      priority: 0
-    });
-  } catch (err) {
-    console.warn('[IDM Shadow] 通知失败', err);
-  }
-}
-
-chrome.notifications.onButtonClicked.addListener(async (notificationId) => {
-  if (!notificationId.startsWith('ask-')) return;
-  const downloadId = Number(notificationId.slice(4));
-  try {
-    const items = await chrome.downloads.search({ id: downloadId });
-    if (items.length > 0) {
-      await capture(items[0]);
-      try {
-        await chrome.downloads.cancel(downloadId);
-      } catch (err) {
-        // 忽略
-      }
-    }
-  } catch (err) {
-    console.warn('[IDM Shadow] 接管失败', err);
-  }
-  chrome.notifications.clear(notificationId);
+  // mode 只剩 'auto' 和 'off'（'ask' 在 effectiveMode 里已经归到 auto，
+  // 'follow-app' 也只会返回 auto 或 off），走到这儿说明是没见过的值，
+  // 同样什么都不做。
 });
 
 // 右键菜单：把链接 / 视频交给应用。

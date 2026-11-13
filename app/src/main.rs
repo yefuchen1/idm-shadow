@@ -265,6 +265,7 @@ fn main() {
             commands::reveal_file,
             commands::open_dialog,
             commands::close_dialog,
+            commands::fit_dialog,
             commands::open_file,
             commands::show_in_folder,
         ])

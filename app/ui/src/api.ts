@@ -83,6 +83,9 @@ export const api = {
     invoke<void>("confirm_task", { id, dir }),
   openDialog: (id: string) => invoke<void>("open_dialog", { id }),
   closeDialog: (id: string) => invoke<void>("close_dialog", { id }),
+  /** 把对话框窗口调整到刚好包住内容。height 是前端量出来的。 */
+  fitDialog: (id: string, height: number) =>
+    invoke<void>("fit_dialog", { id, height }),
   openFile: (path: string) => invoke<void>("open_file", { path }),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   cancelConfirmedTask: (id: string) =>

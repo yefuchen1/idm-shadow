@@ -460,7 +460,14 @@ impl DownloadManager {
                         }
                     };
                     if let Some(target) = target {
-                        if let Err(err) = finalize_download(&task, Some(&target)).await {
+                        // 用库里的最新任务，别用 start() 那一刻的快照——
+                        // staging_path 之类的字段可能已经变了。
+                        let fresh = store
+                            .get_task(id)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| task.clone());
+                        if let Err(err) = finalize_download(&fresh, Some(&target)).await {
                             tracing::error!(task = %id, "转存失败: {err}");
                             let error = Some(TaskError::new("finalize_failed", err.to_string()));
                             let _ = store.set_status(id, TaskStatus::Error, error.as_ref());
@@ -481,7 +488,17 @@ impl DownloadManager {
                     // 等用户点确认时再转存并置为完成。
                     let awaiting = {
                         let map = task_confirms.lock().await;
-                        task.needs_confirm
+                        // 读库里的 needs_confirm，不能用闭包捕获的 task——
+                        // 那是 start() 那一刻的快照。用户在这之后确认过的话，
+                        // 快照里还是 true，就会把状态错判成"还在等确认"，
+                        // 任务永远卡在 downloading。
+                        let needs = store
+                            .get_task(id)
+                            .ok()
+                            .flatten()
+                            .map(|t| t.needs_confirm)
+                            .unwrap_or(task.needs_confirm);
+                        needs
                             && map
                                 .get(&id)
                                 .map(|c| c.final_path.is_none())

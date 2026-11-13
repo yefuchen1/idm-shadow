@@ -122,6 +122,7 @@
             return null;
           case "open_dialog":
           case "close_dialog":
+          case "fit_dialog":
           case "open_file":
           case "show_in_folder":
           case "pause_task":

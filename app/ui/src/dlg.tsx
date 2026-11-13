@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderCog } from "lucide-react";
@@ -20,6 +20,8 @@ type Phase = "choose" | "downloading" | "done" | "failed";
 function DownloadDialog() {
   const params = new URLSearchParams(window.location.search);
   const taskId = params.get("task") ?? "";
+
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   const [task, setTask] = useState<TaskDto | null>(null);
   const [dir, setDir] = useState("");
@@ -84,6 +86,70 @@ function DownloadDialog() {
     }, 500);
     return () => window.clearTimeout(t);
   }, [phase, autoClose, taskId]);
+
+  // 窗口跟着内容缩。
+  //
+  // 每种状态的高度差很多：选保存位置时要进度条+两个按钮+目录行，
+  // 下完只有一行状态+三个按钮。固定尺寸的话总有一屏底下空一大片。
+  // 这里量出实际高度交给后端改窗口尺寸。
+  useEffect(() => {
+    if (!taskId || !rootRef.current) return;
+    let last = 0;
+    let timer: number | undefined;
+
+    const apply = () => {
+      const el = rootRef.current;
+      if (!el) return;
+      // 逐个量子元素 + 间距，累加成内容高度。
+      //
+      // scrollHeight 在窗口偏小时会跟着视口走，量出来永远比实际少
+      // （"取消"那行就被裁掉）。自己算最可靠。
+      const style = window.getComputedStyle(el);
+      const padding =
+        parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      const gap = parseFloat(style.rowGap) || 0;
+      const kids = Array.from(el.children) as HTMLElement[];
+      const content =
+        kids.reduce((sum, k) => {
+          const r = k.getBoundingClientRect();
+          const cs = window.getComputedStyle(k);
+          return (
+            sum +
+            r.height +
+            (parseFloat(cs.marginTop) || 0) +
+            (parseFloat(cs.marginBottom) || 0)
+          );
+        }, 0) +
+        gap * Math.max(0, kids.length - 1);
+
+      const height = Math.ceil(content + padding);
+      if (!height || Math.abs(height - last) < 1) return;
+      last = height;
+      api.fitDialog(taskId, height).catch((err) => {
+        console.warn("[IDM Shadow] 调整窗口大小失败", err);
+      });
+    };
+
+    // 内容变了就重量一次。字体加载完、换行变化也会触发。
+    const observer = new ResizeObserver(() => {
+      // 合并连续变化，别每帧都调一次后端
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(apply, 16);
+    });
+    observer.observe(rootRef.current);
+    apply();
+    // 字体加载、placeholder 换行这类变化不一定触发 ResizeObserver，
+    // 补两次延迟测量。
+    const late1 = window.setTimeout(apply, 60);
+    const late2 = window.setTimeout(apply, 220);
+
+    return () => {
+      observer.disconnect();
+      if (timer) window.clearTimeout(timer);
+      window.clearTimeout(late1);
+      window.clearTimeout(late2);
+    };
+  }, [taskId]);
 
   const speed = task?.speed ?? 0;
   const total = task?.total_size ?? null;
@@ -165,7 +231,7 @@ function DownloadDialog() {
   }
 
   return (
-    <div className="dlg">
+    <div className="dlg" ref={rootRef}>
       <div className="dlg-head">
         <div className="dlg-title">
           <span className="dlg-filename">{task?.filename ?? "…"}</span>

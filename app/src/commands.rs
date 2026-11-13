@@ -34,8 +34,12 @@ pub async fn open_dialog(
     let url = WebviewUrl::App(format!("dlg.html?task={}", id).into());
     let window = WebviewWindowBuilder::new(&app, &label, url)
         .title("IDM Shadow")
-        .inner_size(460.0, 340.0)
-        .min_inner_size(380.0, 280.0)
+        // 先给个大概的尺寸，等前端量完内容高度再收——
+        // 前端会调 fit_dialog 把窗口改成刚好包住内容。
+        // 一开始就隐藏，免得用户看到尺寸跳一下。
+        .inner_size(440.0, 220.0)
+        .min_inner_size(360.0, 120.0)
+        .visible(false)
         .resizable(false)
         .always_on_top(true)
         .build()
@@ -66,6 +70,42 @@ pub async fn close_dialog(app: AppHandle, id: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&dialog_label(&id)) {
         window.close().map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// 把对话框窗口调整到刚好包住内容。
+///
+/// 每种状态的内容高度差很多：选保存位置时有进度条+两个按钮+目录行+
+/// 勾选框，下完只有一行状态+三个按钮。固定 460x340 的话，
+/// "下载完成"那屏底下会空出一大片——看着很松散。
+///
+/// 高度由前端量出来传进来（前端才知道自己多高），
+/// 宽度保持建窗口时定的值。
+#[tauri::command]
+pub async fn fit_dialog(app: AppHandle, id: String, height: f64) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(&dialog_label(&id)) else {
+        return Ok(());
+    };
+
+    let size = window.inner_size().map_err(|e| e.to_string())?;
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let width = size.width as f64 / scale;
+
+    // 夹一下，别因为某个瞬间的测量结果把窗口搞成一条缝或者一大块。
+    // set_size 设的是客户区（webview）尺寸，标题栏不算在内，
+    // 所以前端量多少就用多少，不要再加。
+    let height = height.clamp(110.0, 560.0);
+    tracing::debug!(task = %id, height, width, "fit_dialog");
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| e.to_string())?;
+
+    // 第一次量好之后才显示，避免用户看到窗口闪一下大小。
+    if !window.is_visible().unwrap_or(true) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+
     Ok(())
 }
 

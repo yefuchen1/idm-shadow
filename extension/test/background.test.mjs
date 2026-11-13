@@ -110,7 +110,7 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, shouldSkip };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip };`
 );
 
 const fetchCalls = [];
@@ -319,9 +319,10 @@ await test('旧设置 ask 也直接接管，不再弹浏览器通知气泡', asy
   storage.mode = 'auto';
 });
 
-await test('接管失败时才弹通知，别让下载凭空消失', async () => {
-  // blob: 地址引擎取不到，接管不了。这时候通知用户一声，
-  // 免得下载被取消了又没个说法。
+await test('接管失败就安静放手，不弹气泡也不取消下载', async () => {
+  // blob: 地址引擎取不到，接管不了。
+  // 这时候不能让用户看到"用 IDM Shadow 下载？"那种莫名其妙的提问——
+  // 那个气泡既不取消下载，点不点结果一样。让它安安静静交给浏览器。
   storage.mode = 'auto';
   calls.notifications.length = 0;
   calls.downloads.length = 0;
@@ -331,9 +332,39 @@ await test('接管失败时才弹通知，别让下载凭空消失', async () =>
     filename: 'blob.bin'
   });
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(calls.notifications.length, 1, '接管失败应当弹通知');
-  assert.equal(calls.notifications[0][0], 'ask-31');
+  assert.equal(calls.notifications.length, 0, '不该弹任何气泡');
   assert.equal(calls.downloads.length, 0, '没接管成功就不该取消浏览器下载');
+});
+
+await test('本地文件不接管', async () => {
+  // 右键另存的图片、file:// 打开的本地资源——已经在用户自己盘上了，
+  // 没有"下载"这回事，拦下来只会让人莫名其妙。
+  assert.equal(api.isLocalFile({ url: 'file:///D:/work/a.jpg' }), true);
+  assert.equal(
+    api.isLocalFile({ url: 'https://x.com/a', filename: 'D:\\work\\a.jpg' }),
+    true
+  );
+  assert.equal(
+    api.isLocalFile({ url: 'https://x.com/a.zip', filename: 'a.zip' }),
+    false
+  );
+
+  calls.downloads.length = 0;
+  calls.notifications.length = 0;
+  fetchCalls.length = 0;
+  await listeners.onCreated({
+    id: 55,
+    url: 'file:///D:/work/%E5%8F%82%E8%80%83/2.jpg',
+    filename: 'D:\\work\\参考\\2.jpg'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls.downloads.length, 0, '不该取消浏览器下载');
+  assert.equal(calls.notifications.length, 0, '不该弹气泡');
+  assert.equal(
+    fetchCalls.filter((f) => f.url.endsWith('/api/v1/tasks')).length,
+    0,
+    '不该往应用里投任务'
+  );
 });
 
 await test('同一个下载不会重复接管', async () => {

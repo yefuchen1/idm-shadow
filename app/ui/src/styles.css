@@ -708,32 +708,48 @@ body {
   color: var(--text);
   font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
   font-size: 13px;
-  overflow: hidden;
+  /* 不能 hidden：窗口还在缩的过程中内容会溢出，
+     hidden 会把"取消"那行裁掉，量高度也量不准。 */
+  overflow: visible;
+  /* 对话框窗口跟着内容缩，body 不能撑满视口，
+     否则量高度时拿到的是窗口高度，永远收不紧。 */
+  height: auto;
+  min-height: 0;
+}
+
+/* html 也要放开，不然 body 的 auto 会被 html 的 100% 限制住。 */
+html:has(.dlg-body),
+html:has(.dlg-body) body {
+  height: auto;
+  min-height: 0;
+  overflow: visible;
 }
 
 .dlg {
-  padding: 16px 18px;
+  padding: 10px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  min-height: 100vh;
+  gap: 9px;
+  /* 不要 min-height: 100vh——窗口是跟着内容自动缩的，
+     撑满一屏会在底下留一大片空白。 */
   box-sizing: border-box;
+  width: 100%;
 }
 
 .dlg-head {
   border-bottom: 1px solid var(--border-soft);
-  padding-bottom: 10px;
+  padding-bottom: 7px;
 }
 
 .dlg-title {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
 
 .dlg-filename {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -742,18 +758,20 @@ body {
 
 .dlg-sub {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .dlg-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 
 .dlg-actions .btn {
   flex: 1;
   justify-content: center;
   white-space: nowrap;
+  /* 对话框比主界面要紧，按钮矮一点 */
+  padding: 5px 8px;
 }
 
 .dlg-dir {
@@ -780,12 +798,12 @@ body {
 .dlg-progress {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 5px;
 }
 
 .dlg-progress-bar {
-  height: 6px;
-  border-radius: 3px;
+  height: 5px;
+  border-radius: 2px;
   background: var(--bg);
   border: 1px solid var(--border-soft);
   overflow: hidden;
@@ -800,40 +818,41 @@ body {
 .dlg-progress-info {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .dlg-progress-stats {
   display: flex;
-  gap: 10px;
+  gap: 8px;
 }
 
 .dlg-done {
   display: flex;
-  gap: 10px;
-  align-items: flex-start;
+  gap: 8px;
+  align-items: center;
 }
 
 .dlg-done-mark {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: #35a853;
   color: #fff;
-  font-size: 13px;
-  line-height: 22px;
+  font-size: 11px;
+  line-height: 18px;
   text-align: center;
 }
 
 .dlg-done-text {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
   min-width: 0;
   font-weight: 600;
+  font-size: 12px;
 }
 
 .dlg-done-path {
@@ -847,11 +866,18 @@ body {
 
 .dlg-auto {
   display: flex;
-  gap: 7px;
+  gap: 5px;
   align-items: center;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
   cursor: pointer;
+}
+
+/* 勾选框也小一号 */
+.dlg-auto input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
 }
 
 /* 出错/取消时的那个叉 */
@@ -863,15 +889,15 @@ body {
    之前插件调用被权限拦掉、界面却什么都不显示，
    用户只看到"点了没反应"，最难查。 */
 .dlg-error {
-  padding: 7px 9px;
+  padding: 5px 7px;
   border: 1px solid var(--red);
   border-radius: 4px;
   background: rgba(192, 57, 43, 0.06);
   color: var(--red);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.35;
   word-break: break-all;
-  max-height: 64px;
+  max-height: 48px;
   overflow: hidden;
 }
 
@@ -879,7 +905,7 @@ body {
 .dlg-foot {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
 }
 
 .btn.ghost {
