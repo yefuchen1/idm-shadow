@@ -110,7 +110,7 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, shouldSkip };`
 );
 
 const fetchCalls = [];
@@ -199,6 +199,67 @@ await test('内容脚本传来的 referer 也能被识别', async () => {
   );
   const body = JSON.parse(posts[0].options.body);
   assert.equal(body.referer, 'https://example.com/other');
+});
+
+await test('文件名只取 basename，完整路径被丢掉', async () => {
+  // Chrome 的 downloads.onCreated 给的是完整路径。
+  // 直接用的话文件名会变成 C__Users_ROG_Desktop_x.rar 这种压平样子，
+  // 后面转存的时候路径也对不上。
+  assert.equal(api.basename('C:\\Users\\ROG\\Desktop\\x.rar'), 'x.rar');
+  assert.equal(api.basename('d:\\Users\\ROG\\Downloads\\字体_宋体.rar'), '字体_宋体.rar');
+  assert.equal(api.basename('/tmp/foo/bar.zip'), 'bar.zip');
+  assert.equal(api.basename('plain.txt'), 'plain.txt');
+  assert.equal(api.basename(''), null);
+
+  fetchCalls.length = 0;
+  await api.capture({
+    id: 44,
+    url: 'https://example.com/path.rar',
+    filename: 'C:\\Users\\ROG\\Desktop\\real.rar'
+  });
+  const posts = fetchCalls.filter(
+    (f) => f.options.method === 'POST' && f.url.endsWith('/api/v1/tasks')
+  );
+  const body = JSON.parse(posts[0].options.body);
+  assert.equal(body.filename, 'real.rar', '投给应用的应该是纯文件名');
+});
+
+await test('图片预览默认不接管', async () => {
+  assert.equal(api.looksLikeImage('https://x.com/a/b.png'), true);
+  assert.equal(api.looksLikeImage('https://x.com/a/b.PNG?width=200'), true);
+  assert.equal(api.looksLikeImage('https://x.com/a/b.zip'), false);
+
+  assert.equal(await api.shouldSkip({ url: 'https://x.com/p/1.jpg' }), true);
+  assert.equal(
+    await api.shouldSkip({ url: 'https://x.com/p/1.jpg', filename: 'C:\\Users\\ROG\\Desktop\\1.jpg' }),
+    true
+  );
+  assert.equal(await api.shouldSkip({ url: 'https://x.com/p/a.zip' }), false);
+});
+
+await test('图片预览既不接管也不取消浏览器下载', async () => {
+  calls.downloads.length = 0;
+  calls.notifications.length = 0;
+  fetchCalls.length = 0;
+  await listeners.onCreated({
+    id: 41,
+    url: 'https://images-wm.liblib.cloud/preview/abc.jpg',
+    filename: 'C:\\Users\\ROG\\Desktop\\abc.jpg'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls.downloads.length, 0, '不该取消浏览器的下载');
+  assert.equal(calls.notifications.length, 0, '也不该弹通知');
+  assert.equal(
+    fetchCalls.filter((f) => f.url.endsWith('/api/v1/tasks')).length,
+    0,
+    '不该往应用里投任务'
+  );
+});
+
+await test('关掉过滤之后图片照常接管', async () => {
+  storage.skipImages = false;
+  assert.equal(await api.shouldSkip({ url: 'https://x.com/p/1.jpg' }), false);
+  storage.skipImages = true;
 });
 
 await test('blob: 与 data: URL 不接管', async () => {

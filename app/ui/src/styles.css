@@ -663,6 +663,24 @@ body {
   color: var(--muted);
 }
 
+/* 待确认的下载攒了一堆时的提示条。
+   不一个接一个地弹对话框了，改成这里给一条提示，
+   用户点了「逐个处理」才走队列。 */
+.queue-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+
 .empty p {
   margin: 0 0 4px;
   font-size: 14px;

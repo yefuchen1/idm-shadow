@@ -59,6 +59,9 @@ export default function App() {
   // 用户主动把对话框关掉、还没确认的任务。
   // 这些不再自动弹回来，想重选就去列表里点"选择保存位置"。
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
+  // 待确认的下载攒了一堆时，不一个接一个地弹，
+  // 改��列表顶上给一条提示，用户点了才逐个处理。
+  const [manualQueue, setManualQueue] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // 事件监听器要读最新的任务表，但不想因为 tasks 变就重新订阅，
@@ -191,22 +194,34 @@ export default function App() {
   // 结果每轮轮询都跳过已经开着的那个、去找下一个，
   // 待确认任务一多就一个接一个地开窗口，而且谁都没被关掉——
   // 渲染进程能涨到一百多个。
+  //
+  // 待确认的队列（按创建顺序）。攒了一堆的时候不自动弹，
+  // 列表顶上给一条提示，用户点了才逐个处理。
+  const pendingQueue = useMemo(
+    () =>
+      tasks.filter(
+        (t) =>
+          t.needs_confirm &&
+          // 用户已经把这个对话框关掉了，别再弹回来。
+          // 想重新选保存位置，去列表里点那个按钮。
+          !dismissedIds.has(t.id) &&
+          // 失败/取消/完成的任务不再问。
+          //
+          // 之前这里只查 needs_confirm，可任务失败之后这个标记还留在库里，
+          // 于是弹窗弹的是那个早就失败的老任务——文件名都是错的，
+          // 点"直接下载"会确认错对象。
+          !TERMINAL.includes(t.status)
+      ),
+    [tasks, dismissedIds]
+  );
+
   useEffect(() => {
-    const pending = tasks.find(
-      (t) =>
-        t.needs_confirm &&
-        // 用户已经把这个对话框关掉了，别再弹回来。
-        // 想重新选保存位置，去列表里点那个按钮。
-        !dismissedIds.has(t.id) &&
-        // 失败/取消/完成的任务不再问。
-        //
-        // 之前这里只查 needs_confirm，可任务失败之后这个标记还留在库里，
-        // 于是弹窗弹的是那个早就失败的老任务——文件名都是错的，
-        // 点"直接下载"会确认错对象。
-        !TERMINAL.includes(t.status)
-    );
+    const pending = pendingQueue[0];
     // 已经开着就别重复开。
     if (!pending || dialogOpenIds.has(pending.id)) return;
+    // 攒了一堆的时候不自动弹——一个接一个地弹太烦。
+    // 队列里只有一个（正常下载）就照常弹。
+    if (pendingQueue.length > 1 && !manualQueue) return;
     setDialogOpenIds((prev) => new Set(prev).add(pending.id));
     api.openDialog(pending.id).catch((err) => {
       console.warn("[IDM Shadow] 打开下载对话框失败", err);
@@ -216,7 +231,7 @@ export default function App() {
         return next;
       });
     });
-  }, [tasks, dialogOpenIds, dismissedIds]);
+  }, [tasks, dialogOpenIds, dismissedIds, pendingQueue, manualQueue]);
 
   // 任务不再等确认了（确认了/失败了/取消了），把标记摘掉。
   useEffect(() => {
@@ -255,6 +270,11 @@ export default function App() {
     });
     return () => unlisten?.();
   }, []);
+
+  // 队列清空了就把手动模式关掉，下次又恢复自动弹。
+  useEffect(() => {
+    if (pendingQueue.length === 0) setManualQueue(false);
+  }, [pendingQueue.length]);
 
   async function submit() {
     const value = url.trim();
@@ -565,6 +585,19 @@ export default function App() {
       </div>
 
       <div className="list">
+        {pendingQueue.length > 1 && (
+          <div className="queue-banner">
+            <span>
+              有 {pendingQueue.length} 个下载等确认保存位置
+            </span>
+            <button
+              className="btn small"
+              onClick={() => setManualQueue(true)}
+            >
+              逐个处理
+            </button>
+          </div>
+        )}
         {visible.length === 0 && (
           <div className="empty">
             <p>还没有下载任务</p>

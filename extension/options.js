@@ -27,7 +27,9 @@ async function discoverApp() {
     // 不走浏览器的通知气泡。桌面应用里的「设为默认下载工具」
     // 开关要用的话，装好扩展后切到「跟随应用设置」就行。
     mode: 'auto',
-    autoLaunch: true
+    autoLaunch: true,
+    // 页面预览图交给浏览器自己下，不弹对话框
+    skipImages: true
   });
   // 老版本存过 'ask'（先弹浏览器通知气泡再接管）。
   // 现在没有那个气泡了，直接按"接管"处理。
@@ -36,6 +38,7 @@ async function discoverApp() {
   $('token').value = stored.token;
   $('mode').value = stored.mode;
   $('autoLaunch').checked = stored.autoLaunch;
+  $('skipImages').checked = stored.skipImages;
 
   // 已经配好了就直接显示状态，不去打扰应用
   if (stored.token) {
@@ -71,7 +74,8 @@ $('save').addEventListener('click', async () => {
     bridgeUrl: $('bridgeUrl').value.trim().replace(/\/$/, ''),
     token: $('token').value.trim(),
     mode: $('mode').value,
-    autoLaunch: $('autoLaunch').checked
+    autoLaunch: $('autoLaunch').checked,
+    skipImages: $('skipImages').checked
   });
   $('saved').textContent = '已保存';
   setTimeout(() => ($('saved').textContent = ''), 2000);

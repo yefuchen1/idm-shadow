@@ -9,10 +9,44 @@ const DEFAULTS = {
   token: '',
   // off: 不接管；ask: 弹提示由用户确认；auto: 直接接管
   // 'follow-app': 跟随桌面应用的"设为默认下载工具"开关
-  mode: 'ask',
+  mode: 'auto',
   autoLaunch: true,
+  // 跳过图片预览。浏览模型预览站、图库、论坛的时候，
+  // 页面里的图片会被浏览器当成下载，一个预览图弹一次对话框。
+  skipImages: true,
   handled: {}
 };
+
+// 图片类后缀。用来把"页面预览图"挡在接管之外。
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|bmp|svg|avif|ico|tiff?)$/i;
+
+// 只取文件名，不要路径。
+//
+// Chrome 的 downloads.onCreated 给的 item.filename 是完整路径
+// （C:\Users\ROG\Desktop\x.rar），服务器在 Content-Disposition 里
+// 也经常塞完整路径。直接用的话文件名会变成
+// C__Users_ROG_Desktop_x.rar 这种压平过的样子。
+function basename(name) {
+  if (!name) return null;
+  const text = String(name);
+  const cut = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'));
+  const base = (cut >= 0 ? text.slice(cut + 1) : text).trim();
+  return base || null;
+}
+
+function looksLikeImage(text) {
+  if (!text) return false;
+  // 去掉查询串再判断后缀
+  const path = String(text).split(/[?#]/)[0];
+  return IMAGE_EXT.test(path);
+}
+
+// 这个下载要不要放过去不管。
+async function shouldSkip(item) {
+  const s = await settings();
+  if (!s.skipImages) return false;
+  return looksLikeImage(item.url) || looksLikeImage(item.filename);
+}
 
 // 桌面应用里勾了"设为默认下载工具"，扩展就自动接管。
 // 单一事实来源在桌面应用，这里只是服从它。
@@ -258,7 +292,8 @@ async function capture(item) {
 // 我们把浏览器下载取消掉之后它可能永远停在 "download (2)"。
   const serverName = await filenameFromServer(url);
   const chromeName = filenameByDownload[item.id] || item.filename;
-  const finalName = serverName || chromeName;
+  // 只取文件名部分。两边给的可能都是带路径的完整路径。
+  const finalName = basename(serverName) || basename(chromeName);
 
   const payload = {
     url,
@@ -351,6 +386,11 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (await isHandled(item.id)) return;
 
   if (mode === 'auto') {
+    // 过滤掉的（比如页面预览图）不接管。
+    // 也不取消浏览器的下载——让它自己下下去，我们不打扰用户。
+    if (await shouldSkip(item)) {
+      return;
+    }
     const ok = await capture(item);
     if (ok) {
       try {
