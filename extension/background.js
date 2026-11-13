@@ -139,8 +139,13 @@ async function autoConfigure(force = false) {
 /// 当前应当用什么接管方式。
 function effectiveMode(s) {
   if (s.mode === 'follow-app') {
-    return followAppMode ? 'auto' : 'ask';
+    // 桌面应用里没勾"设为默认下载工具"，就别抢浏览器的下载。
+    return followAppMode ? 'auto' : 'off';
   }
+  // 老版本存过 'ask'——那会儿会先弹浏览器的通知气泡，
+  // 等用户点"交给 IDM Shadow"才接管。用户不想看那个气泡了，
+  // 现在直接接管，弹出 IDM Shadow 自己的下载对话框。
+  if (s.mode === 'ask') return 'auto';
   return s.mode;
 }
 
@@ -353,11 +358,14 @@ chrome.downloads.onCreated.addListener(async (item) => {
       } catch (err) {
         // 下载可能已经结束
       }
+      return;
     }
+    // 接管失败（blob: 地址、应用没起来等），
+    // 至少通知用户一声，别让下载凭空消失。
+    await notifyAsk(item);
     return;
   }
 
-  // ask 模式：弹通知，用户点了才接管
   await notifyAsk(item);
 });
 

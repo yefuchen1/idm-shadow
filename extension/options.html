@@ -79,14 +79,14 @@
 
     <label for="mode">下载接管方式</label>
     <select id="mode">
-      <option value="follow-app">跟随 IDM Shadow 应用设置（推荐）</option>
-      <option value="ask">提示后接管（推荐）</option>
-      <option value="auto">自动接管</option>
+      <option value="auto">直接接管（弹出 IDM Shadow 下载对话框）</option>
+      <option value="follow-app">跟随 IDM Shadow 应用设置</option>
       <option value="off">不接管</option>
     </select>
     <p class="hint">
-      「跟随应用」时，桌面应用里勾了「设为默认下载工具」，扩展就自动接管。
-      「自动接管」会立刻取消浏览器的下载并交给 IDM Shadow。blob: 开头的下载无法接管，会保留给浏览器。
+      「跟随应用」时，桌面应用里勾了「设为默认下载工具」才接管，否则下载交给浏览器。
+      接管后浏览器会立刻取消这次下载，转而弹出 IDM Shadow 自己的下载对话框，
+      不会再弹浏览器的通知气泡。blob: 开头的下载无法接管，会保留给浏览器。
     </p>
 
     <label for="autoLaunch">

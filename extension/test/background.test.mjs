@@ -239,7 +239,10 @@ await test('off 模式不接管', async () => {
   storage.mode = 'auto';
 });
 
-await test('ask 模式弹通知而不是直接取消', async () => {
+await test('旧设置 ask 也直接接管，不再弹浏览器通知气泡', async () => {
+  // 用户不想在浏览器右下角看到"用 IDM Shadow 下载？"那个气泡，
+  // 想直接看到 IDM Shadow 自己的下载对话框。
+  // 所以老版本存下来的 'ask' 现在按"直接接管"处理。
   storage.mode = 'ask';
   calls.notifications.length = 0;
   calls.downloads.length = 0;
@@ -249,10 +252,27 @@ await test('ask 模式弹通知而不是直接取消', async () => {
     filename: 'z.zip'
   });
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(calls.notifications.length, 1, '应当弹通知');
-  assert.equal(calls.notifications[0][0], 'ask-9');
-  assert.equal(calls.downloads.length, 0, 'ask 模式不该直接取消');
+  assert.equal(calls.notifications.length, 0, '不该再弹浏览器通知气泡');
+  assert.equal(calls.downloads.length, 1, '应当直接取消浏览器下载');
+  assert.equal(calls.downloads[0][0], 9);
   storage.mode = 'auto';
+});
+
+await test('接管失败时才弹通知，别让下载凭空消失', async () => {
+  // blob: 地址引擎取不到，接管不了。这时候通知用户一声，
+  // 免得下载被取消了又没个说法。
+  storage.mode = 'auto';
+  calls.notifications.length = 0;
+  calls.downloads.length = 0;
+  await listeners.onCreated({
+    id: 31,
+    url: 'blob:http://example.com/1234',
+    filename: 'blob.bin'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls.notifications.length, 1, '接管失败应当弹通知');
+  assert.equal(calls.notifications[0][0], 'ask-31');
+  assert.equal(calls.downloads.length, 0, '没接管成功就不该取消浏览器下载');
 });
 
 await test('同一个下载不会重复接管', async () => {
@@ -297,7 +317,9 @@ await test('跟随应用模式：应用说不是就不自动接管', async () =>
   settingsResponse = { default_download_tool: false };
 
   await api.syncWithApp();
-  assert.equal(api.effectiveMode(await api.settings()), 'ask');
+  // 应用里没勾"设为默认下载工具"，就完全不接管，
+  // 下载老老实实交给浏览器——也不弹那个通知气泡。
+  assert.equal(api.effectiveMode(await api.settings()), 'off');
 
   calls.downloads.length = 0;
   calls.notifications.length = 0;
@@ -308,7 +330,7 @@ await test('跟随应用模式：应用说不是就不自动接管', async () =>
   });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(calls.downloads.length, 0, '不是默认下载工具时不该取消下载');
-  assert.equal(calls.notifications.length, 1, '应该弹提示让用户确认');
+  assert.equal(calls.notifications.length, 0, '不接管时也不该弹通知气泡');
 
   storage.mode = 'auto';
 });

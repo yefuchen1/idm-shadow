@@ -23,9 +23,15 @@ async function discoverApp() {
   const stored = await chrome.storage.local.get({
     bridgeUrl: 'http://127.0.0.1:16888',
     token: '',
-    mode: 'ask',
+    // 默认直接接管：浏览器点下载就弹 IDM Shadow 自己的对话框，
+    // 不走浏览器的通知气泡。桌面应用里的「设为默认下载工具」
+    // 开关要用的话，装好扩展后切到「跟随应用设置」就行。
+    mode: 'auto',
     autoLaunch: true
   });
+  // 老版本存过 'ask'（先弹浏览器通知气泡再接管）。
+  // 现在没有那个气泡了，直接按"接管"处理。
+  if (stored.mode === 'ask') stored.mode = 'auto';
   $('bridgeUrl').value = stored.bridgeUrl;
   $('token').value = stored.token;
   $('mode').value = stored.mode;

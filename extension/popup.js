@@ -113,7 +113,10 @@ $('options').addEventListener('click', () => {
 });
 
 (async function init() {
-  const stored = await chrome.storage.local.get({ mode: 'ask' });
+  // 默认直接接管，弹 IDM Shadow 自己的下载对话框。
+  const stored = await chrome.storage.local.get({ mode: 'auto' });
+  // 老版本存过 'ask'，现在没有那个通知气泡了，直接按"接管"处理。
+  if (stored.mode === 'ask') stored.mode = 'auto';
   $('mode').value = stored.mode;
   await refresh();
   setInterval(refresh, 1000);
