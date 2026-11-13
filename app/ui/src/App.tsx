@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -56,8 +56,14 @@ export default function App() {
   const [deleteFile, setDeleteFile] = useState(true);
   // 已经开过下载对话框的任务，不重复开
   const [dialogOpenIds, setDialogOpenIds] = useState<Set<string>>(new Set());
+  // 用户主动把对话框关掉、还没确认的任务。
+  // 这些不再自动弹回来，想重选就去列表里点"选择保存位置"。
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 事件监听器要读最新的任务表，但不想因为 tasks 变就重新订阅，
+  // 所以用 ref 存一份。
+  const tasksRef = useRef<TaskDto[]>([]);
 
   const refresh = useCallback(async () => {
     try {
@@ -67,6 +73,12 @@ export default function App() {
       setError(String(err));
     }
   }, []);
+
+  // 事件监听器要读最新的任务表，但不想因为 tasks 变就重新订阅，
+  // 所以用 ref 存一份。
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   useEffect(() => {
     refresh();
@@ -174,11 +186,18 @@ export default function App() {
   // 以前是在主窗口里弹模态框——主窗口是任务列表，可能很长，
   // 一个对话框盖在上面两边都别扭。现在分成两个窗口：
   // 列表归列表，对话框归对话框。
+  //
+  // 同时只开一个。以前这里写的是 find(还没开过窗口的待确认任务)，
+  // 结果每轮轮询都跳过已经开着的那个、去找下一个，
+  // 待确认任务一多就一个接一个地开窗口，而且谁都没被关掉——
+  // 渲染进程能涨到一百多个。
   useEffect(() => {
     const pending = tasks.find(
       (t) =>
         t.needs_confirm &&
-        !dialogOpenIds.has(t.id) &&
+        // 用户已经把这个对话框关掉了，别再弹回来。
+        // 想重新选保存位置，去列表里点那个按钮。
+        !dismissedIds.has(t.id) &&
         // 失败/取消/完成的任务不再问。
         //
         // 之前这里只查 needs_confirm，可任务失败之后这个标记还留在库里，
@@ -186,20 +205,20 @@ export default function App() {
         // 点"直接下载"会确认错对象。
         !TERMINAL.includes(t.status)
     );
-    if (pending) {
-      setDialogOpenIds((prev) => new Set(prev).add(pending.id));
-      api.openDialog(pending.id).catch((err) => {
-        console.warn("[IDM Shadow] 打开下载对话框失败", err);
-        setDialogOpenIds((prev) => {
-          const next = new Set(prev);
-          next.delete(pending.id);
-          return next;
-        });
+    // 已经开着就别重复开。
+    if (!pending || dialogOpenIds.has(pending.id)) return;
+    setDialogOpenIds((prev) => new Set(prev).add(pending.id));
+    api.openDialog(pending.id).catch((err) => {
+      console.warn("[IDM Shadow] 打开下载对话框失败", err);
+      setDialogOpenIds((prev) => {
+        const next = new Set(prev);
+        next.delete(pending.id);
+        return next;
       });
-    }
-  }, [tasks, dialogOpenIds]);
+    });
+  }, [tasks, dialogOpenIds, dismissedIds]);
 
-  // 任务不再等确认了（确认了/失败了/取消了），把对话框收掉。
+  // 任务不再等确认了（确认了/失败了/取消了），把标记摘掉。
   useEffect(() => {
     for (const t of tasks) {
       if (!t.needs_confirm && dialogOpenIds.has(t.id)) {
@@ -211,6 +230,31 @@ export default function App() {
       }
     }
   }, [tasks, dialogOpenIds]);
+
+  // 对话框窗口被关掉了（用户点 X，或者代码主动关的）。
+  //
+  // 如果这个任务还没确认，说明是用户主动把它关掉的——
+  // 那就记下来别再自动弹（否则关一张弹一张，没完没了），
+  // 但队列里的下一个待确认任务可以接着弹。
+  useEffect(() => {
+    let unlisten: () => void;
+    listen<{ id: string }>("dlg-closed", (event) => {
+      const closedId = event.payload.id;
+      setDialogOpenIds((prev) => {
+        if (!prev.has(closedId)) return prev;
+        const next = new Set(prev);
+        next.delete(closedId);
+        return next;
+      });
+      const stillPending = tasksRef.current.find((t) => t.id === closedId);
+      if (stillPending?.needs_confirm) {
+        setDismissedIds((prev) => new Set(prev).add(closedId));
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
 
   async function submit() {
     const value = url.trim();
@@ -626,7 +670,18 @@ export default function App() {
                   <button
                     className="btn icon"
                     title="选择保存位置"
-                    onClick={() => guard(() => api.openDialog(task.id))}
+                    onClick={() => {
+                      // 之前被用户关掉过的话，解除"不再自动弹"的标记，
+                      // 不然这个按钮点了也不会有反应。
+                      setDismissedIds((prev) => {
+                        if (!prev.has(task.id)) return prev;
+                        const next = new Set(prev);
+                        next.delete(task.id);
+                        return next;
+                      });
+                      setDialogOpenIds((prev) => new Set(prev).add(task.id));
+                      guard(() => api.openDialog(task.id));
+                    }}
                   >
                     <FolderInput size={14} />
                   </button>

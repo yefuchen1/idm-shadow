@@ -3,7 +3,7 @@
 use idm_shadow_bridge::TaskDto;
 use idm_shadow_engine::task::{TaskId, TaskRequest};
 use serde::Serialize;
-use tauri::{AppHandle, Manager as TauriManager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager as TauriManager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::AppState;
 
@@ -32,7 +32,7 @@ pub async fn open_dialog(
     }
 
     let url = WebviewUrl::App(format!("dlg.html?task={}", id).into());
-    WebviewWindowBuilder::new(&app, &label, url)
+    let window = WebviewWindowBuilder::new(&app, &label, url)
         .title("IDM Shadow")
         .inner_size(460.0, 340.0)
         .min_inner_size(380.0, 280.0)
@@ -40,6 +40,22 @@ pub async fn open_dialog(
         .always_on_top(true)
         .build()
         .map_err(|e| e.to_string())?;
+
+    // 窗口被关掉（用户点 X，或者我们主动关）时通知前端。
+    //
+    // 前端靠这个事件把"这个任务已经开过对话框"的标记摘掉，
+    // 队列里的下一个待确认任务才能接着弹。
+    // 没有它的话，待确认任务一多就会一个接一个地开窗口，
+    // 每个都还关不掉。
+    let task_id = id.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Destroyed = event {
+            let _ = app.emit(
+                "dlg-closed",
+                serde_json::json!({ "id": task_id }),
+            );
+        }
+    });
 
     Ok(())
 }
