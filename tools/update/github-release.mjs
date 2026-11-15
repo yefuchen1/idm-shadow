@@ -120,6 +120,21 @@ async function main() {
     await readFile(join(repo, "app/tauri.conf.json"), "utf8")
   ).version;
   const tag = `v${version}`;
+
+  // 版本号散落在四个文件里，任一处漏改都会让客户端检查更新失效。
+  // 发布前一次性校验，别等用户装了包才发现"永远已是最新"。
+  const packageFiles = ["package.json", "app/ui/package.json"].map((path) =>
+    join(repo, path)
+  );
+  for (const file of packageFiles) {
+    const declared = JSON.parse(await readFile(file, "utf8")).version;
+    if (declared !== version) {
+      throw new Error(
+        `版本号不一致：${join(repo, file)} = ${declared ?? "?"}，tauri.conf.json = ${version}`
+      );
+    }
+  }
+
   let notesFile = args.notesFile;
   if (!notesFile) {
     const defaultFile = join(repo, "docs/releases", `${tag}.md`);
