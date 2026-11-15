@@ -89,9 +89,11 @@
       max_concurrent_tasks: 3,
       default_download_tool: true,
       auto_start: true,
-      version: "0.2.0",
-      update_endpoint: "",
-      update_check_on_start: true
+      version: "0.2.2",
+      update_endpoint:
+        "https://github.com/yefuchen1/idm-shadow/releases/latest/download/latest.json",
+      update_check_on_start: true,
+      release_notes: null
     };
 
     window.__TAURI_INTERNALS__ = {

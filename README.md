@@ -70,7 +70,7 @@ npm run app:installer
 # 3. 写本版说明并提交（发版脚本要求工作区干净）
 #    docs/releases/v<version>.md 会同时用作 Release 正文和客户端更新说明
 git add -A
-git commit -m "release: v0.2.1"
+git commit -m "release: v0.2.2"
 git push origin main
 
 # 4. 发布：自动打 tag、建 Release、上传 exe / .sig / latest.json

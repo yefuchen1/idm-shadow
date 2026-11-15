@@ -642,7 +642,7 @@ export default function App() {
             <label>更新源</label>
             <input
               className="dir-input"
-              placeholder="https://…/latest.json"
+              placeholder="留空使用 GitHub Releases"
               value={draft.updateEndpoint}
               onChange={(e) =>
                 setDraft((d) => ({ ...d, updateEndpoint: e.target.value }))
@@ -650,7 +650,7 @@ export default function App() {
             />
             <button
               className="btn small"
-              disabled={checkingUpdate || !draft.updateEndpoint.trim()}
+              disabled={checkingUpdate}
               onClick={checkUpdate}
             >
               <RefreshCw size={13} />
@@ -677,22 +677,35 @@ export default function App() {
             <label>版本</label>
             <span className="update-version">
               {settings.version}
-              {updateChecked && !updateInfo && (
-                <span className="unit"> · 已是最新</span>
-              )}
+              <span className="unit">
+                {checkingUpdate
+                  ? " · 正在检查更新"
+                  : updateInfo
+                    ? ` · 发现 ${updateInfo.version}`
+                    : updateChecked
+                      ? " · 已是最新"
+                      : " · 启动时自动检查"}
+              </span>
             </span>
-            {updateInfo && (
-              <button
-                className="btn small primary"
-                disabled={installingUpdate}
-                onClick={installUpdate}
-              >
-                <Download size={13} />
-                {installingUpdate
-                  ? "安装中"
-                  : `更新到 ${updateInfo.version}`}
-              </button>
-            )}
+            <button
+              className="btn small primary"
+              disabled={installingUpdate || checkingUpdate}
+              title={
+                updateInfo
+                  ? `下载并安装 ${updateInfo.version}`
+                  : "检查 GitHub Releases 上有没有新版本"
+              }
+              onClick={updateInfo ? installUpdate : checkUpdate}
+            >
+              {updateInfo ? <Download size={13} /> : <RefreshCw size={13} />}
+              {installingUpdate
+                ? "安装中"
+                : updateInfo
+                  ? "立即更新"
+                  : checkingUpdate
+                    ? "检查中"
+                    : "检查更新"}
+            </button>
           </div>
           {updateInfo?.notes && (
             <div className="settings-row update-row">
