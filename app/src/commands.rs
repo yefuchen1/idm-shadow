@@ -168,6 +168,50 @@ pub struct SettingsDto {
     pub update_check_on_start: bool,
     /// 刚更新完、还没被用户关掉的发布说明。
     pub release_notes: Option<crate::update::ReleaseNotes>,
+    /// 浏览器扩展的连接状态，界面用它提示"接管还没启用"。
+    pub extension: ExtensionStatus,
+}
+
+/// 浏览器扩展的当前状态。
+#[derive(Debug, Serialize)]
+pub struct ExtensionStatus {
+    /// 扩展文件所在目录。用户"加载已解压的扩展程序"时要选它。
+    pub dir: String,
+    /// 文件是否已经释放到磁盘。
+    pub installed: bool,
+    /// 最近三分钟内是否有带 token 的扩展请求。
+    pub connected: bool,
+    /// 这台机器上装了哪些受支持的浏览器。
+    pub browsers: Vec<BrowserDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BrowserDto {
+    pub id: String,
+    pub label: String,
+    /// 浏览器的扩展管理页地址。应用打不开它（浏览器会忽略外部进程
+    /// 传进来的内部协议），只能由界面复制给用户自己粘贴。
+    pub page: String,
+}
+
+fn inspect_extension(state: &AppState) -> ExtensionStatus {
+    let dir = crate::extension::extension_dir();
+    ExtensionStatus {
+        dir: dir
+            .as_ref()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        installed: dir.as_ref().map(|d| d.is_dir()).unwrap_or(false),
+        connected: idm_shadow_bridge::extension_connected(&state.extension_seen),
+        browsers: crate::extension::installed_browsers()
+            .into_iter()
+            .map(|b| BrowserDto {
+                id: b.as_str().to_string(),
+                label: b.label().to_string(),
+                page: b.extensions_page().to_string(),
+            })
+            .collect(),
+    }
 }
 
 fn parse_id(raw: &str) -> Result<TaskId, String> {
@@ -312,6 +356,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsDto, Str
         update_endpoint: crate::update::endpoint_setting(&state.manager),
         update_check_on_start: crate::update::check_on_start_setting(&state.manager),
         release_notes: crate::update::pending_release_notes(&state.manager),
+        extension: inspect_extension(&state),
     })
 }
 
@@ -402,6 +447,30 @@ pub async fn set_global_limit(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// 浏览器扩展的当前状态。界面轮询它来更新"已连接 / 未连接"。
+#[tauri::command]
+pub async fn extension_status(state: State<'_, AppState>) -> Result<ExtensionStatus, String> {
+    Ok(inspect_extension(&state))
+}
+
+/// 把扩展释放到磁盘，让用户能"加载已解压的扩展程序"。
+#[tauri::command]
+pub async fn install_extension(state: State<'_, AppState>) -> Result<ExtensionStatus, String> {
+    crate::extension::materialize()
+        .map_err(|e| format!("写入扩展文件失败: {e}"))?;
+    Ok(inspect_extension(&state))
+}
+
+/// 打开扩展目录，用户把整个文件夹拖进扩展管理页即可。
+///
+/// 应用没法直接打开 `chrome://extensions`：Chrome/Edge 会忽略
+/// 外部进程传进来的内部协议地址，只给开一个空白标签页。
+/// 所以这里只负责开目录，地址由界面复制给用户粘贴。
+#[tauri::command]
+pub async fn open_extension_folder() -> Result<(), String> {
+    crate::extension::open_extension_folder()
 }
 
 /// 在文件管理器里显示某个文件。

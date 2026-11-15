@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod extension;
 mod protocol;
 mod tray;
 mod update;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub manager: Arc<DownloadManager>,
     pub bridge_port: u16,
     pub token: String,
+    /// 浏览器扩展最近一次带着 token 调接口的时间，界面用它显示连接状态。
+    pub extension_seen: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// 应用数据目录：%APPDATA%\IDM Shadow
@@ -132,6 +135,7 @@ fn main() {
 
             // AppHandle 是 Send + Sync，能进 Arc 闭包；App 不是。
             let app_handle = app.handle().clone();
+            let extension_seen = Arc::new(std::sync::Mutex::new(None));
             let bridge_state = idm_shadow_bridge::BridgeState {
                 manager: manager.clone(),
                 token: Arc::new(token.clone()),
@@ -146,6 +150,7 @@ fn main() {
                         let _ = window.set_focus();
                     }
                 })),
+                extension_seen: extension_seen.clone(),
             };
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = idm_shadow_bridge::serve(bridge_state, port).await {
@@ -164,7 +169,12 @@ fn main() {
                 manager: manager.clone(),
                 bridge_port: port,
                 token: token.clone(),
+                extension_seen,
             });
+
+            // 扩展是编译进 exe 的，安装后直接释放到固定目录；
+            // 升级时这里把旧副本覆盖成新版本。
+            extension::sync_on_startup();
 
             // 调度器：定期把排队里的任务捞起来
             let scheduler = manager.clone();
@@ -289,6 +299,9 @@ fn main() {
             commands::check_update,
             commands::install_update,
             commands::dismiss_release_notes,
+            commands::extension_status,
+            commands::install_extension,
+            commands::open_extension_folder,
         ])
         .run(tauri::generate_context!())
         .expect("应用启动失败");

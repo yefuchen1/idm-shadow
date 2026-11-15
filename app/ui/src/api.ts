@@ -76,6 +76,18 @@ export interface SettingsDto {
   update_endpoint: string;
   update_check_on_start: boolean;
   release_notes: ReleaseNotes | null;
+  extension: ExtensionStatus;
+}
+
+/** 浏览器扩展的连接状态。 */
+export interface ExtensionStatus {
+  /** 用户"加载已解压的扩展程序"时要选的目录。 */
+  dir: string;
+  /** 扩展文件是否已释放到磁盘。 */
+  installed: boolean;
+  /** 最近三分钟内有没有带 token 的扩展请求。 */
+  connected: boolean;
+  browsers: { id: string; label: string; page: string }[];
 }
 
 export interface UpdateInfo {
@@ -127,6 +139,9 @@ export const api = {
   installUpdate: (endpoint?: string) =>
     invoke<void>("install_update", { endpoint }),
   dismissReleaseNotes: () => invoke<void>("dismiss_release_notes"),
+  extensionStatus: () => invoke<ExtensionStatus>("extension_status"),
+  installExtension: () => invoke<ExtensionStatus>("install_extension"),
+  openExtensionFolder: () => invoke<void>("open_extension_folder"),
   setGlobalLimit: (bytesPerSecond: number | null) =>
     invoke<void>("set_global_limit", { bytesPerSecond }),
   revealFile: (path: string) => invoke<void>("reveal_file", { path })

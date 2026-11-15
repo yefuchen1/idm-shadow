@@ -237,6 +237,61 @@ body {
   height: 14px;
 }
 
+/* 浏览器扩展：状态 + 目录 + 操作按钮，比普通设置行高一截。 */
+.extension-row {
+  align-items: flex-start;
+}
+
+.extension-row > label {
+  padding-top: 2px;
+}
+
+.extension-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.extension-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.extension-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+
+.extension-state.on {
+  color: var(--green);
+}
+
+.extension-dir {
+  flex: 1 1 240px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 3px 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.extension-help {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 .btn.danger {
   background: var(--red);
   border-color: var(--red);

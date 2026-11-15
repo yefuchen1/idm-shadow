@@ -23,6 +23,11 @@ use idm_shadow_engine::manager::DownloadManager;
 use idm_shadow_engine::task::{EngineKind, Task, TaskId, TaskRequest};
 
 pub const TOKEN_HEADER: &str = "x-idm-shadow-token";
+/// 扩展在每个请求上打这个头，用来判断"浏览器接管是不是真的在工作"。
+///
+/// 光看进程/浏览器版本判断不了：扩展没启用、被禁用、被删掉，
+/// 应用这边都看不出来。让扩展自报身份最省事。
+pub const CLIENT_HEADER: &str = "x-idm-shadow-client";
 
 #[derive(Clone)]
 pub struct BridgeState {
@@ -34,6 +39,11 @@ pub struct BridgeState {
     /// 扩展点「打开主界面」时会调它。bridge 本身不该知道 Tauri，
     /// 所以这里放个回调，由 app 那边接上。
     pub show_ui: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 扩展最近一次带 token 调接口的时间。
+    ///
+    /// 界面用它显示"已连接 / 未连接"。用 `Instant` 而不是时间戳，
+    /// 免得用户改系统时间把状态搞乱。
+    pub extension_seen: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// 统一错误响应。
@@ -287,12 +297,54 @@ async fn auth_middleware(
         .or_else(|| query.get("token").cloned());
 
     match provided {
-        Some(token) if token == *state.token => next.run(request).await,
+        Some(token) if token == *state.token => {
+            if is_extension_client(&headers) {
+                if let Ok(mut slot) = state.extension_seen.lock() {
+                    *slot = Some(std::time::Instant::now());
+                }
+            }
+            next.run(request).await
+        }
         _ => {
             let err = ApiError::new("unauthorized", "token 不正确");
             (StatusCode::UNAUTHORIZED, Json(err)).into_response()
         }
     }
+}
+
+/// 这个请求是不是浏览器扩展发来的。
+///
+/// 只认显式声明：扩展在没有 Origin 头的场景（service worker 里
+/// 某些请求）也要能被认出来，所以不能只靠 `chrome-extension://`。
+/// 这个判断只用于显示状态，不参与鉴权——鉴权永远是 token。
+fn is_extension_client(headers: &HeaderMap) -> bool {
+    if headers
+        .get(CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("extension"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|o| o.starts_with("chrome-extension://") || o.starts_with("moz-extension://"))
+        .unwrap_or(false)
+}
+
+/// 扩展是不是还在连着。
+///
+/// 扩展每分钟会拉一次角标数据，三分钟没动静基本就是退了、
+/// 被禁用或者被卸载了。给一个宽裕的窗口，避免网络抖动误报。
+pub fn extension_connected(
+    seen: &std::sync::Mutex<Option<std::time::Instant>>,
+) -> bool {
+    seen.lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|at| at.elapsed() < std::time::Duration::from_secs(180))
+        .unwrap_or(false)
 }
 
 /// 构造路由。
@@ -351,6 +403,9 @@ async fn health(State(state): State<BridgeState>) -> Json<Value> {
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "port": state.port,
+        // 浏览器扩展是不是还在连着。不涉及 token，健康检查
+        // 本来就不需要鉴权，这里也不多暴露什么。
+        "extension_connected": extension_connected(&state.extension_seen),
     }))
 }
 
@@ -841,5 +896,37 @@ mod tests {
         assert!(!bootstrap_origin_allowed("http://localhost"));
         // file:// 页面发的是 null
         assert!(!bootstrap_origin_allowed("null"));
+    }
+
+    #[test]
+    fn extension_presence_is_tracked_from_marked_requests() {
+        let seen = std::sync::Mutex::new(None);
+        assert!(!extension_connected(&seen));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLIENT_HEADER,
+            axum::http::HeaderValue::from_static("extension"),
+        );
+        assert!(is_extension_client(&headers));
+
+        *seen.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(extension_connected(&seen));
+    }
+
+    #[test]
+    fn plain_web_requests_do_not_count_as_extension() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://example.com"),
+        );
+        assert!(!is_extension_client(&headers));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("chrome-extension://abc"),
+        );
+        assert!(is_extension_client(&headers));
     }
 }

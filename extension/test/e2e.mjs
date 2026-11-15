@@ -323,12 +323,11 @@ try {
   check('只投递了一个任务', after.length === before.length + 1,
     `${before.length} -> ${after.length}`);
 
-  // ask 模式：弹通知让用户确认，不直接接管。
+  // off 模式：不接管，下载留给浏览器。
   //
-  // 这条路要过 chrome.notifications，而 MV3 的通知必须带 iconUrl，
-  // 少一个字段就抛 "Some of the required properties are missing"。
-  // 之前这个错误只有实机才看得到——单元测试的 mock 不校验通知形状。
-  await optPage.selectOption('#mode', 'ask');
+  // 以前的版本有 'ask'（弹通知让用户确认），后来去掉了——
+  // 只弹气泡又不取消下载，用户点不点结果都一样。
+  await optPage.selectOption('#mode', 'off');
   await optPage.click('#save');
 
   // 看看扩展的 service worker 有没有报错
@@ -348,16 +347,13 @@ try {
   }
   await new Promise((r) => setTimeout(r, 2500));
 
-  const missingProps = errors.filter((e) =>
-    /required properties are missing/i.test(e)
-  );
-  check('ask 模式的通知没有缺字段', missingProps.length === 0,
-    missingProps[0] || errors.join(' | '));
+  check('off 模式没有 service worker 报错', errors.length === 0,
+    errors.join(' | '));
 
-  // ask 模式不该自动投递给应用
-  const afterAsk = await listTasks();
-  check('ask 模式不会自动接管', afterAsk.length === after.length,
-    `${after.length} -> ${afterAsk.length}`);
+  // off 模式不该自动投递给应用
+  const afterOff = await listTasks();
+  check('off 模式不会自动接管', afterOff.length === after.length,
+    `${after.length} -> ${afterOff.length}`);
 
   // popup 的「打开主界面」不该开出标签页。
   //
@@ -366,12 +362,20 @@ try {
   // 「无法访问此页面 / localhost 拒绝连接」的错误页留在那儿。
   const popupPage = await browser.newPage();
   await popupPage.goto(`chrome-extension://${extId}/popup.html`);
+  // 等前一步的下载标签页稳定下来再数，避免它自己关掉造成误判。
+  await new Promise((r) => setTimeout(r, 800));
   const tabsBefore = browser.pages().length;
   await popupPage.click('#open');
   await new Promise((r) => setTimeout(r, 1500));
   const tabsAfter = browser.pages().length;
-  check('点「打开主界面」不会开出错误标签页', tabsAfter === tabsBefore,
-    `${tabsBefore} -> ${tabsAfter}`);
+  // 关键不是数量不变（别的标签页可能自己关掉），而是没有留下
+  // 一个加载协议链接的错误页。
+  const stray = browser
+    .pages()
+    .filter((p) => /^idmshadow:|^chrome-error:/.test(p.url()));
+  check('点「打开主界面」不会开出错误标签页',
+    tabsAfter <= tabsBefore && stray.length === 0,
+    `${tabsBefore} -> ${tabsAfter}; stray=${stray.map((p) => p.url()).join(',')}`);
 } catch (err) {
   failures += 1;
   console.error('FAIL  测试执行出错:', err.message);

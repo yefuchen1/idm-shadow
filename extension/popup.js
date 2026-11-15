@@ -101,7 +101,11 @@ async function showAppWindow() {
   try {
     await fetch(`${s.bridgeUrl}/api/v1/ui/show`, {
       method: 'POST',
-      headers: { 'X-IDM-Shadow-Token': s.token }
+      headers: {
+        'X-IDM-Shadow-Token': s.token,
+        // 让应用知道扩展还活着（设置页显示连接状态）
+        'X-IDM-Shadow-Client': 'extension'
+      }
     });
   } catch (err) {
     // 应用没在跑，忽略

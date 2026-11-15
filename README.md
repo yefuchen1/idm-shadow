@@ -205,8 +205,12 @@ WebView2 运行时。
 ## 油猴对接步骤
 
 1. 启动 IDM Shadow，打开「设置」，记下 **bridge 地址** 和 **token**。
-2. 装扩展：Chrome 打开 `chrome://extensions`，开启开发者模式，
-   「加载已解压的扩展程序」，选 `extension/` 目录。
+2. 装扩展：设置里的「浏览器接管」一栏会显示扩展目录
+   `%APPDATA%\IDM Shadow\extension`（点「打开目录」可直达），
+   地址栏打开 `chrome://extensions` 或 `edge://extensions`
+   （「浏览器接管」里的按钮会把地址复制到剪贴板），开启「开发者模式」，
+   点「加载已解压的扩展程序」选中该目录。
+   加载成功后该栏会变成「已连接」——那是扩展带 token 调了一次本地接口。
 3. 打开扩展的设置页，填入 bridge 地址与 token。接管方式默认是
    **「直接接管」**：浏览器点下载就直接弹出 IDM Shadow 自己的下载对话框，
    不会再在浏览器右下角弹那个「用 IDM Shadow 下载？」的气泡。

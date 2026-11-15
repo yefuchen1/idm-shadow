@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Ban,
+  CircleCheck,
+  CircleDashed,
   Copy,
   Download,
   FolderInput,
@@ -22,6 +24,7 @@ import {
   formatSize,
   formatSpeed,
   STATUS_LABEL,
+  type ExtensionStatus,
   type SettingsDto,
   type SegmentDto,
   type PieceStatusDto,
@@ -65,6 +68,8 @@ export default function App() {
   );
   // 更新后第一次启动展示一次"本次更新内容"。
   const [releaseNotes, setReleaseNotes] = useState<ReleaseNotes | null>(null);
+  // 浏览器扩展：文件放哪、有没有真的连上来。
+  const [extension, setExtension] = useState<ExtensionStatus | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
     id: string;
     filename: string;
@@ -105,6 +110,7 @@ export default function App() {
       .getSettings()
       .then((s) => {
         setSettings(s);
+        setExtension(s.extension);
         if (s.release_notes) setReleaseNotes(s.release_notes);
         setDraft({
           downloadDir: s.download_dir,
@@ -196,6 +202,27 @@ export default function App() {
       unlistenUpdateProgress.then((fn) => fn());
     };
   }, [refresh]);
+
+  // 设置面板开着的时候轮询扩展状态：用户去浏览器里点完
+  // "加载已解压的扩展程序"，回来就能看到变成"已连接"。
+  useEffect(() => {
+    if (!showSettings) return;
+    let alive = true;
+    const tick = () => {
+      api
+        .extensionStatus()
+        .then((s) => {
+          if (alive) setExtension(s);
+        })
+        .catch(() => undefined);
+    };
+    tick();
+    const timer = window.setInterval(tick, 4000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [showSettings]);
 
   const totals = useMemo(() => {
     let speed = 0;
@@ -337,6 +364,30 @@ export default function App() {
 
   async function copy(text: string) {
     await navigator.clipboard.writeText(text);
+  }
+
+  /** 释放扩展文件，并把目录复制到剪贴板——下一步就要选这个目录。 */
+  async function prepareExtension() {
+    setError(null);
+    try {
+      const status = await api.installExtension();
+      setExtension(status);
+      if (status.dir) await navigator.clipboard.writeText(status.dir);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function openExtensionFolder() {
+    setError(null);
+    try {
+      const status = extension?.installed ? extension : await api.installExtension();
+      setExtension(status);
+      if (status.dir) await navigator.clipboard.writeText(status.dir);
+      await api.openExtensionFolder();
+    } catch (err) {
+      setError(String(err));
+    }
   }
 
   async function pickFolder() {
@@ -625,6 +676,89 @@ export default function App() {
               <span>浏览器下载自动交给 IDM Shadow</span>
             </label>
           </div>
+          {extension && (
+            <div className="settings-row extension-row">
+              <label>浏览器接管</label>
+              <div className="extension-body">
+                <div className="extension-line">
+                  {extension.connected ? (
+                    <span className="extension-state on">
+                      <CircleCheck size={13} />
+                      已连接
+                    </span>
+                  ) : (
+                    <span className="extension-state">
+                      <CircleDashed size={13} />
+                      未连接
+                    </span>
+                  )}
+                  <span className="unit">
+                    {extension.connected
+                      ? "浏览器下载会交给 IDM Shadow"
+                      : extension.installed
+                        ? "扩展已释放，还需要在浏览器里启用"
+                        : "需要先在浏览器里加载扩展"}
+                  </span>
+                </div>
+                <div className="extension-line">
+                  <code className="extension-dir">{extension.dir}</code>
+                  <button
+                    className="btn small"
+                    title="复制扩展目录"
+                    onClick={() => copy(extension.dir)}
+                  >
+                    <Copy size={13} />
+                  </button>
+                </div>
+                <div className="extension-line">
+                  {extension.installed ? (
+                    <button
+                      className="btn small"
+                      onClick={prepareExtension}
+                      title="重新写入扩展文件"
+                    >
+                      <RefreshCw size={13} />
+                      更新文件
+                    </button>
+                  ) : (
+                    <button className="btn small" onClick={prepareExtension}>
+                      <FolderCog size={13} />
+                      释放扩展文件
+                    </button>
+                  )}
+                  <button
+                    className="btn small"
+                    onClick={openExtensionFolder}
+                    title="打开扩展目录，把它拖进扩展管理页"
+                  >
+                    <FolderOpen size={13} />
+                    打开目录
+                  </button>
+                </div>
+                {!extension.connected && (
+                  <>
+                    <p className="extension-help">
+                      地址栏打开下面的扩展页，开启「开发者模式」，点
+                      「加载已解压的扩展程序」，选中上面的目录。
+                    </p>
+                    <div className="extension-line">
+                      {extension.browsers.map((b) => (
+                        <button
+                          key={b.id}
+                          className="btn small"
+                          onClick={() => copy(b.page)}
+                          title={`复制 ${b.label} 扩展页地址`}
+                        >
+                          <Copy size={13} />
+                          {b.label} 扩展页
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
           <div className="settings-row">
             <label>开机自启</label>
             <label className="switch">

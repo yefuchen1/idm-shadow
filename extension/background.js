@@ -20,6 +20,11 @@ const DEFAULTS = {
 // 图片类后缀。用来把"页面预览图"挡在接管之外。
 const IMAGE_EXT = /\.(jpe?g|png|gif|webp|bmp|svg|avif|ico|tiff?)$/i;
 
+// 打到本地 bridge 的请求都带上这个头，应用靠它判断扩展还活着
+// （设置页显示"已连接 / 未连接"）。不参与鉴权——鉴权始终是 token。
+const CLIENT_HEADER = 'X-IDM-Shadow-Client';
+const CLIENT_VALUE = 'extension';
+
 // 只取文件名，不要路径。
 //
 // Chrome 的 downloads.onCreated 给的 item.filename 是完整路径
@@ -79,7 +84,8 @@ async function renameTask(taskId, filename) {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        'X-IDM-Shadow-Token': s.token
+        'X-IDM-Shadow-Token': s.token,
+        [CLIENT_HEADER]: CLIENT_VALUE
       },
       body: JSON.stringify({ filename })
     });
@@ -204,7 +210,7 @@ async function syncWithApp() {
   if (!s.token) return;
   try {
     const resp = await fetch(apiUrl('/api/v1/settings', s), {
-      headers: { 'X-IDM-Shadow-Token': s.token }
+      headers: { 'X-IDM-Shadow-Token': s.token, [CLIENT_HEADER]: CLIENT_VALUE }
     });
     if (!resp.ok) return;
     const body = await resp.json();
@@ -251,7 +257,8 @@ async function createTask(payload) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-IDM-Shadow-Token': s.token
+      'X-IDM-Shadow-Token': s.token,
+      [CLIENT_HEADER]: CLIENT_VALUE
     },
     body: JSON.stringify(payload)
   });
@@ -470,7 +477,7 @@ async function updateBadge() {
   }
   try {
     const resp = await fetch(apiUrl('/api/v1/tasks', s), {
-      headers: { 'X-IDM-Shadow-Token': s.token }
+      headers: { 'X-IDM-Shadow-Token': s.token, [CLIENT_HEADER]: CLIENT_VALUE }
     });
     if (!resp.ok) throw new Error('bad status');
     const body = await resp.json();
@@ -510,7 +517,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === 'tasks') {
     settings()
       .then((s) =>
-        fetch(apiUrl('/api/v1/tasks', s), { headers: { 'X-IDM-Shadow-Token': s.token } })
+        fetch(apiUrl('/api/v1/tasks', s), {
+          headers: { 'X-IDM-Shadow-Token': s.token, [CLIENT_HEADER]: CLIENT_VALUE }
+        })
       )
       .then((r) => r.json())
       .then((body) => sendResponse(body))
