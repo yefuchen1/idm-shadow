@@ -5,14 +5,18 @@
 // 客户端固定读 `releases/latest/download/latest.json`，所以不需要改客户端地址。
 //
 // 用法：
-//   npm run release:github -- --notes "修了什么"
-//   npm run release:github -- --notes-file CHANGELOG.md --draft
+//   npm run release:github
+//   npm run release:github -- --notes-file docs/releases/v0.2.1.md --draft
+//
+// 更新说明优先从 `docs/releases/v<version>.md` 读取。说明文件要提交进 Git，
+// 这样 Release 正文、客户端 feed 和源码历史对得上。
+// 不要用 `--notes` 传多行文本：PowerShell 经 npm 转发参数时会只保留第一行。
 //
 // 需要环境变量 GITHUB_TOKEN（repo 权限）。私钥仍由 tauri build 使用，
 // 本脚本只上传已签名的产物，绝不读取或上传私钥。
 
 import { execFileSync } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -100,6 +104,7 @@ async function uploadAsset(uploadUrl, file) {
       `上传 ${name} 失败: ${response.status} ${await response.text()}`
     );
   }
+  return response.json();
 }
 
 async function main() {
@@ -115,11 +120,23 @@ async function main() {
     await readFile(join(repo, "app/tauri.conf.json"), "utf8")
   ).version;
   const tag = `v${version}`;
-  const notes = args.notesFile
-    ? (await readFile(args.notesFile, "utf8")).trim()
+  let notesFile = args.notesFile;
+  if (!notesFile) {
+    const defaultFile = join(repo, "docs/releases", `${tag}.md`);
+    try {
+      await access(defaultFile);
+      notesFile = defaultFile;
+    } catch {
+      // 没有版本说明文件时，才退回单行 --notes。
+    }
+  }
+  const notes = notesFile
+    ? (await readFile(notesFile, "utf8")).trim()
     : args.notes;
   if (!notes.trim()) {
-    throw new Error("更新说明不能为空：发出去的每个版本都要告诉用户改了什么。");
+    throw new Error(
+      `更新说明不能为空。新建 docs/releases/${tag}.md 写清本次改动，再发版。`
+    );
   }
 
   const status = execFileSync("git", ["status", "--porcelain"], {
@@ -140,8 +157,11 @@ async function main() {
   run("node", ["tools/update/publish.mjs", "--base-url", baseUrl, "--notes", notes]);
 
   const distDir = join(repo, "dist/updates");
-  const feed = await readFile(join(distDir, "latest.json"), "utf8");
-  const installer = JSON.parse(feed).platforms["windows-x86_64"].url.split("/").pop();
+  const feedPath = join(distDir, "latest.json");
+  const feedText = await readFile(feedPath, "utf8");
+  const installer = JSON.parse(feedText)
+    .platforms["windows-x86_64"].url.split("/")
+    .pop();
 
   run("git", ["tag", "-a", tag, "-m", `IDM Shadow ${version}`]);
   run("git", ["push", "origin", `refs/tags/${tag}`]);
@@ -161,10 +181,18 @@ async function main() {
 
   // 顺序有讲究：latest.json 最后传。先传就会有一小段时间
   // 客户端能读到新 feed、却下不到安装包。
-  await uploadAsset(
+  const uploadedInstaller = await uploadAsset(
     release.upload_url.replace("{?name,label}", ""),
     join(distDir, decodeURIComponent(installer))
   );
+
+  // GitHub 会把资产名里的空格等字符改写成点号（"IDM Shadow_..." →
+  // "IDM.Shadow_..."）。feed 必须用服务端返回的真实下载地址，
+  // 否则客户端拿到的是 404。这里在 latest.json 上传前修正。
+  const feed = JSON.parse(feedText);
+  feed.platforms["windows-x86_64"].url = uploadedInstaller.browser_download_url;
+  await writeFile(feedPath, `${JSON.stringify(feed, null, 2)}\n`, "utf8");
+
   await uploadAsset(
     release.upload_url.replace("{?name,label}", ""),
     join(repo, "target/release/bundle/nsis", `${decodeURIComponent(installer)}.sig`)
@@ -173,7 +201,7 @@ async function main() {
   // 却下不到安装包。
   await uploadAsset(
     release.upload_url.replace("{?name,label}", ""),
-    join(repo, "dist/updates/latest.json")
+    feedPath
   );
 
   console.log("");

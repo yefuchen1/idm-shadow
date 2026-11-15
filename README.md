@@ -67,18 +67,21 @@ $env:TAURI_SIGNING_PRIVATE_KEY="$env:USERPROFILE\.tauri\idm-shadow.key"
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD=(Get-Content "$env:USERPROFILE\.tauri\idm-shadow.password" -Raw).Trim()
 npm run app:installer
 
-# 3. 提交并推送源码（发版脚本要求工作区干净）
+# 3. 写本版说明并提交（发版脚本要求工作区干净）
+#    docs/releases/v<version>.md 会同时用作 Release 正文和客户端更新说明
 git add -A
 git commit -m "release: v0.2.1"
 git push origin main
 
 # 4. 发布：自动打 tag、建 Release、上传 exe / .sig / latest.json
 $env:GITHUB_TOKEN="<repo 权限的 token>"
-npm run release:github -- --notes "修复……"
+npm run release:github
 ```
 
 发版脚本会校验 `Cargo.toml` 与 `tauri.conf.json` 版本一致、安装包与 `.sig`
 都存在；`latest.json` 最后上传，避免客户端读到新 feed 却下不到包。
+feed 里的下载地址取自 GitHub 返回的真实资产地址（GitHub 会把资产名里的空格
+改写成点号），不要手写文件名拼 URL。
 
 签名私钥在 `%USERPROFILE%\.tauri\idm-shadow.key`，**必须单独备份**。
 丢了私钥就无法再给老用户推送可验证的更新，只能让所有人手工重装。
