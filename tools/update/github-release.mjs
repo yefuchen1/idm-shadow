@@ -7,6 +7,7 @@
 // 用法：
 //   npm run release:github
 //   npm run release:github -- --notes-file docs/releases/v0.2.1.md --draft
+//   npm run release:github -- --resume
 //
 // 更新说明优先从 `docs/releases/v<version>.md` 读取。说明文件要提交进 Git，
 // 这样 Release 正文、客户端 feed 和源码历史对得上。
@@ -26,7 +27,13 @@ const REPO_SLUG = "yefuchen1/idm-shadow";
 const API = "https://api.github.com";
 
 function parseArgs(argv) {
-  const args = { notes: "", notesFile: "", draft: false, prerelease: false };
+  const args = {
+    notes: "",
+    notesFile: "",
+    draft: false,
+    prerelease: false,
+    resume: false
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
     const next = () => {
@@ -38,6 +45,7 @@ function parseArgs(argv) {
     else if (key === "--notes-file") args.notesFile = resolve(next());
     else if (key === "--draft") args.draft = true;
     else if (key === "--prerelease") args.prerelease = true;
+    else if (key === "--resume") args.resume = true;
     else if (key === "--help" || key === "-h") args.help = true;
     else throw new Error(`未知参数: ${key}`);
   }
@@ -111,7 +119,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     console.log(
-      "npm run release:github -- [--notes <text> | --notes-file <path>] [--draft] [--prerelease]"
+      "npm run release:github -- [--notes <text> | --notes-file <path>] [--draft] [--prerelease] [--resume]"
     );
     return;
   }
@@ -164,8 +172,14 @@ async function main() {
     );
   }
 
-  if (execFileSync("git", ["tag", "--list", tag], { cwd: repo, encoding: "utf8" }).trim()) {
-    throw new Error(`tag ${tag} 已存在。版本号没改就不要重复发版。`);
+  const localTag = execFileSync("git", ["tag", "--list", tag], {
+    cwd: repo,
+    encoding: "utf8"
+  }).trim();
+  if (localTag && !args.resume) {
+    throw new Error(
+      `tag ${tag} 已存在。版本号没改就不要重复发版；上次发布中途失败可加 --resume 继续。`
+    );
   }
 
   const baseUrl = `https://github.com/${REPO_SLUG}/releases/download/${tag}`;
@@ -178,7 +192,9 @@ async function main() {
     .platforms["windows-x86_64"].url.split("/")
     .pop();
 
-  run("git", ["tag", "-a", tag, "-m", `IDM Shadow ${version}`]);
+  if (!localTag) {
+    run("git", ["tag", "-a", tag, "-m", `IDM Shadow ${version}`]);
+  }
   run("git", ["push", "origin", `refs/tags/${tag}`]);
 
   console.log(`创建 Release ${tag}`);
