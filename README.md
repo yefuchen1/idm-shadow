@@ -37,6 +37,52 @@
 | 同时下载任务数 | 超出上限的任务排队，前面的跑完自动接上（0 = 不限） |
 | 默认下载工具 | 勾上后浏览器下载自动交给本应用；**会连带打开开机自启** |
 | 开机自启 | 注册表 `HKCU\...\Run`，当前用户即可生效 |
+| 更新源 | 默认指向 GitHub Releases；每个版本发布后客户端自动发现 |
+| 启动时检查 | 每次打开应用检查一次新版本，默认开 |
+
+## 安装与更新
+
+正式版是 NSIS 安装包，装到 `%LOCALAPPDATA%\IDM Shadow`（当前用户，
+不需要管理员权限）。安装包不带开机自启：由应用按设置里的开关写入
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值为
+`"<安装目录>\idm-shadow-app.exe" --autostart`；带这个参数启动只进托盘，不弹主窗口。
+每次启动都会按设置对账，安装目录变了会重写路径，被安全软件清掉会补回。
+
+**更新只有一个入口：GitHub Releases。**
+
+- 固定 feed：<https://github.com/yefuchen1/idm-shadow/releases/latest/download/latest.json>
+- 客户端每次启动检查（设置里可关），发现新版本在列表顶部提示；
+- 安装包必须带 minisign 签名，客户端验签通过才会安装；
+- 安装完成后重启，主界面展示本次更新内容，关闭后不再重复。
+
+源码、安装包、更新 feed 都通过 GitHub 管理；大文件走 Release 资产，
+不进 Git 历史。
+
+### 发版流程
+
+```powershell
+# 1. 改版本号：Cargo.toml / app/tauri.conf.json / package.json / app/ui/package.json
+# 2. 构建签名安装包
+$env:TAURI_SIGNING_PRIVATE_KEY="$env:USERPROFILE\.tauri\idm-shadow.key"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD=(Get-Content "$env:USERPROFILE\.tauri\idm-shadow.password" -Raw).Trim()
+npm run app:installer
+
+# 3. 提交并推送源码（发版脚本要求工作区干净）
+git add -A
+git commit -m "release: v0.2.1"
+git push origin main
+
+# 4. 发布：自动打 tag、建 Release、上传 exe / .sig / latest.json
+$env:GITHUB_TOKEN="<repo 权限的 token>"
+npm run release:github -- --notes "修复……"
+```
+
+发版脚本会校验 `Cargo.toml` 与 `tauri.conf.json` 版本一致、安装包与 `.sig`
+都存在；`latest.json` 最后上传，避免客户端读到新 feed 却下不到包。
+
+签名私钥在 `%USERPROFILE%\.tauri\idm-shadow.key`，**必须单独备份**。
+丢了私钥就无法再给老用户推送可验证的更新，只能让所有人手工重装。
+私钥、密码、`*.key.pub` 都不入库（见 `.gitignore`）。
 
 ### 关于确认流程的实现
 

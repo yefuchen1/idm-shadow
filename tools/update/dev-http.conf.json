@@ -1,0 +1,8 @@
+{
+  "plugins": {
+    "updater": {
+      "dangerousInsecureTransportProtocol": true,
+      "requireSignedVersion": true
+    }
+  }
+}

@@ -72,6 +72,29 @@ export interface SettingsDto {
   max_concurrent_tasks: number;
   default_download_tool: boolean;
   auto_start: boolean;
+  version: string;
+  update_endpoint: string;
+  update_check_on_start: boolean;
+  release_notes: ReleaseNotes | null;
+}
+
+export interface UpdateInfo {
+  version: string;
+  current_version: string;
+  notes: string | null;
+  date: string | null;
+}
+
+export interface UpdateProgress {
+  phase: "download" | "installed";
+  downloaded?: number;
+  total?: number | null;
+}
+
+/** 升级后第一次启动时带来的发布说明。 */
+export interface ReleaseNotes {
+  version: string;
+  notes: string;
 }
 
 export const api = {
@@ -99,6 +122,11 @@ export const api = {
   getSettings: () => invoke<SettingsDto>("get_settings"),
   updateSettings: (patch: SettingsPatch) =>
     invoke<void>("update_settings", patch as unknown as Record<string, unknown>),
+  checkUpdate: (endpoint?: string) =>
+    invoke<UpdateInfo | null>("check_update", { endpoint }),
+  installUpdate: (endpoint?: string) =>
+    invoke<void>("install_update", { endpoint }),
+  dismissReleaseNotes: () => invoke<void>("dismiss_release_notes"),
   setGlobalLimit: (bytesPerSecond: number | null) =>
     invoke<void>("set_global_limit", { bytesPerSecond }),
   revealFile: (path: string) => invoke<void>("reveal_file", { path })
@@ -111,6 +139,8 @@ export interface SettingsPatch {
   maxConcurrentTasks?: number;
   defaultDownloadTool?: boolean;
   autoStart?: boolean;
+  updateEndpoint?: string;
+  updateCheckOnStart?: boolean;
 }
 
 export function formatSize(bytes: number | null | undefined): string {

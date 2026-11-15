@@ -14,3 +14,9 @@ Thumbs.db
 
 *.log
 .playwright-cli/
+
+# 更新发布产物与签名私钥，绝不入库
+/dist/updates/
+*.key
+*.key.pub
+*.password

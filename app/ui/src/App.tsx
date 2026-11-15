@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   Ban,
   Copy,
+  Download,
   FolderInput,
   FolderOpen,
   FolderCog,
@@ -25,7 +26,10 @@ import {
   type SegmentDto,
   type PieceStatusDto,
   type TaskDto,
-  type TaskStatus
+  type TaskStatus,
+  type UpdateInfo,
+  type UpdateProgress,
+  type ReleaseNotes
 } from "./api";
 import { SegmentBar } from "./SegmentBar";
 import { PieceBar } from "./PieceBar";
@@ -47,8 +51,20 @@ export default function App() {
     maxConnections: "16",
     maxConcurrentTasks: "0",
     defaultDownloadTool: false,
-    autoStart: false
+    autoStart: false,
+    updateEndpoint: "",
+    updateCheckOnStart: true
   });
+  // 更新：检查结果、检查中、下载进度、错误都在这一块里。
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateChecked, setUpdateChecked] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(
+    null
+  );
+  // 更新后第一次启动展示一次"本次更新内容"。
+  const [releaseNotes, setReleaseNotes] = useState<ReleaseNotes | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
     id: string;
     filename: string;
@@ -89,16 +105,34 @@ export default function App() {
       .getSettings()
       .then((s) => {
         setSettings(s);
+        if (s.release_notes) setReleaseNotes(s.release_notes);
         setDraft({
           downloadDir: s.download_dir,
           globalLimit: "",
           maxConnections: String(s.max_connections),
           maxConcurrentTasks: String(s.max_concurrent_tasks),
           defaultDownloadTool: s.default_download_tool,
-          autoStart: s.auto_start
+          autoStart: s.auto_start,
+          updateEndpoint: s.update_endpoint,
+          updateCheckOnStart: s.update_check_on_start
         });
       })
       .catch(() => undefined);
+
+    // 启动后静默检查发现的新版本，以及安装进度。
+    const unlistenUpdate = listen<UpdateInfo>("update-available", (event) => {
+      setUpdateInfo(event.payload);
+      setUpdateChecked(true);
+    });
+    const unlistenUpdateProgress = listen<UpdateProgress>(
+      "update-progress",
+      (event) => {
+        setUpdateProgress(event.payload);
+        if (event.payload.phase === "installed") {
+          setInstallingUpdate(false);
+        }
+      }
+    );
 
     const unlistenProgress = listen<{
       id: string;
@@ -158,6 +192,8 @@ export default function App() {
       unlistenProgress.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
       unlistenConfirm.then((fn) => fn());
+      unlistenUpdate.then((fn) => fn());
+      unlistenUpdateProgress.then((fn) => fn());
     };
   }, [refresh]);
 
@@ -337,6 +373,11 @@ export default function App() {
       setError("限速值不对");
       return;
     }
+    const endpoint = draft.updateEndpoint.trim();
+    if (endpoint && !/^https:\/\//i.test(endpoint)) {
+      setError("正式版更新源必须是 https；http 仅用于本地自测");
+      return;
+    }
 
     await guard(async () => {
       await api.updateSettings({
@@ -345,7 +386,9 @@ export default function App() {
         maxConnections: conns,
         maxConcurrentTasks: tasks,
         defaultDownloadTool: draft.defaultDownloadTool,
-        autoStart: draft.autoStart
+        autoStart: draft.autoStart,
+        updateEndpoint: endpoint,
+        updateCheckOnStart: draft.updateCheckOnStart
       });
       const s = await api.getSettings();
       setSettings(s);
@@ -353,9 +396,37 @@ export default function App() {
         ...d,
         globalLimit: "",
         defaultDownloadTool: s.default_download_tool,
-        autoStart: s.auto_start
+        autoStart: s.auto_start,
+        updateEndpoint: s.update_endpoint,
+        updateCheckOnStart: s.update_check_on_start
       }));
     });
+  }
+
+  async function checkUpdate() {
+    setError(null);
+    setCheckingUpdate(true);
+    try {
+      const info = await api.checkUpdate(draft.updateEndpoint.trim() || undefined);
+      setUpdateInfo(info);
+      setUpdateChecked(true);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function installUpdate() {
+    setError(null);
+    setInstallingUpdate(true);
+    setUpdateProgress(null);
+    try {
+      await api.installUpdate(draft.updateEndpoint.trim() || undefined);
+    } catch (err) {
+      setInstallingUpdate(false);
+      setError(String(err));
+    }
   }
 
   async function confirmDelete() {
@@ -367,6 +438,24 @@ export default function App() {
 
   return (
     <div className="app">
+      {releaseNotes && (
+        <div className="release-notes">
+          <div className="release-notes-head">
+            <strong>已更新到 {releaseNotes.version}</strong>
+            <button
+              className="btn icon"
+              title="关闭"
+              onClick={() => {
+                setReleaseNotes(null);
+                api.dismissReleaseNotes().catch(() => undefined);
+              }}
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <p>{releaseNotes.notes}</p>
+        </div>
+      )}
       <header className="titlebar">
         <div className="brand">
           <span className="logo" />
@@ -550,6 +639,80 @@ export default function App() {
             </label>
           </div>
           <div className="settings-row">
+            <label>更新源</label>
+            <input
+              className="dir-input"
+              placeholder="https://…/latest.json"
+              value={draft.updateEndpoint}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, updateEndpoint: e.target.value }))
+              }
+            />
+            <button
+              className="btn small"
+              disabled={checkingUpdate || !draft.updateEndpoint.trim()}
+              onClick={checkUpdate}
+            >
+              <RefreshCw size={13} />
+              {checkingUpdate ? "检查中" : "检查"}
+            </button>
+          </div>
+          <div className="settings-row">
+            <label>启动时检查</label>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={draft.updateCheckOnStart}
+                onChange={(e) =>
+                  setDraft((d) => ({
+                    ...d,
+                    updateCheckOnStart: e.target.checked
+                  }))
+                }
+              />
+              <span>发现新版本只在界面提示，不自动安装</span>
+            </label>
+          </div>
+          <div className="settings-row update-row">
+            <label>版本</label>
+            <span className="update-version">
+              {settings.version}
+              {updateChecked && !updateInfo && (
+                <span className="unit"> · 已是最新</span>
+              )}
+            </span>
+            {updateInfo && (
+              <button
+                className="btn small primary"
+                disabled={installingUpdate}
+                onClick={installUpdate}
+              >
+                <Download size={13} />
+                {installingUpdate
+                  ? "安装中"
+                  : `更新到 ${updateInfo.version}`}
+              </button>
+            )}
+          </div>
+          {updateInfo?.notes && (
+            <div className="settings-row update-row">
+              <label>更新说明</label>
+              <span className="update-notes">{updateInfo.notes}</span>
+            </div>
+          )}
+          {updateProgress?.phase === "download" && (
+            <div className="settings-row update-row">
+              <label>下载更新</label>
+              <span className="update-notes">
+                {updateProgress.total
+                  ? `${formatSize(updateProgress.downloaded ?? 0)} / ${formatSize(
+                      updateProgress.total
+                    )}`
+                  : formatSize(updateProgress.downloaded ?? 0)}
+              </span>
+            </div>
+          )}
+          <div className="settings-row">
             <button className="btn primary" onClick={saveSettings}>
               保存设置
             </button>
@@ -585,6 +748,29 @@ export default function App() {
       </div>
 
       <div className="list">
+        {updateInfo && (
+          <div className="update-banner">
+            <div className="update-banner-text">
+              <strong>发现新版本 {updateInfo.version}</strong>
+              {updateInfo.notes && <span>{updateInfo.notes}</span>}
+            </div>
+            <button
+              className="btn small primary"
+              disabled={installingUpdate}
+              onClick={installUpdate}
+            >
+              <Download size={13} />
+              {installingUpdate ? "安装中" : "立即更新"}
+            </button>
+            <button
+              className="btn icon"
+              title="稍后"
+              onClick={() => setUpdateInfo(null)}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {pendingQueue.length > 1 && (
           <div className="queue-banner">
             <span>

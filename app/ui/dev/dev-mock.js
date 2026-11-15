@@ -88,7 +88,10 @@
       max_connections: 16,
       max_concurrent_tasks: 3,
       default_download_tool: true,
-      auto_start: true
+      auto_start: true,
+      version: "0.2.0",
+      update_endpoint: "",
+      update_check_on_start: true
     };
 
     window.__TAURI_INTERNALS__ = {
@@ -99,7 +102,22 @@
           case "get_settings":
             return settings;
           case "update_settings":
-            Object.assign(settings, args || {});
+            // 真机的字段是 camelCase，这里按真机的名字回写。
+            if (args?.downloadDir) settings.download_dir = args.downloadDir;
+            if (typeof args?.autoStart === "boolean") {
+              settings.auto_start = args.autoStart;
+            }
+            if (typeof args?.defaultDownloadTool === "boolean") {
+              settings.default_download_tool = args.defaultDownloadTool;
+            }
+            if (typeof args?.updateEndpoint === "string") {
+              settings.update_endpoint = args.updateEndpoint;
+            }
+            if (typeof args?.updateCheckOnStart === "boolean") {
+              settings.update_check_on_start = args.updateCheckOnStart;
+            }
+            return null;
+          case "check_update":
             return null;
           case "confirm_task": {
             // 真实实现会清掉 needs_confirm 并把状态改回 downloading

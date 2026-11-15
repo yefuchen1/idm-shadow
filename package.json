@@ -1,7 +1,7 @@
 {
   "name": "idm-shadow",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "IDM Shadow：复刻 IDM 的下载工具，支持油猴脚本对接",
   "scripts": {
     "test": "node extension/test/background.test.mjs && node userscript/test/bridge.test.mjs",
@@ -11,10 +11,15 @@
     "ui:build": "npm --prefix app/ui run build",
     "ui:dev": "npm --prefix app/ui run dev",
     "app:build": "npm run ui:build && cargo build --release -p idm-shadow-app",
+    "app:installer": "cd app && npx tauri build",
+    "release:github": "node tools/update/github-release.mjs",
     "app": "cargo run --release -p idm-shadow-app",
-    "server": "cargo run -p idm-shadow-engine --example test_server"
+    "server": "cargo run -p idm-shadow-engine --example test_server",
+    "update:publish": "node tools/update/publish.mjs",
+    "update:serve": "node tools/update/serve.mjs"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
     "playwright": "^1.49.0"
   }
 }

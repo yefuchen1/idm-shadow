@@ -7,6 +7,7 @@
 mod commands;
 mod protocol;
 mod tray;
+mod update;
 
 use std::sync::Arc;
 
@@ -65,6 +66,7 @@ fn main() {
             // 已经有实例在跑：把协议链接转交给它
             protocol::handle_args(app, &argv);
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -240,6 +242,22 @@ fn main() {
             let argv: Vec<String> = std::env::args().collect();
             protocol::handle_args(app.handle(), &argv);
 
+            // 开机自启只进托盘；正常启动才显示主窗口。
+            // 窗口在 tauri.conf.json 里是 visible:false，等这里决定。
+            let autostart = argv.iter().any(|arg| arg == idm_shadow_bridge::system::AUTOSTART_ARG);
+            if !autostart {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+
+            // 注册表按数据库里的选择对账（路径变了会重写）。
+            idm_shadow_bridge::reconcile_auto_start(&manager);
+
+            // 启动后静默检查一次更新，不自动安装。
+            update::spawn_startup_check(app.handle().clone(), manager.clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -268,6 +286,9 @@ fn main() {
             commands::fit_dialog,
             commands::open_file,
             commands::show_in_folder,
+            commands::check_update,
+            commands::install_update,
+            commands::dismiss_release_notes,
         ])
         .run(tauri::generate_context!())
         .expect("应用启动失败");

@@ -20,6 +20,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+url = "2"
 
 [features]
 # 没有这个 feature，Tauri 会认为这是开发构建，

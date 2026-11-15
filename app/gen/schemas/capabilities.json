@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"默认权限。主窗口是任务列表，dlg-* 是下载对话框小窗口。","local":true,"windows":["main","dlg-*"],"permissions":["core:default","dialog:default","opener:default","opener:allow-open-path"]}}
+{"default":{"identifier":"default","description":"默认权限。主窗口是任务列表，dlg-* 是下载对话框小窗口。","local":true,"windows":["main","dlg-*"],"permissions":["core:default","dialog:default","opener:default","opener:allow-open-path","updater:default"]}}

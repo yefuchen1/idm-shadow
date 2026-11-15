@@ -637,7 +637,7 @@ async fn get_settings(State(state): State<BridgeState>) -> Result<Json<Value>, A
         "max_connections": config.max_connections,
         "max_concurrent_tasks": state.manager.max_concurrent_tasks().await,
         "default_download_tool": is_default_download_tool(&state.manager),
-        "auto_start": system::is_auto_start(),
+        "auto_start": is_auto_start_setting(&state.manager),
         "settings": settings,
     })))
 }
@@ -654,6 +654,56 @@ pub fn is_default_download_tool(manager: &DownloadManager) -> bool {
         .unwrap_or(false)
 }
 
+/// 开机自启的开关存在数据库里，注册表只是按它写出来的结果。
+///
+/// 老版本没有这一项：那时"默认下载工具"约定连带打开自启，
+/// 所以有 `default_download_tool=1` 就视为开启，下次启动会对账补写。
+pub fn is_auto_start_setting(manager: &DownloadManager) -> bool {
+    match manager.store().get_setting("auto_start") {
+        Ok(Some(v)) => v == "1",
+        _ => is_default_download_tool(manager),
+    }
+}
+
+/// 按数据库里的选择，把注册表启动项对齐。
+///
+/// 每次启动都跑一遍：值改了要跟着改，exe 换目录要重写路径，
+/// 注册表被安全软件清掉也要能自愈。
+pub fn reconcile_auto_start(manager: &DownloadManager) {
+    let Some(exe) = system::current_exe() else {
+        tracing::warn!("拿不到程序自身路径，跳过开机自启对账");
+        return;
+    };
+
+    let wanted = is_auto_start_setting(manager);
+    let present = system::is_auto_start();
+
+    if wanted && (!present || !system::auto_start_matches(&exe)) {
+        match system::set_auto_start(true, &exe) {
+            Ok(()) => tracing::info!(exe = %exe.display(), "已写入开机自启"),
+            Err(err) => tracing::warn!("写入开机自启失败: {err}"),
+        }
+    } else if !wanted && present {
+        if let Err(err) = system::set_auto_start(false, &exe) {
+            tracing::warn!("删除开机自启失败: {err}");
+        }
+    }
+}
+
+/// 保存开机自启选择：先落库，再按结果写注册表。
+///
+/// 注册表写失败要回滚数据库里的值，否则界面显示"已开启"、
+/// 实际重启不会启动，就是这个项目踩过的坑。
+pub fn set_auto_start_setting(manager: &DownloadManager, enabled: bool) -> anyhow::Result<()> {
+    let exe = system::current_exe()
+        .ok_or_else(|| anyhow::anyhow!("找不到程序自身路径"))?;
+    system::set_auto_start(enabled, &exe)?;
+    manager
+        .store()
+        .set_setting("auto_start", if enabled { "1" } else { "0" })?;
+    Ok(())
+}
+
 /// 打开"设为默认下载工具"。
 /// 按约定：默认下载工具意味着开机就在后台待命，所以同时打开开机自启。
 pub fn set_default_download_tool(manager: &DownloadManager, enabled: bool) -> anyhow::Result<()> {
@@ -662,10 +712,10 @@ pub fn set_default_download_tool(manager: &DownloadManager, enabled: bool) -> an
         .set_setting("default_download_tool", if enabled { "1" } else { "0" })?;
 
     if enabled {
-        // 默认下载工具 ⇒ 开机自启
-        if let Some(exe) = system::current_exe() {
-            system::set_auto_start(true, &exe)?;
-        }
+        // 默认下载工具 ⇒ 开机自启。
+        // 走 set_auto_start_setting 是为了把选择一并落库：
+        // 只写注册表的话，下次启动对账会把它当成"用户没开"删掉。
+        set_auto_start_setting(manager, true)?;
         // 注册自定义协议，扩展唤起应用时用得上
         if let Some(exe) = system::current_exe() {
             let _ = protocol::register(&exe);
@@ -739,10 +789,7 @@ async fn update_settings(
             .map_err(|e| ApiError::new("internal", e.to_string()))?;
     }
     if let Some(enabled) = body.auto_start {
-        let exe = system::current_exe().ok_or_else(|| {
-            ApiError::new("internal", "找不到程序自身路径")
-        })?;
-        system::set_auto_start(enabled, &exe)
+        set_auto_start_setting(&state.manager, enabled)
             .map_err(|e| ApiError::new("internal", e.to_string()))?;
     }
     Ok(Json(json!({ "ok": true })))

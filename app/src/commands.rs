@@ -7,6 +7,33 @@ use tauri::{AppHandle, Emitter, Manager as TauriManager, State, WebviewUrl, Webv
 
 use crate::AppState;
 
+/// 检查是否有新版本。没有更新时 `version` 为空表示已是最新。
+#[tauri::command]
+pub async fn check_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    endpoint: Option<String>,
+) -> Result<Option<crate::update::UpdateInfo>, String> {
+    crate::update::check(&app, &state.manager, endpoint.as_deref()).await
+}
+
+/// 下载并安装更新。成功后界面会收到 `update-progress` 事件。
+#[tauri::command]
+pub async fn install_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    endpoint: Option<String>,
+) -> Result<(), String> {
+    crate::update::install(&app, &state.manager, endpoint.as_deref()).await
+}
+
+/// 用户关掉「本次更新内容」提示，不再重复弹。
+#[tauri::command]
+pub async fn dismiss_release_notes(state: State<'_, AppState>) -> Result<(), String> {
+    crate::update::acknowledge_release_notes(&state.manager);
+    Ok(())
+}
+
 /// 下载对话框的窗口 label。每个任务一个窗口。
 pub fn dialog_label(task_id: &str) -> String {
     format!("dlg-{task_id}")
@@ -136,6 +163,11 @@ pub struct SettingsDto {
     pub max_concurrent_tasks: u32,
     pub default_download_tool: bool,
     pub auto_start: bool,
+    pub version: String,
+    pub update_endpoint: String,
+    pub update_check_on_start: bool,
+    /// 刚更新完、还没被用户关掉的发布说明。
+    pub release_notes: Option<crate::update::ReleaseNotes>,
 }
 
 fn parse_id(raw: &str) -> Result<TaskId, String> {
@@ -275,7 +307,11 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsDto, Str
         max_connections: config.max_connections as u32,
         max_concurrent_tasks: state.manager.max_concurrent_tasks().await.unwrap_or(0) as u32,
         default_download_tool: idm_shadow_bridge::is_default_download_tool(&state.manager),
-        auto_start: idm_shadow_bridge::system::is_auto_start(),
+        auto_start: idm_shadow_bridge::is_auto_start_setting(&state.manager),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        update_endpoint: crate::update::endpoint_setting(&state.manager),
+        update_check_on_start: crate::update::check_on_start_setting(&state.manager),
+        release_notes: crate::update::pending_release_notes(&state.manager),
     })
 }
 
@@ -289,6 +325,8 @@ pub async fn update_settings(
     max_concurrent_tasks: Option<u32>,
     default_download_tool: Option<bool>,
     auto_start: Option<bool>,
+    update_endpoint: Option<String>,
+    update_check_on_start: Option<bool>,
 ) -> Result<(), String> {
     if let Some(dir) = download_dir {
         let path = std::path::PathBuf::from(dir);
@@ -333,9 +371,18 @@ pub async fn update_settings(
             .map_err(|e| e.to_string())?;
     }
     if let Some(enabled) = auto_start {
-        let exe = idm_shadow_bridge::system::current_exe()
-            .ok_or_else(|| "找不到程序自身路径".to_string())?;
-        idm_shadow_bridge::system::set_auto_start(enabled, &exe)
+        idm_shadow_bridge::set_auto_start_setting(&state.manager, enabled)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(endpoint) = update_endpoint {
+        crate::update::set_endpoint_setting(&state.manager, &endpoint)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(enabled) = update_check_on_start {
+        state
+            .manager
+            .store()
+            .set_setting("update_check_on_start", if enabled { "1" } else { "0" })
             .map_err(|e| e.to_string())?;
     }
     Ok(())
