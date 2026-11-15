@@ -80,9 +80,6 @@ export default function App() {
   // 用户主动把对话框关掉、还没确认的任务。
   // 这些不再自动弹回来，想重选就去列表里点"选择保存位置"。
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
-  // 待确认的下载攒了一堆时，不一个接一个地弹，
-  // 改��列表顶上给一条提示，用户点了才逐个处理。
-  const [manualQueue, setManualQueue] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // 事件监听器要读最新的任务表，但不想因为 tasks 变就重新订阅，
@@ -258,8 +255,12 @@ export default function App() {
   // 待确认任务一多就一个接一个地开窗口，而且谁都没被关掉——
   // 渲染进程能涨到一百多个。
   //
-  // 待确认的队列（按创建顺序）。攒了一堆的时候不自动弹，
-  // 列表顶上给一条提示，用户点了才逐个处理。
+  // 列表里的顺序是旧→新。但用户刚点的那次下载永远是**最新**的，
+  // 不能因为更早的残留任务把它挤掉。所以自动弹框挑最后一条，
+  // 老任务留在列表里，想处理再点按钮。
+  //
+  // 只有真正在等确认的任务才算数：失败/取消/完成的不算，
+  // 用户关掉过的也不算（否则关上 3 个之后，新下载都不弹了）。
   const pendingQueue = useMemo(
     () =>
       tasks.filter(
@@ -279,12 +280,11 @@ export default function App() {
   );
 
   useEffect(() => {
-    const pending = pendingQueue[0];
+    const pending = pendingQueue[pendingQueue.length - 1];
     // 已经开着就别重复开。
     if (!pending || dialogOpenIds.has(pending.id)) return;
-    // 攒了一堆的时候不自动弹——一个接一个地弹太烦。
-    // 队列里只有一个（正常下载）就照常弹。
-    if (pendingQueue.length > 1 && !manualQueue) return;
+    // 已经有一张对话框开着（用户在处理某个任务），先不抢焦点。
+    if (dialogOpenIds.size > 0) return;
     setDialogOpenIds((prev) => new Set(prev).add(pending.id));
     api.openDialog(pending.id).catch((err) => {
       console.warn("[IDM Shadow] 打开下载对话框失败", err);
@@ -294,7 +294,7 @@ export default function App() {
         return next;
       });
     });
-  }, [tasks, dialogOpenIds, dismissedIds, pendingQueue, manualQueue]);
+  }, [tasks, dialogOpenIds, dismissedIds, pendingQueue]);
 
   // 任务不再等确认了（确认了/失败了/取消了），把标记摘掉。
   useEffect(() => {
@@ -333,11 +333,6 @@ export default function App() {
     });
     return () => unlisten?.();
   }, []);
-
-  // 队列清空了就把手动模式关掉，下次又恢复自动弹。
-  useEffect(() => {
-    if (pendingQueue.length === 0) setManualQueue(false);
-  }, [pendingQueue.length]);
 
   async function submit() {
     const value = url.trim();
@@ -925,7 +920,16 @@ export default function App() {
             </span>
             <button
               className="btn small"
-              onClick={() => setManualQueue(true)}
+              onClick={() => {
+                // 逐个处理：按从旧到新的顺序，把还没开过的挨个打开。
+                for (const t of pendingQueue) {
+                  if (dialogOpenIds.has(t.id)) continue;
+                  setDialogOpenIds((prev) => new Set(prev).add(t.id));
+                  api.openDialog(t.id).catch((err) => {
+                    console.warn("[IDM Shadow] 打开下载对话框失败", err);
+                  });
+                }
+              }}
             >
               逐个处理
             </button>

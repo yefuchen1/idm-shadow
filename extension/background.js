@@ -275,6 +275,15 @@ async function createTask(payload) {
   return await resp.json();
 }
 
+/// 投递一次，失败返回 null 而不是抛异常。
+async function tryCreateTask(payload) {
+  try {
+    return await createTask(payload);
+  } catch (err) {
+    return null;
+  }
+}
+
 // 唤起桌面应用（通过自定义协议）。
 async function launchApp(url, name) {
   const params = new URLSearchParams();
@@ -331,38 +340,61 @@ async function capture(item) {
     needs_confirm: true
   };
 
-  try {
-    const task = await createTask(payload);
-    if (task && task.id && item.id !== undefined) {
-      taskByDownload[item.id] = task.id;
+  let task = await tryCreateTask(payload);
+
+  // token 过期、应用换了端口、或者应用刚更新过：
+  // 重新从引导接口拿一次地址和 token 再试。
+  // 以前只在 token 为空时才自动配置，所以拿着旧 token 会一直 401，
+  // 而且每次失败都会把浏览器下载取消掉。
+  if (!task) {
+    const found = await discoverApp();
+    if (found) {
+      await saveSettings({ bridgeUrl: found.bridgeUrl, token: found.token });
+      task = await tryCreateTask(payload);
     }
-    // 名字还是临时名（比如 "download"），再等等 Chrome 定好
-    if (task && task.id && finalName && /^download( \(\d+\))?$/.test(finalName)) {
-      const final = await waitForFilename(item.id);
-      if (final) await renameTask(task.id, final);
-    }
-    await markHandled(item.id, true);
-    await updateBadge();
-    return true;
-  } catch (err) {
+  }
+
+  // 应用没起来：唤起它，然后**等它真的接住任务**再返回。
+  //
+  // 以前这里是 fire-and-forget：先返回 true，调用方立刻取消浏览器下载，
+  // 2.5 秒后再异步重试。应用冷启动常慢于 2.5 秒，重试失败就没人管了——
+  // 用户看到的是"点了下载，浏览器不下了，IDM 也没弹框"，文件凭空消失。
+  if (!task) {
     const s = await settings();
     if (s.autoLaunch) {
       await launchApp(url, item.filename);
-      // 应用起来之后重试一次
-      setTimeout(async () => {
-        try {
-          await createTask(payload);
-          await markHandled(item.id, true);
-          await updateBadge();
-        } catch (err2) {
-          console.warn('[IDM Shadow] 重试投递失败', err2);
+      for (let i = 0; i < 10 && !task; i++) {
+        await new Promise((r) => setTimeout(r, 800));
+        task = await tryCreateTask(payload);
+        if (!task) {
+          const found = await discoverApp();
+          if (found) {
+            await saveSettings({ bridgeUrl: found.bridgeUrl, token: found.token });
+            task = await tryCreateTask(payload);
+          }
         }
-      }, 2500);
-      return true;
+      }
     }
-    console.warn('[IDM Shadow] 投递失败', err);
+  }
+
+  // 始终没接住：返回 false，让浏览器自己把这文件下完。
+  // 宁可这次没走 IDM，也不能把下载弄丢。
+  if (!task) {
+    console.warn('[IDM Shadow] 投递失败，保留浏览器下载');
     return false;
   }
+
+  if (task.id && item.id !== undefined) {
+    taskByDownload[item.id] = task.id;
+  }
+  // 名字还是临时名（比如 "download"），再等等 Chrome 定好
+  if (task.id && finalName && /^download( \(\d+\))?$/.test(finalName)) {
+    const final = await waitForFilename(item.id);
+    if (final) await renameTask(task.id, final);
+  }
+  await markHandled(item.id, true);
+  await updateBadge();
+  return true;
 }
 
 // Chrome 确定最终文件名时会触发这个事件。

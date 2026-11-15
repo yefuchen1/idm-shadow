@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IDM Shadow",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "把浏览器里的下载交给 IDM Shadow 接管，支持油猴脚本触发的下载。",
   "permissions": [
     "downloads",

@@ -117,6 +117,8 @@ const fetchCalls = [];
 let settingsResponse = { default_download_tool: false };
 // 引导接口的响应，null 表示"这个端口没有应用"
 let bootstrapResponse = { port: 16888, token: 'auto-found-token' };
+// 让接下来的 N 次任务投递返回 401，用来模拟 token 过期/应用换端口。
+let rejectPosts = 0;
 const fakeFetch = async (url, options = {}) => {
   fetchCalls.push({ url, options });
   if (url.endsWith('/api/v1/bootstrap')) {
@@ -127,6 +129,15 @@ const fakeFetch = async (url, options = {}) => {
       ok: true,
       status: 200,
       json: async () => bootstrapResponse,
+      text: async () => ''
+    };
+  }
+  if (url.endsWith('/api/v1/tasks') && options.method === 'POST' && rejectPosts > 0) {
+    rejectPosts -= 1;
+    return {
+      ok: false,
+      status: 401,
+      json: async () => ({ error: { message: 'token 不正确' } }),
       text: async () => ''
     };
   }
@@ -478,6 +489,54 @@ await test('自动配置：应用没在跑时不乱改已有配置', async () =>
   await api.autoConfigure(true);
   assert.equal(storage.token, 'manual-token', '不该把已有 token 冲掉');
 
+  bootstrapResponse = { port: 16888, token: 'auto-found-token' };
+});
+
+await test('token 过期时自动重新配置，再投一次就成功', async () => {
+  // 应用重装/换端口之后，扩展里存的还是旧 token。
+  // 以前只认"token 为空才自动配置"，于是一直 401，而且 401 之后
+  // 还会把浏览器下载取消掉——用户的文件就这么没了。
+  storage.bridgeUrl = 'http://127.0.0.1:16888';
+  storage.token = 'stale-token';
+  storage.mode = 'auto';
+  storage.handled = {};
+  fetchCalls.length = 0;
+  rejectPosts = 1;
+
+  const ok = await api.capture({ id: 901, url: 'https://example.com/stale.bin' });
+
+  assert.equal(ok, true, '重新配置之后应当投递成功');
+  assert.equal(storage.token, 'auto-found-token', '应当换成引导接口给的新 token');
+  const posts = fetchCalls.filter(
+    (f) => f.options.method === 'POST' && f.url.endsWith('/api/v1/tasks')
+  );
+  assert.equal(posts.length, 2, '应当先失败一次、重新配置后再投一次');
+  assert.equal(posts[1].options.headers['X-IDM-Shadow-Token'], 'auto-found-token');
+});
+
+await test('应用接不住任务时不取消浏览器下载', async () => {
+  storage.token = '';
+  storage.mode = 'auto';
+  storage.handled = {};
+  bootstrapResponse = null;
+  rejectPosts = 99;
+  calls.downloads.length = 0;
+
+  await listeners.onCreated({
+    id: 902,
+    url: 'https://example.com/lost.bin',
+    filename: 'lost.bin'
+  });
+
+  // 轮询 10 次 × 800ms，等它放弃
+  await new Promise((r) => setTimeout(r, 9000));
+  assert.equal(
+    calls.downloads.length,
+    0,
+    '投递没成功就不该取消浏览器下载，否则文件会凭空消失'
+  );
+
+  rejectPosts = 0;
   bootstrapResponse = { port: 16888, token: 'auto-found-token' };
 });
 
