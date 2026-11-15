@@ -212,13 +212,14 @@ pub async fn install(
     }
 
     // 先把说明存下来：安装器会结束进程，之后再写就来不及了。
+    // 版本号由界面的标题单独展示，这里只存说明正文，避免重复。
     let notes = update
         .body
         .as_deref()
         .map(str::trim)
         .filter(|notes| !notes.is_empty())
-        .map(|notes| format!("{}\n\n{}", update.version, notes))
-        .unwrap_or_else(|| update.version.clone());
+        .unwrap_or("本次更新没有附带说明。")
+        .to_string();
     if let Err(err) = manager.store().set_setting(PENDING_NOTES_KEY, &notes) {
         tracing::warn!("保存更新说明失败: {err}");
     }
