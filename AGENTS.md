@@ -23,5 +23,7 @@
 - 唯一更新通道是 GitHub Releases，客户端每次启动检查；
 - 安装包必须经过 minisign 签名；
 - 私钥、密码、数据库、构建产物和 Release 大文件不得入库；
+- 安装包只在干净工作区构建一次；Tauri/NSIS 不保证逐字节可复现，
+  发版后不要重建覆盖同名资产；
 - `latest.json` 最后上传，且下载地址取自 GitHub 返回的真实资产 URL；
 - 更新说明优先从 `docs/releases/v<version>.md` 读取，不要用多行 `--notes`。
