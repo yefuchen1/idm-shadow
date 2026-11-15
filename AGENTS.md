@@ -11,7 +11,7 @@
 1. 先看现有代码与模式，改完跑对应测试/构建。
 2. 递增四处版本号：根 `Cargo.toml`、`app/tauri.conf.json`、
    `package.json`、`app/ui/package.json`。
-3. 写 `docs/releases/v<version>.md`，面向用户说明本次改动。
+3. 写 `docs/releases/v<version>.md`，面向用户说明本次改动；正文不要以版本号开头。
 4. 构建带 `.sig` 的 NSIS 安装包。
 5. 提交并推送 `main`；工作区必须干净。
 6. 用 `npm run release:github` 发布到 GitHub Releases，确认
