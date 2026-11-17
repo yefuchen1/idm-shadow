@@ -1,5 +1,11 @@
 // 页面内的「发送到 IDM Shadow」入口。
-// 只做两件事：在媒体链接旁边挂一个按钮，把当前页面的视频源交给后台。
+//
+// 三件事：
+//  1. 在媒体链接旁边挂一个按钮，把当前页面的视频源交给后台；
+//  2. 接管跨源的 a[download] 点击——那种情况浏览器当成页面导航，
+//     chrome.downloads.onCreated 根本不触发，扩展从头到尾不会被唤醒，
+//     用户点下载就是一点反应都没有；
+//  3. 把结果告诉后台。
 
 (function () {
   'use strict';
@@ -8,6 +14,20 @@
   window.__idmShadowInjected = true;
 
   const MEDIA_RE = /\.(m3u8|mp4|mkv|webm|flv|ts)(\?|#|$)/i;
+
+  // 是不是跨源的。
+  function isCrossOrigin(url) {
+    try {
+      return new URL(url, location.href).origin !== location.origin;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // 浏览器对 blob:/data: 的处理跟普通链接不一样，别碰。
+  function isUnsupported(url) {
+    return /^(blob|data|javascript|chrome-extension|edge):/i.test(url);
+  }
 
   function send(url, filename) {
     chrome.runtime.sendMessage(
@@ -56,7 +76,100 @@
     });
   }
 
+  // 接管跨源的 a[download] 点击。
+  //
+  // 为什么需要这一段：
+  // 浏览器对 a[download] 的处理分两种。目标是同源（或者最终响应带
+  // Content-Disposition: attachment）时，它会触发 chrome.downloads.onCreated，
+  // 扩展能接管。但目标是跨源、且最终响应没有 disposition 时，浏览器把
+  // 它当成**页面导航**——于是没有下载、没有 onCreated、扩展全程没醒，
+  // 用户点了下载就是一点反应都没有。
+  //
+  // 所以这里在捕获阶段先拦下来，交给后台去下载。
+  // 拦不住或者后台失败，就让浏览器按原来的方式走（见下面的兜底）。
+  function installDownloadInterceptor() {
+    document.addEventListener(
+      'click',
+      (event) => {
+        // 只处理左键单击。右键菜单另说（浏览器自己会弹"下载"菜单项）。
+        if (event.defaultPrevented) return;
+        if (event.button !== 0) return;
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+
+        // 只认带 download 属性的链接。
+        //
+        // 这是精准信号：页面明确说了"这是个下载"。
+        // 普通外链（a[href]）不碰——那是浏览器打开新页面的事，
+        // 拦下来会把"点开看 PDF"变成"直接下载"，用户会觉得莫名其妙。
+        const anchor =
+          event.target && event.target.closest
+            ? event.target.closest('a[download]')
+            : null;
+        if (!anchor) return;
+
+        const href = anchor.getAttribute('href');
+        if (!href) return;
+
+        let resolved;
+        try {
+          resolved = new URL(href, location.href).href;
+        } catch (err) {
+          return;
+        }
+        if (isUnsupported(resolved)) return;
+        // 同源的不用管——那种情况 onCreated 会触发，扩展接得住。
+        if (!isCrossOrigin(resolved)) return;
+
+        // download 属性里的文件名是页面给的，比浏览器猜的 "download" 可靠。
+        const attr = anchor.getAttribute('download');
+        const name = attr && attr.trim() ? attr.trim() : '';
+
+        event.preventDefault();
+        event.stopPropagation();
+        chrome.runtime.sendMessage(
+          {
+            type: 'capture-url',
+            url: resolved,
+            filename: name,
+            referer: location.href
+          },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              // 后台不在（扩展刚更新还没重载？）——放回给浏览器。
+              fallbackDownload(resolved, name);
+              return;
+            }
+            if (!response || !response.ok) {
+              // 应用没接住。别把下载弄丢，让浏览器自己下。
+              fallbackDownload(resolved, name);
+            }
+          }
+        );
+      },
+      true
+    );
+  }
+
+  // 接管失败时的兜底：让浏览器自己下。
+  //
+  // 优先用 chrome.downloads.download（它能带上文件名）；
+  // 扩展刚装上、还没拿到 downloads 权限之外的场景就用普通导航。
+  function fallbackDownload(url, filename) {
+    try {
+      chrome.downloads.download(
+        { url, filename: filename || undefined },
+        () => {
+          void chrome.runtime.lastError;
+        }
+      );
+    } catch (err) {
+      // 实在不行就让浏览器自己导航过去。
+      window.location.href = url;
+    }
+  }
+
   const timer = setInterval(scan, 1500);
   setTimeout(() => clearInterval(timer), 60000);
   scan();
+  installDownloadInterceptor();
 })();

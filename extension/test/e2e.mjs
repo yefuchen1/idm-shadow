@@ -36,9 +36,13 @@ if (process.env.IDM_SHADOW_EXT_DIR) {
   cpSync(extDir_source, extDir, { recursive: true });
 }
 
-const PORT = 16888;
+// 测试用独立端口，跟用户正在跑的实例不冲突。
+const PORT = 16890;
 const TOKEN = 'e2e-extension-token-0123456789';
 const SERVER_PORT = 18997;
+// 第二个端口。用来做"跨源"——同源的话浏览器的行为完全不一样，
+// 跨源 a[download] 才是那个浏览器当成导航、扩展根本不会被唤醒的场景。
+const PAGE_PORT = 18998;
 
 function log(...args) {
   console.log('  ', ...args);
@@ -47,6 +51,20 @@ function log(...args) {
 function startFileServer(payload) {
   return new Promise((resolvePromise) => {
     const server = require('node:http').createServer((req, res) => {
+      const path = (req.url || '/').split('?')[0];
+
+      // 跨源下载目标：模拟 ClipKnight 修好之前的形状——
+      // 末段是 "download"，响应里没有 Content-Disposition。
+      // 浏览器对这种响应不会当成下载，扩展的 downloads.onCreated 不会触发。
+      if (path === '/api/download') {
+        res.writeHead(200, {
+          'Content-Type': 'video/mp4',
+          'Content-Length': payload.length
+        });
+        res.end(payload);
+        return;
+      }
+
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'Content-Length': payload.length,
@@ -58,6 +76,24 @@ function startFileServer(payload) {
   });
 }
 
+// 页面服务：单独一个端口，跟下载目标跨源。
+function startPageServer() {
+  return new Promise((resolvePromise) => {
+    const server = require('node:http').createServer((req, res) => {
+      const html = `<!doctype html><html><body>
+<a id="dl" download="clip.mp4"
+   href="http://127.0.0.1:${SERVER_PORT}/api/download?url=x">download</a>
+</body></html>`;
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(html)
+      });
+      res.end(html);
+    });
+    server.listen(PAGE_PORT, '127.0.0.1', () => resolvePromise(server));
+  });
+}
+
 function startApp() {
   const exe = join(repoRoot, 'target', 'debug', 'idm-shadow-app.exe');
   if (!existsSync(exe)) {
@@ -65,8 +101,16 @@ function startApp() {
   }
   const logFile = join(tmpdir(), 'idm-ext-e2e-app.log');
   const out = openSync(logFile, 'w');
+  // 独立端口 + 独立数据目录：测试不该碰到用户正在跑的实例，
+  // 也不该动用户真实的任务库。
+  const dataDir = mkdtempSync(join(tmpdir(), 'idm-ext-e2e-data-'));
   return spawn(exe, [], {
-    env: { ...process.env, IDM_SHADOW_TOKEN: TOKEN },
+    env: {
+      ...process.env,
+      IDM_SHADOW_TOKEN: TOKEN,
+      IDM_SHADOW_PORT: String(PORT),
+      IDM_SHADOW_DATA_DIR: dataDir
+    },
     stdio: ['ignore', out, out]
   });
 }
@@ -136,12 +180,14 @@ for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
 
 const profileDir = mkdtempSync(join(tmpdir(), 'idm-ext-e2e-'));
 const server = await startFileServer(payload);
+const pageServer = await startPageServer();
 // 应用是单实例的：已经有一个在跑的话，测试启的那个会被转交给它，
 // 于是测试里的 token 和实际服务的对不上——表现是"扩展没投进来"，
 // 但根因在这儿，很容易查错方向。所以先看一眼端口有没有人占着。
 if (await portAlreadyInUse(PORT)) {
   console.error('端口 ' + PORT + ' 上已经有 IDM Shadow 在跑了，请先关掉它再跑这个测试。');
   server.close();
+  pageServer.close();
   rmSync(profileDir, { recursive: true, force: true });
   process.exit(1);
 }
@@ -216,7 +262,14 @@ try {
   const autoMsg = await optPage.textContent('#autoMsg');
   check('自动配置能找到应用并填好 token', autoMsg.includes('配置好了'), autoMsg);
 
-  // 切回 auto 模式继续测接管
+  // 切回 auto 模式继续测接管。
+  //
+  // 注意：上一步"自动配置"会把扩展指向**第一个**能应答的端口。
+  // 机器上如果还装着 IDM Shadow，它占着 16888，扩展就被指到那个
+  // 已安装的实例上去了（token 对不上），后面的接管全都测不到。
+  // 所以这里明确指回测试自己的实例。
+  await optPage.fill('#bridgeUrl', `http://127.0.0.1:${PORT}`);
+  await optPage.fill('#token', TOKEN);
   await optPage.selectOption('#mode', 'auto');
   await optPage.click('#save');
 
@@ -323,10 +376,72 @@ try {
   check('只投递了一个任务', after.length === before.length + 1,
     `${before.length} -> ${after.length}`);
 
+  // 跨源 a[download]：浏览器会当成页面导航的那一种。
+  //
+  // 目标地址的响应里没有 Content-Disposition，浏览器不会把它当成下载，
+  // chrome.downloads.onCreated 根本不触发——扩展从头到尾不会被唤醒。
+  // 以前这就是"点了下载，一点反应都没有"的根因。
+  //
+  // 现在由内容脚本在捕获阶段拦下来，交给后台投递。
+  const beforeCross = await listTasks();
+  const pageX = await browser.newPage();
+  await pageX.goto(`http://127.0.0.1:${PAGE_PORT}/page`);
+  await pageX.click('#dl');
+
+  let crossTask = null;
+  for (let i = 0; i < 40; i++) {
+    const tasks = await listTasks();
+    const found = tasks.find(
+      (t) =>
+        t.url.includes('/api/download') &&
+        !beforeCross.some((b) => b.id === t.id)
+    );
+    if (found) {
+      crossTask = found;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  check('跨源 a[download] 也会被接管', Boolean(crossTask),
+    crossTask ? '' : '桌面应用没收到任务');
+
+  if (crossTask) {
+    // 文件名：内容脚本给的 download 属性是 "clip.mp4"，
+    // 引擎再用 Content-Type 核对一次扩展名。
+    check('跨源下载的文件名带上了扩展名',
+      crossTask.filename.endsWith('.mp4'),
+      crossTask.filename);
+
+    // 下载要真的跑起来。
+    let downloading = false;
+    for (let i = 0; i < 30; i++) {
+      const tasks = await listTasks();
+      const cur = tasks.find((t) => t.id === crossTask.id);
+      if (cur && (cur.status === 'awaiting_confirm' || cur.status === 'downloading')) {
+        downloading = true;
+        crossTask = cur;
+        break;
+      }
+      if (cur && cur.status === 'error') {
+        log('跨源任务出错:', cur.error);
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    check('跨源任务真的在下载', downloading, crossTask.status);
+
+    // 只该有一个任务——不能既接管又让浏览器下一遍。
+    const afterCross = await listTasks();
+    check('跨源下载只投递了一个任务',
+      afterCross.length === beforeCross.length + 1,
+      `${beforeCross.length} -> ${afterCross.length}`);
+  }
+
   // off 模式：不接管，下载留给浏览器。
   //
   // 以前的版本有 'ask'（弹通知让用户确认），后来去掉了——
   // 只弹气泡又不取消下载，用户点不点结果都一样。
+  const beforeOff = await listTasks();
   await optPage.selectOption('#mode', 'off');
   await optPage.click('#save');
 
@@ -352,8 +467,8 @@ try {
 
   // off 模式不该自动投递给应用
   const afterOff = await listTasks();
-  check('off 模式不会自动接管', afterOff.length === after.length,
-    `${after.length} -> ${afterOff.length}`);
+  check('off 模式不会自动接管', afterOff.length === beforeOff.length,
+    `${beforeOff.length} -> ${afterOff.length}`);
 
   // popup 的「打开主界面」不该开出标签页。
   //
@@ -383,6 +498,7 @@ try {
   if (browser) await browser.close().catch(() => {});
   app.kill();
   server.close();
+  pageServer.close();
   rmSync(profileDir, { recursive: true, force: true });
   if (asciiRoot) rmSync(asciiRoot, { recursive: true, force: true });
 }

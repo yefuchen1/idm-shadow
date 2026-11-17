@@ -7,6 +7,7 @@ pub use engine::{DownloadConfig, HttpEngine, TaskProgress};
 pub use segmenter::{Segmenter, WorkerId, Work};
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{
@@ -28,6 +29,11 @@ pub struct ResourceMeta {
     pub last_modified: Option<String>,
     pub suggested_filename: Option<String>,
     pub content_type: Option<String>,
+    /// 响应头里原始的 Content-Disposition。
+    ///
+    /// 留着原始值（而不是解析后的文件名）是为了让上层能自己决定
+    /// 怎么用它——比如"只有当解析不出名字时才用它"。
+    pub content_disposition: Option<String>,
     /// 跟随重定向后的最终地址。
     pub final_url: String,
 }
@@ -101,10 +107,23 @@ pub fn build_client(user_agent: Option<&str>) -> Result<Client> {
 }
 /// 探测资源：大小、是否支持 Range、ETag、文件名。
 pub async fn probe(client: &Client, ctx: &RequestContext) -> Result<ResourceMeta> {
+    probe_with_timeout(client, ctx, Duration::from_secs(20)).await
+}
+
+/// 探测资源，并给整个请求加个时间上限。
+///
+/// 建任务的时候要靠探测结果定文件名，那一步是**同步挡在用户界面前面**的：
+/// 探测慢一点，扩展那边就一直等着，用户的点击像是没反应。
+/// 所以定名那条路用短超时（几秒），超时就退回按 URL 猜名字。
+pub async fn probe_with_timeout(
+    client: &Client,
+    ctx: &RequestContext,
+    timeout: Duration,
+) -> Result<ResourceMeta> {
     let rb = ctx.apply(client.get(&ctx.url)).header(RANGE, "bytes=0-0");
-    let resp = rb
-        .send()
+    let resp = tokio::time::timeout(timeout, rb.send())
         .await
+        .map_err(|_| anyhow!("探测超时: {}", ctx.url))?
         .with_context(|| format!("探测失败: {}", ctx.url))?;
 
     let status = resp.status();
@@ -134,6 +153,11 @@ pub async fn probe(client: &Client, ctx: &RequestContext) -> Result<ResourceMeta
         .and_then(filename_from_content_disposition)
         .or_else(|| crate::task::filename_from_url(&final_url));
 
+    let content_disposition = headers
+        .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -155,6 +179,7 @@ pub async fn probe(client: &Client, ctx: &RequestContext) -> Result<ResourceMeta
         last_modified,
         suggested_filename,
         content_type,
+        content_disposition,
         final_url,
     })
 }

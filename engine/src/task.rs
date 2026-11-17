@@ -276,6 +276,177 @@ pub fn sanitize_filename(raw: &str) -> String {
     truncate_utf8(trimmed, 180)
 }
 
+/// URL 末段里那些"看着像文件名、其实不是"的占位词。
+///
+/// `/api/download`、`/file`、`/index` 这类接口路径的末段根本不是文件名。
+/// 拿来当文件名，落盘就是一个光秃秃的 "download"。
+const GENERIC_NAMES: &[&str] = &[
+    "download", "downloads", "file", "files", "index", "default", "api", "get", "down", "dl",
+];
+
+/// 这个末段是占位词吗（不是真文件名）。
+pub fn is_generic_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    GENERIC_NAMES.contains(&lower.as_str())
+}
+
+/// 浏览器还没定好文件名时给的临时名。
+///
+/// Chrome 在文件名确定之前会先用 "download"、"download (2)" 这种占位名，
+/// 正在写的时候还会加 ".crdownload" 后缀。这些都不能当成用户要的文件名——
+/// 传给引擎只会让落盘文件变成一个光秃秃的 "download"。
+pub fn is_temporary_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    let stem = lower.strip_suffix(".crdownload").unwrap_or(&lower);
+    if stem == "download" {
+        return true;
+    }
+    if let Some(rest) = stem.strip_prefix("download (") {
+        if let Some(num) = rest.strip_suffix(')') {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 名字里有没有像样的扩展名。
+pub fn has_extension(name: &str) -> bool {
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// 根据 Content-Type 猜扩展名。判不出来返回 None（不猜）。
+///
+/// Content-Type 是服务器给的"事实"，比从 URL 末段瞎猜可靠得多。
+/// 但 `application/octet-stream` 这种万能类型不给任何提示，直接放弃。
+pub fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match ct.as_str() {
+        "video/mp4" | "video/mp4v" | "video/x-m4v" => ".mp4",
+        "video/webm" => ".webm",
+        "video/quicktime" => ".mov",
+        "video/x-msvideo" | "video/avi" => ".avi",
+        "video/x-matroska" | "video/matroska" => ".mkv",
+        "video/mp2t" | "video/mpeg" | "application/mp2t" => ".ts",
+        "video/x-ms-wmv" => ".wmv",
+        "video/3gpp" => ".3gp",
+        "audio/mpeg" | "audio/mp3" => ".mp3",
+        "audio/mp4" | "audio/x-m4a" => ".m4a",
+        "audio/aac" => ".aac",
+        "audio/ogg" => ".ogg",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "audio/flac" | "audio/x-flac" => ".flac",
+        "application/pdf" => ".pdf",
+        "application/zip" | "application/x-zip-compressed" => ".zip",
+        "application/x-rar-compressed" | "application/vnd.rar" => ".rar",
+        "application/x-7z-compressed" => ".7z",
+        "application/gzip" => ".gz",
+        "application/vnd.ms-excel" => ".xls",
+        "application/msword" => ".doc",
+        _ => return None,
+    };
+    Some(ext)
+}
+
+/// 统一的文件名定夺。
+///
+/// 优先级：
+///   1. Content-Disposition 里的名字——服务器最权威，它说叫什么就叫什么；
+///   2. 调用方给的名字（用户自己起的，或浏览器定好的）；
+///   3. URL 末段；
+///   4. "download"。
+///
+/// 名字没有扩展名时，按 Content-Type 补一个。
+/// 这一步是关键：TikTok 这类平台的地址末段是一串哈希，完全没有扩展名，
+/// 只按 URL 猜的话落盘就是一个没有扩展名的文件，播放器不认。
+/// Content-Type 是服务器给的"事实"，用它补扩展名最靠谱。
+///
+/// `provided` 是调用方给的名字。传 `None` 表示"我没名字，你定"。
+pub fn resolve_download_filename(
+    disposition: Option<&str>,
+    provided: Option<&str>,
+    url: &str,
+    content_type: Option<&str>,
+) -> String {
+    let ext = content_type.and_then(extension_for_content_type);
+
+    // 1. Content-Disposition
+    if let Some(name) = disposition.and_then(filename_from_content_disposition) {
+        if !name.is_empty() {
+            return with_extension(name, ext);
+        }
+    }
+
+    // 2. 调用方给的名字
+    let provided = provided
+        .map(sanitize_filename)
+        .filter(|n| !n.is_empty() && !is_temporary_name(n));
+
+    // 3. URL 末段
+    let from_url = last_path_segment(url)
+        .map(|seg| sanitize_filename(&seg))
+        .filter(|n| !n.is_empty() && !is_generic_name(n));
+
+    // 4. 兜底
+    let stem = provided
+        .or(from_url)
+        .unwrap_or_else(|| "download".to_string());
+
+    with_extension(stem, ext)
+}
+
+/// URL 路径的最后一个有效段。
+///
+/// 末尾的斜杠不算（`/video/tos/abc/` 的末段是空串），
+/// 这种地址在 TikTok 之类的站点上很常见。
+fn last_path_segment(url: &str) -> Option<String> {
+    // 先把协议和主机名去掉，只留路径部分。
+    //
+    // 不去掉的话，"https://a.com/" 这种没有路径的地址
+    // 会把主机名 "a.com" 当成文件名。
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let path = match without_query.find("://") {
+        Some(idx) => {
+            let rest = &without_query[idx + 3..];
+            // 跳过主机名（到第一个斜杠为止）
+            match rest.find('/') {
+                Some(slash) => &rest[slash..],
+                None => "",
+            }
+        }
+        None => without_query,
+    };
+    let trimmed = path.trim_end_matches('/');
+    let seg = trimmed.rsplit('/').next()?;
+    if seg.is_empty() {
+        return None;
+    }
+    percent_decode(seg)
+}
+
+/// 给没有扩展名的名字补一个扩展名。
+fn with_extension(name: String, ext: Option<&str>) -> String {
+    let Some(ext) = ext else {
+        return name;
+    };
+    if has_extension(&name) {
+        return name;
+    }
+    format!("{name}{ext}")
+}
+
 fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -439,6 +610,131 @@ mod tests {
             Some("file.bin".to_string())
         );
         assert_eq!(filename_from_url("https://a.com/"), None);
+    }
+
+    #[test]
+    fn temporary_names_are_recognized() {
+        assert!(is_temporary_name("download"));
+        assert!(is_temporary_name("Download"));
+        assert!(is_temporary_name("download (2)"));
+        assert!(is_temporary_name("download (12).crdownload"));
+        assert!(is_temporary_name(""));
+        assert!(is_temporary_name("   "));
+        // 真的文件名不该被误判
+        assert!(!is_temporary_name("video.mp4"));
+        assert!(!is_temporary_name("downloads.mp4"));
+        assert!(!is_temporary_name("my-download.zip"));
+    }
+
+    #[test]
+    fn content_type_gives_extension() {
+        assert_eq!(extension_for_content_type("video/mp4"), Some(".mp4"));
+        assert_eq!(extension_for_content_type("video/mp4; charset=utf-8"), Some(".mp4"));
+        assert_eq!(extension_for_content_type("application/pdf"), Some(".pdf"));
+        assert_eq!(extension_for_content_type("application/octet-stream"), None);
+        assert_eq!(extension_for_content_type("text/html"), None);
+        assert_eq!(extension_for_content_type(""), None);
+    }
+
+    #[test]
+    fn disposition_wins_over_everything() {
+        assert_eq!(
+            resolve_download_filename(
+                Some("attachment; filename=\"real name.mp4\""),
+                Some("from-chrome.mp4"),
+                "https://a.com/api/download?url=x",
+                Some("video/mp4"),
+            ),
+            "real name.mp4"
+        );
+    }
+
+    #[test]
+    fn api_download_url_gets_extension_from_content_type() {
+        // ClipKnight 的实际形状：末段是 "download"，没有扩展名。
+        // 以前落盘就是一个光秃秃的 "download"。
+        assert_eq!(
+            resolve_download_filename(
+                None,
+                None,
+                "https://clipknight.com/api/download?url=https%3A%2F%2Fx.com%2Fx%2Fstatus%2F1&rank=0",
+                Some("video/mp4"),
+            ),
+            "download.mp4"
+        );
+    }
+
+    #[test]
+    fn hash_url_gets_extension_from_content_type() {
+        // TikTok 这类平台的地址末段是一串哈希，完全没有扩展名。
+        let url = "https://v16-webapp-prime.us.tiktok.com/video/tos/abc/o4oQxrDpIFABEOByoKEc5cExBj3VfROLqIHHgf/?a=1988";
+        assert_eq!(
+            resolve_download_filename(None, None, url, Some("video/mp4")),
+            "o4oQxrDpIFABEOByoKEc5cExBj3VfROLqIHHgf.mp4"
+        );
+    }
+
+    #[test]
+    fn url_segment_with_extension_is_kept() {
+        assert_eq!(
+            resolve_download_filename(None, None, "https://a.com/x/clip.webm", Some("video/webm")),
+            "clip.webm"
+        );
+    }
+
+    #[test]
+    fn provided_name_survives_when_server_says_nothing() {
+        assert_eq!(
+            resolve_download_filename(None, Some("myvideo.mp4"), "https://a.com/api/download", None),
+            "myvideo.mp4"
+        );
+    }
+
+    #[test]
+    fn provided_name_without_extension_gets_one() {
+        assert_eq!(
+            resolve_download_filename(None, Some("myvideo"), "https://a.com/api/download", Some("video/mp4")),
+            "myvideo.mp4"
+        );
+    }
+
+    #[test]
+    fn temporary_provided_name_is_ignored() {
+        // 浏览器给的 "download" 不该压过服务器给的真名。
+        assert_eq!(
+            resolve_download_filename(
+                Some("attachment; filename=\"server.mp4\""),
+                Some("download"),
+                "https://a.com/api/download",
+                Some("video/mp4"),
+            ),
+            "server.mp4"
+        );
+    }
+
+    #[test]
+    fn nothing_known_falls_back_to_download() {
+        assert_eq!(
+            resolve_download_filename(None, None, "https://a.com/api/download", None),
+            "download"
+        );
+        // 全空 URL 也不能崩。
+        assert_eq!(resolve_download_filename(None, None, "", None), "download");
+    }
+
+    #[test]
+    fn generic_url_segments_are_not_filenames() {
+        assert!(is_generic_name("download"));
+        assert!(is_generic_name("DOWNLOAD"));
+        assert!(is_generic_name("index"));
+        assert!(!is_generic_name("clip.mp4"));
+    }
+
+    #[test]
+    fn trailing_slash_is_not_a_filename() {
+        // TikTok 的地址末尾带斜杠，末段是空串。
+        assert_eq!(last_path_segment("https://a.com/video/tos/abc/"), Some("abc".to_string()));
+        assert_eq!(last_path_segment("https://a.com/"), None);
     }
 
     #[test]

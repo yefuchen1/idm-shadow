@@ -60,12 +60,23 @@ function isLocalFile(item) {
   return false;
 }
 
-// 这个下载要不要放过去不管。
-async function shouldSkip(item) {
-  if (isLocalFile(item)) return true;
+// 是不是页面预览图那种"不该当下载接管"的图片。
+//
+// 浏览模型预览站、图库、论坛的时候，页面里的图片会被浏览器当成下载，
+// 一个预览图弹一次对话框，很烦。
+async function shouldSkipImage(item) {
   const s = await settings();
   if (!s.skipImages) return false;
   return looksLikeImage(item.url) || looksLikeImage(item.filename);
+}
+
+// 这个下载要不要放过去不管。
+//
+// isLocalFile 只在浏览器那边有意义（Chrome 的 item.filename 是完整路径，
+// 用来看是不是用户磁盘上已有的东西），所以只给 onCreated 那条路用。
+async function shouldSkip(item) {
+  if (isLocalFile(item)) return true;
+  return shouldSkipImage(item);
 }
 
 // 桌面应用里勾了"设为默认下载工具"，扩展就自动接管。
@@ -114,35 +125,19 @@ async function waitForFilename(downloadId, retries = 20) {
   return null;
 }
 
-/// 自己问服务器要文件名。
+/// 浏览器还没定好文件名时给的临时名。
 ///
-/// Chrome 给的名字在接管场景下不可靠——我们很快就把浏览器下载取消了，
-/// 它可能永远停在 "download (2)" 这种临时名上。
-/// 直接读响应头里的 Content-Disposition 最靠谱，跟 Chrome 的状态无关。
-async function filenameFromServer(url) {
-  try {
-    const resp = await fetch(url, { method: 'HEAD' });
-    const disposition = resp.headers.get('content-disposition');
-    if (!disposition) return null;
-
-    // filename*=UTF-8''xxx 优先
-    const starMatch = /filename\*\s*=\s*([^']*)'([^']*)'([^;]+)/i.exec(disposition);
-    if (starMatch) {
-      try {
-        return decodeURIComponent(starMatch[3].trim().replace(/^"|"$/g, ''));
-      } catch (err) {
-        // 解码失败就用普通的
-      }
-    }
-
-    const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(disposition);
-    if (plain) {
-      return plain[1].trim();
-    }
-  } catch (err) {
-    // 服务器不支持 HEAD 或者网络不通
-  }
-  return null;
+/// Chrome 在文件名确定之前会先用 "download"、"download (2)" 这种占位名，
+/// 下载中还会加 ".crdownload" 后缀。这些不是用户要的文件名，
+/// 传给引擎只会让落盘文件变成一个光秃秃的 "download"。
+/// 引擎那边有同样的判断（engine/src/task.rs）。
+function isTemporaryName(name) {
+  if (!name) return true;
+  const lower = String(name).trim().toLowerCase();
+  if (!lower) return true;
+  const stem = lower.endsWith('.crdownload') ? lower.slice(0, -'.crdownload'.length) : lower;
+  if (stem === 'download') return true;
+  return /^download \(\d+\)$/.test(stem);
 }
 
 async function settings() {
@@ -314,17 +309,23 @@ async function capture(item) {
   if (!url) return false;
   // blob / data URL 由页面内生命周期决定，引擎取不到
   if (/^(blob|data|chrome-extension|edge):/i.test(url)) return false;
+  // 页面预览图之类的不接管。
+  //
+  // 这个检查放在 capture 里而不是只在 onCreated 里，
+  // 是因为内容脚本那条入口（跨源 a[download]）也要守同样的规矩。
+  // 放在 autoConfigure 之前，免得为了看一眼图片就先去连一遍应用。
+  if (await shouldSkipImage(item)) return false;
 
   // 还没配置过就先自动找一下应用。
   // 装完扩展就能直接用，不用手动抄 token。
   await autoConfigure();
 
-  // 文件名优先问服务器要——Chrome 给的名字在接管场景下不可靠，
-// 我们把浏览器下载取消掉之后它可能永远停在 "download (2)"。
-  const serverName = await filenameFromServer(url);
   const chromeName = filenameByDownload[item.id] || item.filename;
-  // 只取文件名部分。两边给的可能都是带路径的完整路径。
-  const finalName = basename(serverName) || basename(chromeName);
+  // 只取文件名部分。Chrome 给的可能是带路径的完整路径。
+  const rawName = basename(chromeName);
+  // 临时名（"download"、"download (2)"）不是真名字，别传给引擎——
+  // 引擎会自己问服务器要名字，并按 Content-Type 补扩展名。
+  const finalName = rawName && !isTemporaryName(rawName) ? rawName : null;
 
   const payload = {
     url,
@@ -387,12 +388,9 @@ async function capture(item) {
   if (task.id && item.id !== undefined) {
     taskByDownload[item.id] = task.id;
   }
-  // 名字还是临时名（比如 "download"），再等等 Chrome 定好
-  if (task.id && finalName && /^download( \(\d+\))?$/.test(finalName)) {
-    const final = await waitForFilename(item.id);
-    if (final) await renameTask(task.id, final);
+  if (item.id !== undefined) {
+    await markHandled(item.id, true);
   }
-  await markHandled(item.id, true);
   await updateBadge();
   return true;
 }
@@ -536,8 +534,21 @@ chrome.alarms.create('sync-app-mode', { periodInMinutes: 1 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === 'capture-url') {
-    capture({ url: message.url, filename: message.filename || '', referer: message.referer })
-      .then((ok) => sendResponse({ ok }));
+    // 内容脚本发来的接管请求也要守模式。
+    //
+    // 用户在设置里选了"不接管"，内容脚本却照样把下载抢走的话，
+    // 那个开关就形同虚设了。
+    settings()
+      .then((s) => {
+        if (effectiveMode(s) === 'off') return false;
+        return capture({
+          url: message.url,
+          filename: message.filename || '',
+          referer: message.referer
+        });
+      })
+      .then((ok) => sendResponse({ ok }))
+      .catch(() => sendResponse({ ok: false }));
     return true;
   }
   if (message && message.type === 'status') {

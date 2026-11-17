@@ -27,6 +27,12 @@ pub struct AppState {
 
 /// 应用数据目录：%APPDATA%\IDM Shadow
 fn data_dir() -> std::path::PathBuf {
+    // 自动化测试要跑在独立目录里——不然测试的清理动作会动到用户真实的任务库。
+    if let Ok(dir) = std::env::var("IDM_SHADOW_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
     let base = std::env::var("APPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
@@ -64,11 +70,24 @@ fn main() {
         )
         .init();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+    // 自动化测试要能跟用户正在跑的实例并存，所以给它一个独立端口。
+    // 单实例插件会直接把第二个进程转交给第一个、让它啥也不干——
+    // 测试里表现就是"bridge 起不来"，很难查。
+    let isolated = std::env::var("IDM_SHADOW_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .is_some();
+
+    let mut builder = tauri::Builder::default();
+    if !isolated {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // 已经有实例在跑：把协议链接转交给它
             protocol::handle_args(app, &argv);
-        }))
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -129,8 +148,16 @@ fn main() {
 
             // 本地 HTTP API
             // setup 回调是同步的，这里用 Tauri 的阻塞运行时跑一小段异步。
-            let port = tauri::async_runtime::block_on(idm_shadow_bridge::find_free_port(16888))
+            //
+            // 端口可以由环境变量指定（IDM_SHADOW_PORT）。
+            // 这样自动化测试能跑在别的端口上，不用先把用户正在用的实例关掉。
+            let start_port = std::env::var("IDM_SHADOW_PORT")
+                .ok()
+                .and_then(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
                 .unwrap_or(16888);
+            let port = tauri::async_runtime::block_on(idm_shadow_bridge::find_free_port(start_port))
+                .unwrap_or(start_port);
             store.set_setting("bridge_port", &port.to_string())?;
 
             // AppHandle 是 Send + Sync，能进 Arc 闭包；App 不是。

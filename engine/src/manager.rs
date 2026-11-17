@@ -16,8 +16,8 @@ use crate::http::{RequestContext, ResourceMeta};
 use crate::limiter::RateLimiter;
 use crate::store::Store;
 use crate::task::{
-    filename_from_content_disposition, filename_from_url, sanitize_filename, unique_path,
-    EngineKind, Task, TaskError, TaskId, TaskRequest, TaskStatus,
+    is_temporary_name, resolve_download_filename, sanitize_filename, unique_path, EngineKind, Task,
+    TaskError, TaskId, TaskRequest, TaskStatus,
 };
 
 /// 任务状态变化事件。UI 与扩展都靠它订阅。
@@ -216,11 +216,16 @@ impl DownloadManager {
             .map(PathBuf::from)
             .unwrap_or(default_dir);
 
-        let filename = req
-            .filename
-            .as_ref()
-            .map(|f| sanitize_filename(f))
-            .unwrap_or_else(|| "download".to_string());
+        // 文件名在这里定，不是在下载阶段再改名。
+        //
+        // 原因有两个：
+        //  1. 落盘名必须是弹窗里给用户看的那个名字。用户手快点「立即下载」，
+        //     下载阶段才回填的话，弹窗显示 "download.mp4"、磁盘上却是 "download"，
+        //     对不上；真要回填还得连暂存文件一起改名。
+        //  2. 探测已经在下载前做过一次（engine/src/http/engine.rs），
+        //     那次的响应头里已经有 Content-Disposition 和 Content-Type，
+        //     这里再走一遍是同一次网络往返，不算额外成本。
+        let filename = self.resolve_task_filename(&req).await;
         let path = unique_path(&dir, &filename);
         let filename = path
             .file_name()
@@ -262,6 +267,69 @@ impl DownloadManager {
             self.inner.events.send(TaskEvent::ConfirmNeeded(id)).ok();
         }
         Ok(task)
+    }
+
+    /// 定出任务该用的文件名。
+    ///
+    /// 调用方给的名字如果像"真的名字"，就直接用；只给了一堆占位词
+    /// （`download`、`download (2)`、空），就当没给，探测服务器定名。
+    async fn resolve_task_filename(&self, req: &TaskRequest) -> String {
+        let provided = req.filename.as_deref().filter(|name| {
+            let cleaned = sanitize_filename(name);
+            !cleaned.is_empty() && !is_temporary_name(&cleaned)
+        });
+
+        // 名字又完整又有扩展名，不用白跑一趟网络。
+        //
+        // 但只有名字没有扩展名时还得探一次：
+        // 用户自己起的名字也可能是 "video" 这种光秃秃的，
+        // 补上扩展名它才能被播放器认出来。
+        if let Some(name) = provided {
+            if crate::task::has_extension(&name) {
+                return name.to_string();
+            }
+        }
+
+        match self.probe_filename(req, provided).await {
+            Some(name) => name,
+            None => match provided {
+                Some(name) => sanitize_filename(name),
+                None => "download".to_string(),
+            },
+        }
+    }
+
+    /// 探测服务器拿文件名。失败返回 None。
+    ///
+    /// 超时给得很短（5 秒）：这一步挡在用户点击和弹窗之间，
+    /// 站点不响应的话不能让人干等。
+    async fn probe_filename(
+        &self,
+        req: &TaskRequest,
+        provided: Option<&str>,
+    ) -> Option<String> {
+        let client = crate::http::build_client(req.user_agent.as_deref()).ok()?;
+        let ctx = RequestContext {
+            url: req.url.clone(),
+            referer: req.referer.clone(),
+            user_agent: req.user_agent.clone(),
+            cookies: req.cookies.clone(),
+            headers: req.headers.clone(),
+        };
+        let meta = crate::http::probe_with_timeout(&client, &ctx, Duration::from_secs(5))
+            .await
+            .ok()?;
+        let name = resolve_download_filename(
+            meta.content_disposition.as_deref(),
+            provided,
+            &meta.final_url,
+            meta.content_type.as_deref(),
+        );
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     /// 启动（或恢复）一个任务。
@@ -767,20 +835,6 @@ impl DownloadManager {
         crate::http::probe(&client, &ctx).await
     }
 
-    /// 根据探测结果补全文件名。
-    pub async fn resolve_filename(&self, req: &TaskRequest) -> Result<String> {
-        if let Some(name) = &req.filename {
-            return Ok(sanitize_filename(name));
-        }
-        let meta = self.probe(req).await?;
-        if let Some(name) = meta.suggested_filename {
-            return Ok(name);
-        }
-        if let Some(name) = filename_from_content_disposition("") {
-            return Ok(name);
-        }
-        filename_from_url(&req.url).ok_or_else(|| anyhow!("无法确定文件名"))
-    }
 }
 
 /// 默认下载目录：用户目录下的 Downloads。
