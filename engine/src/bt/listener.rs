@@ -37,7 +37,7 @@ pub fn spawn_inbound_listener<F>(
     handler: F,
 ) -> Result<Option<std::thread::JoinHandle<()>>>
 where
-    F: Fn(std::net::TcpStream) + Send + Sync + 'static,
+    F: Fn(std::net::TcpStream, String) + Send + Sync + 'static,
 {
     if !config.enabled {
         return Ok(None);
@@ -57,13 +57,13 @@ where
             tracing::info!(port = actual_port, "BT 入站监听已启动");
             loop {
                 match listener.accept() {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         let handler = handler.clone();
                         std::thread::spawn(move || {
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-                            handler(stream);
+                            handler(stream, addr.ip().to_string());
                         });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -113,6 +113,6 @@ mod tests {
             port: 6881,
             enabled: false,
         };
-        assert!(spawn_inbound_listener(&cfg, |_| {}).unwrap().is_none());
+        assert!(spawn_inbound_listener(&cfg, |_, _| {}).unwrap().is_none());
     }
 }

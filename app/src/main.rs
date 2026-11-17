@@ -242,6 +242,7 @@ fn main() {
                                     "speed": progress.speed,
                                     "connections": progress.connections,
                                     "note": progress.note,
+                                    "dht_nodes": progress.dht_nodes,
                                     "segments": progress.segments.iter().map(|s| serde_json::json!({
                                         "start": s.start,
                                         "end": s.end,

@@ -119,6 +119,11 @@ pub struct TaskDto {
     pub segments: Vec<SegmentDto>,
     /// BT 任务的分片状态（piece 校验可视化用）。
     pub pieces: Option<PieceStatusDto>,
+    /// BT 任务当前 DHT 里有多少个节点。
+    ///
+    /// 磁力链接连不上 peer 的时候，用户靠这个区分
+    /// 「DHT 没连上」和「连上了但 swarm 里没人」。
+    pub dht_nodes: Option<u64>,
     /// 文件现在还在不在保存位置。
     ///
     /// 任务列表用它把"文件已经没了"的条目标灰——
@@ -248,6 +253,7 @@ impl TaskDto {
                     })
                     .collect(),
             }),
+            dht_nodes: live.and_then(|p| p.dht_nodes),
             created_at: task.created_at.to_rfc3339(),
             updated_at: task.updated_at.to_rfc3339(),
         }

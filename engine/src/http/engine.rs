@@ -147,6 +147,11 @@ pub struct TaskProgress {
     /// BT 引擎才有：累计校验了多少块、其中多少块是坏的。
     pub verified_pieces: Option<u64>,
     pub corrupted_pieces: Option<u64>,
+    /// BT 引擎才有：DHT 里现在有多少个节点。
+    ///
+    /// 用户靠这个判断磁力链接到底有没有连上 DHT——
+    /// 连不上的时候光看"0 连接"分不清是 DHT 没通还是 swarm 里没人。
+    pub dht_nodes: Option<u64>,
     /// 产物说明。HLS 合并后会说明是 mp4 还是原始 TS。
     pub note: Option<String>,
 }

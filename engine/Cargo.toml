@@ -23,6 +23,9 @@ aes = "0.8"
 cbc = "0.1"
 cipher = { version = "0.4", features = ["block-padding"] }
 bittorrent-rs = { version = "0.3", features = ["dht", "mse", "lsd", "nat-pmp"] }
+sha1 = "0.11"
+crypto-bigint = { version = "0.5", default-features = false, features = ["alloc"] }
+rand = "0.8"
 
 [dev-dependencies]
 proptest = "1"

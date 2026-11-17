@@ -31,6 +31,8 @@ export interface TaskDto {
   segments: SegmentDto[];
   /** BT 任务的分片状态，piece 校验可视化用。 */
   pieces: PieceStatusDto | null;
+  /** BT 任务当前 DHT 里有多少个节点。null = 不是 BT 任务。 */
+  dht_nodes: number | null;
   /** 文件现在还在不在保存位置。null = 不适用（还没下完）。 */
   file_exists: boolean | null;
   created_at: string;

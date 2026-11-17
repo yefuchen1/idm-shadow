@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use bittorrent_rs::session::TorrentSession;
 use bittorrent_rs::utils::bencode::{BNode, Bencode};
+use bittorrent_rs::utils::util::LockExt;
 use idm_shadow_engine::task::{EngineKind, TaskRequest};
 use uuid::Uuid;
 /// 一个最小的 HTTP tracker：把见过的 peer 都返回回去。
@@ -456,6 +457,120 @@ async fn announce_to_tracker(tracker: SocketAddr, port: u16) {
     let _ = reqwest::Client::new().get(&url).send().await;
 }
 
+/// tracker 上报的端口必须是**我们实际监听的端口**。
+///
+/// `bittorrent-rs` 的 `Tracker::new()` 把 `port` 写死成 6881，
+/// 所以我们另起一份 announce 并把端口改掉。
+///
+/// 这个测试起一个会记录 announce 里 port 参数的 tracker，
+/// 然后断言它收到的端口是我们设置的那个。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tracker_announce_uses_the_real_listen_port() {
+    use std::sync::Mutex;
+
+    // 一个会记录 announce 里 port 参数的 tracker。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_port: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+
+    let recorder = seen_port.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                loop {
+                    let Ok(n) = socket.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                if let Some(query) = req.split_whitespace().nth(1) {
+                    for pair in query.split('&') {
+                        if let Some(v) = pair.strip_prefix("port=") {
+                            if let Ok(p) = v.parse::<u16>() {
+                                *recorder.lock().unwrap() = Some(p);
+                            }
+                        }
+                    }
+                }
+                // 回一个空的 peer 列表。
+                let body = b"d8:completei0e10:incompletei0e8:intervali1800e5:peers0:e";
+                let mut resp: Vec<u8> = Vec::new();
+                resp.extend_from_slice(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
+                );
+                resp.extend_from_slice(
+                    format!("{}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(),
+                );
+                resp.extend_from_slice(body);
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    // 建一个指向这个 tracker 的会话。
+    let dir = temp_dir("tracker-port");
+    let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let torrent_bytes = make_torrent_with_announce(
+        "data.bin",
+        &payload,
+        16 * 1024,
+        &format!("http://{addr}/announce"),
+    );
+    let torrent_path = dir.join("test.torrent");
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+
+    let mut cfg = bittorrent_rs::session::config::SessionConfig::default();
+    cfg.listen_port = 0;
+    cfg.dht_port = 0;
+    cfg.dht_enabled = false;
+
+    let mut session = TorrentSession::builder(&torrent_path, &dir)
+        .seeding(false)
+        .config(cfg)
+        .build()
+        .expect("会话应当能建起来");
+    session.start_download().expect("应当能启动下载");
+
+    // 用一个不常见的端口——6881 的话测不出来。
+    let real_port: u16 = 47123;
+    let mut announcer = idm_shadow_engine::bt::tracker::TrackerAnnouncer::new(real_port);
+    // 先等 tracker 起来。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    announcer.tick(&mut session);
+
+    // tracker 那边可能还在处理，给它一点时间。
+    for _ in 0..40 {
+        if seen_port.lock().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let reported = *seen_port.lock().unwrap();
+    assert_eq!(
+        reported,
+        Some(real_port),
+        "tracker 上报的端口应当是 {real_port}，实际是 {reported:?}"
+    );
+
+    let _ = session.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// 任务模型能识别磁力和 .torrent。
 #[test]
 fn task_engine_detection() {
@@ -513,11 +628,12 @@ fn inbound_listener_accepts_connections() {
 
     // 起监听，收到连接后往通道里丢一个字节
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = idm_shadow_engine::bt::listener::spawn_inbound_listener(&cfg, move |mut stream| {
-        let mut b = [0u8; 1];
-        let _ = stream.read_exact(&mut b);
-        let _ = tx.send(b[0]);
-    })
+    let handle =
+        idm_shadow_engine::bt::listener::spawn_inbound_listener(&cfg, move |mut stream, _addr| {
+            let mut b = [0u8; 1];
+            let _ = stream.read_exact(&mut b);
+            let _ = tx.send(b[0]);
+        })
     .unwrap()
     .expect("监听线程应当起来了");
 
@@ -536,4 +652,229 @@ fn inbound_listener_accepts_connections() {
     assert_eq!(got, b'X');
 
     drop(handle);
+}
+
+/// 完整链路（入站方向）：手写做种端**连过来**，
+/// 我们这边的入站监听接住它、发 bitfield、主动要块、收块落盘。
+///
+/// 这是 BT 入站能力的核心证明。
+/// 之前我们只能主动连别人，别人连过来的连接全被丢掉，
+/// NAT 后面的用户等于半残。
+///
+/// 跟 `bt_transfers_data_from_a_real_peer` 的区别：
+/// 那个是「我们连做种端」，这个是「做种端连我们」。
+#[test]
+fn inbound_peer_can_pull_data_from_us() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    // 把引擎的调试日志打开，出问题时能看到入站会话卡在哪一步。
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // 内容固定：128 KiB，分成 16 KiB 的 piece
+    let payload: Vec<u8> = (0..128 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let piece_len = 16 * 1024;
+
+    let dir = temp_dir("inbound");
+    let leecher_dir = dir.join("leecher");
+    std::fs::create_dir_all(&leecher_dir).unwrap();
+
+    let torrent_bytes = make_torrent_with_announce(
+        "data.bin",
+        &payload,
+        piece_len,
+        "http://127.0.0.1:1/announce",
+    );
+    let info_hash = extract_info_hash(&torrent_bytes);
+    let torrent_path = dir.join("test.torrent");
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+
+    // 建一个只下载不做种的会话。
+    let mut cfg = bittorrent_rs::session::config::SessionConfig::default();
+    cfg.listen_port = 0;
+    cfg.dht_port = 0;
+    cfg.dht_enabled = false;
+
+    let mut session = TorrentSession::builder(&torrent_path, &leecher_dir)
+        .seeding(false)
+        .config(cfg)
+        .build()
+        .expect("会话应当能建起来");
+    session.start_download().expect("应当能启动下载");
+
+    let ctx = session.context();
+    let info_hash_arr: [u8; 20] = {
+        let guard = ctx.lock_safe();
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&guard.info_hash[..20]);
+        ih
+    };
+    assert_eq!(
+        &info_hash_arr[..],
+        &info_hash[..],
+        "库里的 info_hash 应当跟 torrent 文件算出来的一致"
+    );
+
+    // 起入站监听。
+    let port = idm_shadow_engine::bt::listener::find_port(46100).unwrap();
+    let stats = Arc::new(idm_shadow_engine::bt::peer_session::InboundStats::default());
+    let listener_ctx = ctx.clone();
+    let listener_stats = stats.clone();
+    let _handle = idm_shadow_engine::bt::listener::spawn_inbound_listener(
+        &idm_shadow_engine::bt::listener::InboundConfig {
+            port,
+            enabled: true,
+        },
+        move |stream, addr| {
+            let peer_port = stream.peer_addr().map(|a| a.port()).unwrap_or(0);
+            idm_shadow_engine::bt::peer_session::handle_inbound_peer(
+                stream,
+                addr,
+                peer_port,
+                &info_hash_arr,
+                listener_ctx.clone(),
+                listener_stats.clone(),
+            );
+        },
+    )
+    .unwrap()
+    .expect("入站监听线程应当起来了");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 手写做种端：**主动连过来**。
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("做种端应当能连上我们的监听");
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    // 1. 发我们的握手。
+    let mut hs = Vec::with_capacity(68);
+    hs.push(19);
+    hs.extend_from_slice(b"BitTorrent protocol");
+    hs.extend_from_slice(&[0u8; 8]);
+    hs.extend_from_slice(&info_hash);
+    hs.extend_from_slice(b"-SEED-0001-000000000");
+    conn.write_all(&hs).unwrap();
+    conn.flush().unwrap();
+
+    // 2. 读对方（我们）的握手。
+    let mut peer_hs = [0u8; 68];
+    conn.read_exact(&mut peer_hs).unwrap();
+    assert_eq!(&peer_hs[1..20], b"BitTorrent protocol", "对方应当回了标准握手");
+    assert_eq!(&peer_hs[28..48], &info_hash[..], "info_hash 应当对得上");
+
+    // 3. 发 bitfield：我全都有。
+    let piece_count = payload.len().div_ceil(piece_len);
+    let bitfield_len = piece_count.div_ceil(8);
+    let mut bitfield = vec![0u8; bitfield_len];
+    for i in 0..piece_count {
+        bitfield[i / 8] |= 0x80 >> (i % 8);
+    }
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&((1 + bitfield.len()) as u32).to_be_bytes());
+    msg.push(5);
+    msg.extend_from_slice(&bitfield);
+    conn.write_all(&msg).unwrap();
+
+    // 4. 循环：收到 request 就发对应的块。
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut sent_pieces = 0usize;
+    loop {
+        // 先把对方的请求都处理掉。
+        while buf.len() >= 4 {
+            let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if buf.len() < 4 + len {
+                break;
+            }
+            let id = buf[4];
+            let body = buf[5..4 + len].to_vec();
+            buf.drain(..4 + len);
+
+            match id {
+                // request
+                6 if body.len() >= 12 => {
+                    let index =
+                        u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+                    let begin =
+                        u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+                    let want =
+                        u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
+
+                    let piece_start = index * piece_len;
+                    let start = piece_start + begin;
+                    if start >= payload.len() {
+                        continue;
+                    }
+                    let end = (start + want).min(payload.len());
+                    let chunk = payload[start..end].to_vec();
+
+                    let mut block = Vec::new();
+                    block.extend_from_slice(&((9 + chunk.len()) as u32).to_be_bytes());
+                    block.push(7);
+                    block.extend_from_slice(&(index as u32).to_be_bytes());
+                    block.extend_from_slice(&(begin as u32).to_be_bytes());
+                    block.extend_from_slice(&chunk);
+                    conn.write_all(&block).unwrap();
+                    sent_pieces += 1;
+                }
+                // interested：回 unchoke，让它放开我下载
+                2 => {
+                    let mut unchoke = Vec::new();
+                    unchoke.extend_from_slice(&1u32.to_be_bytes());
+                    unchoke.push(1);
+                    conn.write_all(&unchoke).unwrap();
+                }
+                _ => {}
+            }
+        }
+
+        // 下载完成就收工。
+        let done = {
+            let guard = ctx.lock_safe();
+            guard.is_download_complete()
+        };
+        if done {
+            break;
+        }
+
+        // 读对方的请求。读超时不是错误——对方可能只是在等校验完成。
+        match conn.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // 超时了，再看一眼有没有下完，还没下完就继续等。
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+
+    assert!(
+        sent_pieces > 0,
+        "对方应当至少向我们要过一次块（收到 {sent_pieces} 个块请求）"
+    );
+    assert!(
+        stats.handshaked() >= 1,
+        "入站握手应当成功过（accepted={} handshaked={}）",
+        stats.accepted(),
+        stats.handshaked()
+    );
+
+    // 文件内容应当跟原始数据一致。
+    let out = leecher_dir.join("data.bin");
+    assert!(out.exists(), "下载端应当有文件");
+    let content = std::fs::read(&out).unwrap();
+    assert_eq!(content.len(), payload.len(), "文件大小应当一致");
+    assert!(content == payload, "文件内容必须一致");
+
+    let _ = session.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }

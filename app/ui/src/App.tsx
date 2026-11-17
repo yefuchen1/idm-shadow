@@ -147,6 +147,7 @@ export default function App() {
       note: string | null;
       segments: SegmentDto[];
       pieces: PieceStatusDto | null;
+      dht_nodes: number | null;
     }>("task-progress", (event) => {
       const p = event.payload;
       setTasks((prev) =>
@@ -160,7 +161,8 @@ export default function App() {
                 connections: p.connections,
                 note: p.note ?? t.note,
                 segments: p.segments ?? t.segments,
-                pieces: p.pieces ?? t.pieces
+                pieces: p.pieces ?? t.pieces,
+                dht_nodes: p.dht_nodes ?? t.dht_nodes
               }
             : t
         )
@@ -1065,6 +1067,14 @@ export default function App() {
                 </span>
                 {task.connections > 0 && (
                   <span className="subtle">{task.connections} 连接</span>
+                )}
+                {task.engine === "bt" && (task.dht_nodes ?? 0) > 0 && (
+                  <span
+                    className="subtle"
+                    title="DHT 里已知的节点数。磁力链接找不到 peer 时，看这个能分清是 DHT 没连上还是 swarm 里没人。"
+                  >
+                    DHT {task.dht_nodes} 节点
+                  </span>
                 )}
                 {task.error && (
                   <span className="subtle error-text" title={task.error}>

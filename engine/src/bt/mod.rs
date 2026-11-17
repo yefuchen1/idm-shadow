@@ -17,11 +17,16 @@ use bittorrent_rs::core::metainfo::MetaInfoFile;
 use bittorrent_rs::session::{SessionEvent, TorrentSession};
 use bittorrent_rs::session::SessionConfig;
 use bittorrent_rs::utils::util::get_bitfield_index_and_mask;
+use bittorrent_rs::utils::util::LockExt;
 
 use crate::http::engine::{EngineCtx, PieceCell, PieceState, PieceStatus, TaskProgress};
 use crate::task::Task;
 
 pub mod listener;
+pub mod discovery;
+pub mod pe;
+pub mod peer_session;
+pub mod tracker;
 
 use listener::InboundConfig;
 
@@ -35,22 +40,39 @@ pub fn download(
     let download_dir = dir.parent().unwrap_or(Path::new(".")).to_path_buf();
     std::fs::create_dir_all(&download_dir).ok();
 
+    // 端口先定下来。
+    //
+    // 这里必须**先占端口再建会话**：库的 NAT-PMP 映射、LSD 宣告、
+    // tracker 上报用的都是 `config.listen_port`，而我们自己的入站监听
+    // 用的是另外找的端口。两边不一致的话，NAT 后别人连不进来，
+    // DHT 里宣告的端口也指向一个没人监听的地址。
+    //
+    // 所以：挑一个没人用的端口 → 把它填进 config → 再起监听。
+    // 三边用同一个端口，映射、宣告、监听才对得上。
+    let listen_port = listener::find_port(6881).unwrap_or(6881);
+
     // 只下载不做种：peer 不会给我们数据，我们也不回传。
     //
     // 打开异步校验：开了它 piece 的哈希校验走后台线程池，
     // 不阻塞下载；而且校验结果（尤其是坏块）会被统计出来，
     // 界面上就能显示"坏块重传统计"。
     let mut session = if url.starts_with("magnet:") {
-        TorrentSession::from_magnet(url, &download_dir)
+        let config = session_config_magnet(listen_port);
+        // 磁力链接没有 tracker 会很难找到 peer，
+        // 补一批实测可达的。
+        let ctx = bittorrent_rs::TorrentSession::from_magnet(url, &download_dir)
             .seeding(false)
             .enable_pex(true)
             .enable_async_verification(true)
+            .config(config.clone())
             .build()
-            .context("创建磁力会话失败")?
+            .context("创建磁力会话失败")?;
+        discovery::inject_fallback_trackers(&ctx.context());
+        ctx
     } else {
         // 普通的 .torrent 文件或者 http 直链
         let torrent_path = fetch_torrent_file(url, &download_dir)?;
-        let config = session_config(&torrent_path, &download_dir);
+        let config = session_config(&torrent_path, &download_dir, listen_port);
         TorrentSession::builder(&torrent_path, &download_dir)
             .seeding(false)
             .enable_pex(true)
@@ -70,16 +92,62 @@ pub fn download(
         .start_download()
         .context("启动 BT 下载失败")?;
 
+    // DHT announce。
+    //
+    // 库的 DHT 只回应别人的 announce_peer，自己从来不主动宣告——
+    // 也就是「别人能查到我们，我们查不到别人」。
+    // 这个线程补上主动宣告这一半，让别的 peer 能反过来找到我们。
+    let dht_stats = Arc::new(discovery::DhtStats::default());
+    let dht_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let dht_info_hash = {
+        let ctx_arc = session.context();
+        let guard = ctx_arc.lock_safe();
+        let mut ih = [0u8; 20];
+        let n = guard.info_hash.len().min(20);
+        ih[..n].copy_from_slice(&guard.info_hash[..n]);
+        ih
+    };
+    let (dht_announcer, dht_thread) = discovery::DhtAnnouncer::spawn(
+        dht_info_hash,
+        listen_port,
+        dht_stats.clone(),
+        dht_running.clone(),
+    );
+
     // 入站监听：bittorrent-rs 自己只做主动连接，
     // 我们补上接受别人连过来的那一半。
-    let inbound_port = listener::find_port(6881).unwrap_or(6881);
+    //
+    // 监听的端口跟 config.listen_port 是同一个，
+    // 这样 NAT-PMP 映射出去的端口、DHT 里宣告的端口、
+    // 实际监听的端口三者一致。
     let inbound_cfg = InboundConfig {
-        port: inbound_port,
+        port: listen_port,
         enabled: true,
     };
-    let inbound_handle = listener::spawn_inbound_listener(&inbound_cfg, |stream| {
-        // 入站连接交给库里的 peer 会话处理
-        handle_inbound_peer(stream);
+    let inbound_stats = Arc::new(peer_session::InboundStats::default());
+    let session_ctx = session.context();
+    let inbound_handle = listener::spawn_inbound_listener(&inbound_cfg, move |stream, addr| {
+        // 入站连接：真的当成一个 peer 对待——
+        // 握手、发 bitfield、主动要块、收块落盘。
+        let info_hash = {
+            let guard = session_ctx.lock_safe();
+            let mut ih = [0u8; 20];
+            let n = guard.info_hash.len().min(20);
+            ih[..n].copy_from_slice(&guard.info_hash[..n]);
+            ih
+        };
+        let port = stream
+            .peer_addr()
+            .map(|a| a.port())
+            .unwrap_or(0);
+        peer_session::handle_inbound_peer(
+            stream,
+            addr,
+            port,
+            &info_hash,
+            session_ctx.clone(),
+            inbound_stats.clone(),
+        );
     })?;
     let _ = &inbound_handle;
 
@@ -102,12 +170,24 @@ pub fn download(
     // 上一轮读到的分片状态。读不到时沿用它。
     let mut last_pieces = PieceStatus::default();
     let mut reported_downloading = false;
+    // tracker announce：自己来一份，用真实端口上报。
+    let mut tracker_announcer = tracker::TrackerAnnouncer::new(listen_port);
 
     loop {
         if *ctx.cancel.borrow() {
             let _ = session.stop();
             break;
         }
+
+        // 自己 announce 一次 tracker（用真实端口）。
+        let found_peers = tracker_announcer.tick(&mut session);
+        if found_peers > 0 {
+            tracing::debug!("BT tracker 返回 {found_peers} 个 peer");
+        }
+
+        // 把库 DHT 路由表里的节点喂给自己的 announce 线程，
+        // 这样 announce 能覆盖到库实际连上的那些节点。
+        feed_dht_candidates(&session, &dht_announcer);
 
         if let Some(stats) = session.try_stats() {
             let downloaded = stats.bytes_downloaded;
@@ -144,6 +224,7 @@ pub fn download(
                 pieces: Some(pieces.clone()),
                 verified_pieces: Some(pieces.verified as u64),
                 corrupted_pieces: Some(pieces.corrupted as u64),
+                dht_nodes: Some(dht_node_count(&session, &dht_stats)),
                 note: None,
             });
 
@@ -157,6 +238,8 @@ pub fn download(
     }
 
     let _ = session.stop();
+    dht_running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = dht_thread.join();
     drop(event_thread);
 
     if finished {
@@ -164,6 +247,47 @@ pub fn download(
     } else {
         Err(anyhow!("BT 下载未完成"))
     }
+}
+
+/// 把库 DHT 路由表里的节点喂给 announce 线程。
+///
+/// 库的 DHT 负责维护路由表（哪些节点还活着），
+/// 我们自己的 announce 线程负责宣告自己。
+/// 两边合起来才有完整的 DHT 能力。
+fn feed_dht_candidates(
+    session: &TorrentSession,
+    announcer: &Arc<discovery::DhtAnnouncer>,
+) {
+    let Some(dht) = session.dht.clone() else {
+        return;
+    };
+    let nodes = {
+        let table = dht.routing_table.lock_safe();
+        table
+            .buckets
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(|n| (n.ip.clone(), n.port))
+            .collect::<Vec<_>>()
+    };
+    for (ip, port) in nodes {
+        announcer.add_candidate(ip, port);
+    }
+}
+
+/// DHT 里现在有多少个节点。
+///
+/// 两个来源加起来：库的路由表 + 我们自己的候选表。
+fn dht_node_count(session: &TorrentSession, stats: &Arc<discovery::DhtStats>) -> u64 {
+    let from_library = session
+        .dht
+        .as_ref()
+        .map(|dht| {
+            let table = dht.routing_table.lock_safe();
+            table.buckets.iter().map(|b| b.len() as u64).sum::<u64>()
+        })
+        .unwrap_or(0);
+    from_library.max(stats.nodes())
 }
 
 /// 记住哪些块校验失败过。
@@ -253,8 +377,10 @@ fn read_pieces(session: &TorrentSession) -> Option<(Vec<bool>, Vec<u16>, u64)> {
 ///
 /// 全新下载没什么可校验的（盘上什么都没有），直接跳过；
 /// 断点续传才需要认真校验，知道哪些块已经下好了。
-fn session_config(torrent_path: &Path, download_dir: &Path) -> SessionConfig {
+fn session_config(torrent_path: &Path, download_dir: &Path, listen_port: u16) -> SessionConfig {
     let mut config = SessionConfig::default();
+
+    apply_common_config(&mut config, listen_port);
 
     // 看看目标文件在不在。
     let existing = match MetaInfoFile::new(torrent_path).and_then(|mut m| {
@@ -273,6 +399,40 @@ fn session_config(torrent_path: &Path, download_dir: &Path) -> SessionConfig {
     );
     config
 }
+
+/// 磁力链接的会话配置。
+fn session_config_magnet(listen_port: u16) -> SessionConfig {
+    let mut config = SessionConfig::default();
+    apply_common_config(&mut config, listen_port);
+    config
+}
+
+/// 两个会话共用的配置。
+fn apply_common_config(config: &mut SessionConfig, listen_port: u16) {
+    // 监听端口必须跟入站监听是同一个，
+    // 否则 NAT-PMP 映射出去的是另一个端口，别人连进来会连错地方。
+    config.listen_port = listen_port;
+    config.dht_port = listen_port;
+
+    // 并发 peer 上限。
+    //
+    // 库默认 50，迅雷那种量级能到几百。
+    // swarm 上限（`maximum_swarm_size`）是 100，
+    // 超过之后 `add_peer` 会拒绝新连接，所以这里给得比它高，
+    // 让库自己去按实际连接情况裁剪。
+    config.max_connections = MAX_CONNECTIONS;
+    config.max_peer_candidates = MAX_PEER_CANDIDATES;
+
+    // 磁力链接常常是 private 种子，
+    // 但 LSD 只在局域网有意义，这里放开一点更实用。
+    config.allow_private_lsd = true;
+}
+
+/// 并发连接上限。
+const MAX_CONNECTIONS: usize = 200;
+
+/// peer 候选队列上限。
+const MAX_PEER_CANDIDATES: usize = 2000;
 
 /// 画图最多用多少格。
 const MAX_PIECE_CELLS: usize = 240;
@@ -346,76 +506,6 @@ fn build_piece_status(
         cells,
     }
 }
-/// 处理一个入站连接。
-///
-/// bittorrent-rs 的 peer 会话处理是内部函数，这里用它的公开 API
-/// 走一遍握手 + 消息循环：先读 handshake，再按库的消息格式收发。
-fn handle_inbound_peer(mut stream: std::net::TcpStream) {
-    use std::io::{Read, Write};
-
-    // 1. 读 68 字节的 handshake
-    let mut hs = [0u8; 68];
-    if stream.read_exact(&mut hs).is_err() {
-        return;
-    }
-    if &hs[1..20] != b"BitTorrent protocol" && &hs[0..19] != b"BitTorrent protocol" {
-        return;
-    }
-
-    // 2. 回 handshake：<19>"BitTorrent protocol"<8 reserved><20 infohash>
-    //    info_hash 从对方发来的那份里取（第 28..48 字节）
-    let mut reply = Vec::with_capacity(68);
-    reply.push(19);
-    reply.extend_from_slice(b"BitTorrent protocol");
-    reply.extend_from_slice(&[0u8; 8]);
-    reply.extend_from_slice(&hs[28..48]);
-    reply.extend_from_slice(b"-IDMS-0001-000000000");
-    if stream.write_all(&reply).is_err() {
-        return;
-    }
-
-    // 3. 消息循环
-    //    长度前缀 + id + 负载
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        while buf.len() < 4 {
-            match stream.read(&mut tmp) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            }
-        }
-        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if len > 1024 * 1024 {
-            return;
-        }
-        while buf.len() < 4 + len {
-            match stream.read(&mut tmp) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            }
-        }
-        let id = buf[4];
-        let _body = buf[5..4 + len].to_vec();
-        buf.drain(..4 + len);
-
-        match id {
-            // interested
-            2 => {
-                let mut unchoke = Vec::new();
-                unchoke.extend_from_slice(&1u32.to_be_bytes());
-                unchoke.push(1);
-                if stream.write_all(&unchoke).is_err() {
-                    return;
-                }
-            }
-            // keep-alive
-            0 => {}
-            _ => {}
-        }
-    }
-}
-
 /// 下载 .torrent 文件本身。
 fn fetch_torrent_file(url: &str, dir: &Path) -> Result<std::path::PathBuf> {
     // 已经是本地文件就直接用
@@ -554,7 +644,7 @@ mod tests {
         assert_eq!(status.verification_failures, 2, "累计坏块次数应当是 2");
 
         // 坏块位置靠 bitfield 对比定位
-        let mut map = corrupted.lock().unwrap();
+        let map = corrupted.lock().unwrap();
         assert_eq!(map.get(&0).copied().unwrap_or(0), 2, "第 0 块坏了两次");
         assert!(map.get(&1).is_none(), "第 1 块是好的");
     }
