@@ -119,8 +119,22 @@ pub struct LoadedCopy {
     /// 扩展目录。
     pub path: String,
     /// 那份副本自己的 manifest 版本号。
+    ///
+    /// 这是**磁盘上**的版本。
     pub version: String,
-    /// 目录里的文件和当前发布的对不上（版本旧了，或者被人改过）。
+    /// 浏览器**实际在跑**的版本。
+    ///
+    /// 来自浏览器的注册信息。跟 `version` 不一样就说明浏览器缓存了旧代码：
+    /// 文件已经更新，但跑的还是老的。读不到就是 None（浏览器没记这个字段）。
+    pub running_version: Option<String>,
+    /// 是不是该让用户去点「重新加载」了。
+    ///
+    /// 两种情况都算：
+    ///  - 浏览器跑的版本跟随包发布的对不上（跑着旧代码）；
+    ///  - 目录里的文件和当前发布的对不上（文件本身旧了，或者被人改过）。
+    ///
+    /// 只看文件是不够的——用户遇到的最常见的一种情况恰恰是文件已经
+    /// 更新了、浏览器却还跑着旧的。
     pub stale: bool,
 }
 
@@ -137,7 +151,17 @@ fn user_data_dir(browser: Browser) -> Option<PathBuf> {
 ///
 /// `location == 4` 表示用户自己加载的已解压扩展；装在浏览器里的那些
 /// （location 1/2/3）路径在程序目录里，不是用户能改的。
-fn unpacked_extension_paths(prefs: &Path) -> Vec<PathBuf> {
+///
+/// 顺带把浏览器**实际在跑**的版本带出来。
+///
+/// 这个版本号来自 `service_worker_registration_info.version`——浏览器
+/// 注册 service worker 时记下来的值，也就是它现在真正在执行的那份代码
+/// 的版本。
+///
+/// 为什么不能只看磁盘上的 manifest：浏览器把已解压扩展的注册信息缓存住了，
+/// 文件换了新版它照样跑旧代码。这时候磁盘上是 0.1.4，注册的是 0.1.0，
+/// 只看文件会以为一切正常。
+fn unpacked_extension_entries(prefs: &Path) -> Vec<(PathBuf, Option<String>)> {
     let Ok(text) = std::fs::read_to_string(prefs) else {
         return Vec::new();
     };
@@ -158,9 +182,15 @@ fn unpacked_extension_paths(prefs: &Path) -> Vec<PathBuf> {
         }
         if let Some(path) = entry.get("path").and_then(|p| p.as_str()) {
             let path = PathBuf::from(path);
-            if !out.contains(&path) {
-                out.push(path);
+            if out.iter().any(|(p, _)| *p == path) {
+                continue;
             }
+            let running = entry
+                .get("service_worker_registration_info")
+                .and_then(|i| i.get("version"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            out.push((path, running));
         }
     }
     out
@@ -202,20 +232,31 @@ fn scan_user_data(browser: Browser, user_data: &Path) -> Vec<LoadedCopy> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        for path in unpacked_extension_paths(&prefs) {
+        for (path, running) in unpacked_extension_entries(&prefs) {
             let Some((name, version)) = read_manifest(&path) else {
                 continue;
             };
             if name != EXTENSION_NAME {
                 continue;
             }
+            // 两种"旧"都要算：
+            //  1. 磁盘上的文件不是当前发布的（文件本身旧了）；
+            //  2. 浏览器跑的版本不是当前发布的（浏览器缓存了旧代码）。
+            //
+            // 第 2 条才是最难查的那种：文件明明是新的，浏览器却还跑着旧的。
+            let disk_stale = !matches_shipped(&path);
+            let running_stale = running
+                .as_deref()
+                .map(|v| v != shipped_version())
+                .unwrap_or(false);
             out.push(LoadedCopy {
                 browser: browser.as_str().to_string(),
                 browser_label: browser.label().to_string(),
                 profile: profile_name.clone(),
                 path: path.to_string_lossy().to_string(),
                 version,
-                stale: !matches_shipped(&path),
+                running_version: running,
+                stale: disk_stale || running_stale,
             });
         }
     }
@@ -409,17 +450,44 @@ mod tests {
 
     /// 造一个假的浏览器用户数据目录。
     fn fake_user_data(root: &Path, ext_dir: &Path, version: &str) -> PathBuf {
+        fake_user_data_running(root, ext_dir, version, None)
+    }
+
+    /// 造一个假的浏览器用户数据目录，并指定浏览器**注册**的版本。
+    ///
+    /// `running` 就是浏览器记在 `service_worker_registration_info` 里的
+    /// 那个版本——它跑的是哪份代码，看的就是这个值。
+    fn fake_user_data_running(
+        root: &Path,
+        ext_dir: &Path,
+        version: &str,
+        running: Option<&str>,
+    ) -> PathBuf {
         let profile = root.join("Default");
         std::fs::create_dir_all(&profile).unwrap();
         let manifest = format!(
             r#"{{"manifest_version": 3, "name": "IDM Shadow", "version": "{version}"}}"#
         );
         std::fs::write(ext_dir.join("manifest.json"), manifest).unwrap();
-        let prefs = format!(
-            r#"{{"extensions": {{"settings": {{"abc": {{"location": 4, "path": "{}"}}}}}}}}"#,
-            ext_dir.to_string_lossy().replace('\\', "\\\\")
-        );
-        std::fs::write(profile.join("Secure Preferences"), prefs).unwrap();
+        // 用 serde_json 拼这份 JSON——手写 format! 的花括号一层套一层，
+        // 少写一个就编译不过，多写一个也编译不过。拼 JSON 不是该用字符串。
+        let mut entry = serde_json::Map::new();
+        entry.insert("location".into(), serde_json::json!(4));
+        entry.insert("path".into(), serde_json::json!(ext_dir.to_string_lossy()));
+        if let Some(v) = running {
+            entry.insert(
+                "service_worker_registration_info".into(),
+                serde_json::json!({ "version": v }),
+            );
+        }
+        let prefs = serde_json::json!({
+            "extensions": { "settings": { "abc": serde_json::Value::Object(entry) } }
+        });
+        std::fs::write(
+            profile.join("Secure Preferences"),
+            serde_json::to_string(&prefs).unwrap(),
+        )
+        .unwrap();
         root.to_path_buf()
     }
 
@@ -437,7 +505,11 @@ mod tests {
 
     #[test]
     fn shipped_version_matches_the_manifest() {
-        assert_eq!(shipped_version(), "0.1.4");
+        // 跟着 manifest.json 走，别写死版本号——每次给扩展升版都要改这里，
+        // 忘了改就是一条假失败。
+        let manifest = serde_json::from_str::<serde_json::Value>(MANIFEST).unwrap();
+        let expected = manifest.get("version").unwrap().as_str().unwrap();
+        assert_eq!(shipped_version(), expected);
     }
 
     #[test]
@@ -465,7 +537,8 @@ mod tests {
         let root = tmp.join("User Data");
         let ext_dir = tmp.join("idm-shadow-ext");
         std::fs::create_dir_all(&ext_dir).unwrap();
-        fake_user_data(&root, &ext_dir, "0.1.4");
+        let current = shipped_version();
+        fake_user_data(&root, &ext_dir, &current);
         for (name, bytes) in shipped_files() {
             std::fs::write(ext_dir.join(name), bytes).unwrap();
         }
@@ -473,6 +546,86 @@ mod tests {
         let found = scan_user_data(Browser::Edge, &root);
         assert_eq!(found.len(), 1);
         assert!(!found[0].stale);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_copy_the_browser_runs_as_old_is_stale_even_when_the_files_are_current() {
+        // 用户机器上真实遇到的坑：
+        //
+        //   磁盘上的文件是当前发布的（应用每次启动都会同步一遍），
+        //   浏览器注册的那个版本却是旧的——因为浏览器把已解压扩展的
+        //   注册信息缓存住了，文件换了它不重读。
+        //
+        // 结果就是扩展跑着旧代码：跨源 a[download] 接管那套逻辑
+        // 压根不存在，点下载一点反应都没有。而只看磁盘文件的话，
+        // 一切正常，界面上什么提示都不会有。
+        let tmp = std::env::temp_dir().join(format!("idm-shadow-scan-{}", uuid::Uuid::new_v4()));
+        let root = tmp.join("User Data");
+        let ext_dir = tmp.join("idm-shadow-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let current = shipped_version();
+        // 磁盘上是最新版。
+        fake_user_data_running(&root, &ext_dir, &current, Some("0.0.1"));
+        for (name, bytes) in shipped_files() {
+            std::fs::write(ext_dir.join(name), bytes).unwrap();
+        }
+
+        let found = scan_user_data(Browser::Edge, &root);
+        assert_eq!(found.len(), 1);
+        // 文件是新的，但浏览器跑的是旧的——必须报出来。
+        assert_eq!(found[0].version, current);
+        assert_eq!(found[0].running_version.as_deref(), Some("0.0.1"));
+        assert!(found[0].stale, "浏览器跑着旧代码时必须标成过期");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_copy_running_the_current_version_is_not_stale() {
+        let tmp = std::env::temp_dir().join(format!("idm-shadow-scan-{}", uuid::Uuid::new_v4()));
+        let root = tmp.join("User Data");
+        let ext_dir = tmp.join("idm-shadow-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let current = shipped_version();
+        fake_user_data_running(&root, &ext_dir, &current, Some(&current));
+        for (name, bytes) in shipped_files() {
+            std::fs::write(ext_dir.join(name), bytes).unwrap();
+        }
+
+        let found = scan_user_data(Browser::Edge, &root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].running_version.as_deref(), Some(current.as_str()));
+        assert!(!found[0].stale);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn the_user_machine_scenario_is_detected() {
+        // 用户机器上的真实情况：
+        //
+        //   磁盘上的文件是 0.1.4（应用每次启动都会同步一遍），
+        //   Edge 注册的却是 0.1.0。
+        //
+        // 旧扩展既没有跨源接管逻辑，也不发版本头——从扩展那边看，
+        // 它跟"没装"一模一样。这就是「点了下载一点反应都没有」
+        // 却查不出原因的原因。
+        let tmp = std::env::temp_dir().join(format!("idm-shadow-scan-{}", uuid::Uuid::new_v4()));
+        let root = tmp.join("User Data");
+        let ext_dir = tmp.join("idm-shadow-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let current = shipped_version();
+        fake_user_data_running(&root, &ext_dir, &current, Some("0.1.0"));
+        for (name, bytes) in shipped_files() {
+            std::fs::write(ext_dir.join(name), bytes).unwrap();
+        }
+
+        let found = scan_user_data(Browser::Edge, &root);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].stale, "浏览器跑着 0.1.0 必须被认出来");
+        assert_eq!(found[0].running_version.as_deref(), Some("0.1.0"));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -23,6 +23,12 @@ pub struct AppState {
     pub token: String,
     /// 浏览器扩展最近一次带着 token 调接口的时间，界面用它显示连接状态。
     pub extension_seen: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// 扩展最近一次自报的版本号。
+    ///
+    /// 浏览器会缓存已解压扩展的注册信息，磁盘文件换了新版它照样跑旧代码。
+    /// 靠这个版本号才能发现"跑着旧代码的扩展"——那和"扩展没装"是两回事，
+    /// 但对用户来说症状一样：点下载一点反应都没有。
+    pub extension_version: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// 应用数据目录：%APPDATA%\IDM Shadow
@@ -163,6 +169,10 @@ fn main() {
             // AppHandle 是 Send + Sync，能进 Arc 闭包；App 不是。
             let app_handle = app.handle().clone();
             let extension_seen = Arc::new(std::sync::Mutex::new(None));
+            let extension_version = Arc::new(std::sync::Mutex::new(None));
+            // 随包发布的扩展版本号。扩展拿它跟自己比的版本对一下，
+            // 就知道自己是不是旧版。
+            let shipped_extension_version = Arc::new(extension::shipped_version());
             let bridge_state = idm_shadow_bridge::BridgeState {
                 manager: manager.clone(),
                 token: Arc::new(token.clone()),
@@ -178,7 +188,17 @@ fn main() {
                     }
                 })),
                 extension_seen: extension_seen.clone(),
+                extension_version: extension_version.clone(),
+                shipped_extension_version: shipped_extension_version.clone(),
             };
+
+            // 扩展文件先落地，bridge 再开。
+            //
+            // 顺序反了会出事：扩展可能先从应用那儿问到"有新版"，
+            // 立刻把自己重载——那会儿文件还没写完，它重载起来还是旧代码，
+            // 然后又发现落后，又重载…… 变成个死循环。
+            extension::sync_on_startup();
+
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = idm_shadow_bridge::serve(bridge_state, port).await {
                     tracing::error!("bridge 启动失败: {err}");
@@ -197,11 +217,8 @@ fn main() {
                 bridge_port: port,
                 token: token.clone(),
                 extension_seen,
+                extension_version,
             });
-
-            // 扩展是编译进 exe 的，安装后直接释放到固定目录；
-            // 升级时这里把旧副本覆盖成新版本。
-            extension::sync_on_startup();
 
             // 调度器：定期把排队里的任务捞起来
             let scheduler = manager.clone();

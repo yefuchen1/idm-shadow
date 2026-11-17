@@ -201,10 +201,12 @@ export default function App() {
     };
   }, [refresh]);
 
-  // 设置面板开着的时候轮询扩展状态：用户去浏览器里点完
-  // "加载已解压的扩展程序"，回来就能看到变成"已连接"。
+  // 轮询扩展状态。
+  //
+  // 一直轮询，不只是设置面板开着的时候——浏览器里跑的扩展是不是旧版，
+  // 主界面也得能提示。那个提示是用户能不能发现问题的关键：
+  // 症状是"点了下载一点反应都没有"，不主动说，用户只会觉得软件坏了。
   useEffect(() => {
-    if (!showSettings) return;
     let alive = true;
     const tick = () => {
       api
@@ -220,7 +222,7 @@ export default function App() {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [showSettings]);
+  }, []);
 
   const totals = useMemo(() => {
     let speed = 0;
@@ -690,7 +692,9 @@ export default function App() {
                   )}
                   <span className="unit">
                     {extension.connected
-                      ? "浏览器下载会交给 IDM Shadow"
+                      ? extension.stale
+                        ? `扩展是旧版（v${extension.running_version}），点一次「重新加载」才会更新`
+                        : "浏览器下载会交给 IDM Shadow"
                       : extension.installed
                         ? "扩展已释放，还需要在浏览器里启用"
                         : "需要先在浏览器里加载扩展"}
@@ -712,14 +716,16 @@ export default function App() {
                       {c.browser_label} · {c.profile}
                     </span>
                     <code className="extension-dir">{c.path}</code>
-                    <span className="unit">v{c.version}</span>
+                    <span className="unit">
+                      v{c.running_version ?? c.version}
+                    </span>
                   </div>
                 ))}
                 {extension.copies?.filter((c) => c.stale).map((c) => (
                   <div className="extension-line warn" key={`warn-${c.browser}-${c.profile}-${c.path}`}>
                     <AlertTriangle size={13} />
                     <span>
-                      {c.browser_label} 里跑的是 {c.version} 版旧代码，
+                      {c.browser_label} 里跑的是 {c.running_version ?? c.version} 版旧代码，
                       在扩展管理页点一下「重新加载」才会更新
                     </span>
                     <button
@@ -921,6 +927,25 @@ export default function App() {
       </div>
 
       <div className="list">
+        {extension?.stale && (
+          <div className="warn-banner">
+            <AlertTriangle size={15} />
+            <div className="warn-banner-text">
+              <strong>浏览器里跑的是旧版扩展（v{extension.running_version}）</strong>
+              <span>
+                旧版接管不到跨源下载链接，点下载会一点反应都没有。
+                在扩展管理页点一下「重新加载」就会更新。
+              </span>
+            </div>
+            <button
+              className="btn small"
+              onClick={() => setShowSettings(true)}
+              title="打开设置，去扩展管理页重新加载"
+            >
+              去处理
+            </button>
+          </div>
+        )}
         {updateInfo && (
           <div className="update-banner">
             <div className="update-banner-text">

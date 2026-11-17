@@ -25,6 +25,35 @@ const IMAGE_EXT = /\.(jpe?g|png|gif|webp|bmp|svg|avif|ico|tiff?)$/i;
 const CLIENT_HEADER = 'X-IDM-Shadow-Client';
 const CLIENT_VALUE = 'extension';
 
+// 扩展自己的版本号。
+//
+// 用 manifest 里的版本号，而不是文件 mtime 之类的旁证——
+// 这个值就是浏览器实际在跑的那份代码的版本。
+function extensionVersion() {
+  try {
+    const manifest = chrome.runtime.getManifest();
+    return (manifest && manifest.version) || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// 请求头里带上扩展版本。
+//
+// 关键用途：浏览器会缓存已解压扩展的注册信息——磁盘上的文件换了新版，
+// 浏览器照样跑着旧代码，而且旧代码根本不发这个头。那时候应用这边
+// 看到的就是"扩展没连上"，用户看到的是"点了下载一点反应都没有"。
+// 带上版本号，应用就能把"扩展是旧版"和"扩展没装"区分开。
+function clientHeaders(extra) {
+  return Object.assign(
+    {
+      [CLIENT_HEADER]: CLIENT_VALUE,
+      'X-IDM-Shadow-Version': extensionVersion()
+    },
+    extra || {}
+  );
+}
+
 // 只取文件名，不要路径。
 //
 // Chrome 的 downloads.onCreated 给的 item.filename 是完整路径
@@ -93,11 +122,10 @@ async function renameTask(taskId, filename) {
   try {
     await fetch(apiUrl(`/api/v1/tasks/${taskId}`, s), {
       method: 'PATCH',
-      headers: {
+      headers: clientHeaders({
         'Content-Type': 'application/json',
-        'X-IDM-Shadow-Token': s.token,
-        [CLIENT_HEADER]: CLIENT_VALUE
-      },
+        'X-IDM-Shadow-Token': s.token
+      }),
       body: JSON.stringify({ filename })
     });
   } catch (err) {
@@ -234,14 +262,78 @@ async function syncWithApp() {
   if (!s.token) return;
   try {
     const resp = await fetch(apiUrl('/api/v1/settings', s), {
-      headers: { 'X-IDM-Shadow-Token': s.token, [CLIENT_HEADER]: CLIENT_VALUE }
+      headers: clientHeaders({ 'X-IDM-Shadow-Token': s.token })
     });
     if (!resp.ok) return;
     const body = await resp.json();
     followAppMode = Boolean(body.default_download_tool);
+    await reloadIfOutdated(body.shipped_extension_version);
   } catch (err) {
     // 应用没开就保持原样
   }
+}
+
+/// 桌面应用带的扩展比我现在这版新，就把自己重载一下。
+///
+/// 为什么需要这个：浏览器把已解压扩展的注册信息缓存住了。应用每次启动
+/// 都会把新版的扩展文件写进用户实际加载的那个目录，但浏览器照样跑着
+/// 旧代码——于是跨源下载接管那套逻辑压根不存在，用户点下载一点反应都没有。
+///
+/// 以前这件事只能靠用户自己知道要去扩展管理页点「重新加载」。那是个
+/// 没人会主动去做的动作，症状又是"点了下载没反应"这种说不清的现象，
+/// 于是用户只会觉得软件坏了。
+///
+/// 这里让扩展自己发现版本落后，然后自己重载：文件已经是新的了，
+/// 重载一下就等于点了一次「重新加载」。
+async function reloadIfOutdated(shippedVersion) {
+  if (!shippedVersion) return;
+  const mine = extensionVersion();
+  if (!mine) return;
+  // 只有"我比应用旧"才重载。
+  //
+  // 版本号相等不用管；我比应用新（比如用户先手动装了个更新的扩展）
+  // 也不能管——那会让扩展反复把自己降级回去。
+  if (compareVersions(mine, shippedVersion) >= 0) return;
+
+  // 十分钟内只试一次。
+  //
+  // 这个时间戳必须存在 storage 里，不能放模块变量——重载会把整个
+  // service worker 重来一遍，模块变量也跟着清零。放内存里的话，
+  // "重载了也没生效"就会变成不停重启扩展的死循环，比不更新还糟糕。
+  const now = Date.now();
+  const stored = await chrome.storage.local.get({ lastReloadAttempt: 0 });
+  const last = stored.lastReloadAttempt || 0;
+  if (now - last < 10 * 60 * 1000) return;
+  await chrome.storage.local.set({ lastReloadAttempt: now });
+
+  console.log(
+    `[IDM Shadow] 扩展是旧版（${mine} -> ${shippedVersion}），重新加载`
+  );
+  try {
+    chrome.runtime.reload();
+  } catch (err) {
+    console.warn('[IDM Shadow] 自动重新加载失败', err);
+  }
+}
+
+/// 比两个点分版本号。
+///
+/// 返回负数表示 a 比 b 老，0 表示一样，正数表示 a 更新。
+/// 不是数字的部分按字符串比——版本号格式万一变了，也比"一律当成相等"
+/// 要好：最坏的结果是不重载，而不会陷入重载循环。
+function compareVersions(a, b) {
+  const pa = String(a || '').split('.');
+  const pb = String(b || '').split('.');
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const na = parseInt(pa[i], 10);
+    const nb = parseInt(pb[i], 10);
+    const va = Number.isNaN(na) ? (pa[i] || '') : na;
+    const vb = Number.isNaN(nb) ? (pb[i] || '') : nb;
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+  }
+  return 0;
 }
 
 async function saveSettings(patch) {
@@ -279,11 +371,10 @@ async function createTask(payload) {
   const s = await settings();
   const resp = await fetch(apiUrl('/api/v1/tasks', s), {
     method: 'POST',
-    headers: {
+    headers: clientHeaders({
       'Content-Type': 'application/json',
-      'X-IDM-Shadow-Token': s.token,
-      [CLIENT_HEADER]: CLIENT_VALUE
-    },
+      'X-IDM-Shadow-Token': s.token
+    }),
     body: JSON.stringify(payload)
   });
   if (!resp.ok) {
@@ -536,7 +627,7 @@ async function updateBadge() {
   }
   try {
     const resp = await fetch(apiUrl('/api/v1/tasks', s), {
-      headers: { 'X-IDM-Shadow-Token': s.token, [CLIENT_HEADER]: CLIENT_VALUE }
+      headers: clientHeaders({ 'X-IDM-Shadow-Token': s.token })
     });
     if (!resp.ok) throw new Error('bad status');
     const body = await resp.json();
@@ -590,7 +681,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     settings()
       .then((s) =>
         fetch(apiUrl('/api/v1/tasks', s), {
-          headers: { 'X-IDM-Shadow-Token': s.token, [CLIENT_HEADER]: CLIENT_VALUE }
+          headers: clientHeaders({ 'X-IDM-Shadow-Token': s.token })
         })
       )
       .then((r) => r.json())

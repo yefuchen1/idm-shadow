@@ -185,6 +185,16 @@ pub struct ExtensionStatus {
     pub browsers: Vec<BrowserDto>,
     /// 应用随包发布的扩展版本。
     pub version: String,
+    /// 浏览器里实际在跑的扩展版本。
+    ///
+    /// 扩展自己报上来的；扩展是老版本（不会自报）时，退回用浏览器
+    /// 注册信息里记的版本。
+    pub running_version: Option<String>,
+    /// 浏览器跑的是不是旧代码。
+    ///
+    /// 两路信号取并集：扩展自报的版本对不上，
+    /// 或者浏览器注册信息里记的版本对不上。
+    pub stale: bool,
     /// 浏览器里实际加载的扩展副本。
     ///
     /// 用户常常加载的不是这个目录，而是当初手抄的一份。浏览器会缓存
@@ -210,12 +220,50 @@ pub struct ExtensionCopyDto {
     pub profile: String,
     pub path: String,
     pub version: String,
+    /// 浏览器实际在跑的版本。读不到就是 None。
+    pub running_version: Option<String>,
     /// 文件和当前发布的对不上——浏览器跑的是旧代码。
     pub stale: bool,
 }
 
 fn inspect_extension(state: &AppState) -> ExtensionStatus {
     let dir = crate::extension::extension_dir();
+    let shipped = crate::extension::shipped_version();
+    let copies = crate::extension::loaded_copies_cached()
+        .into_iter()
+        .map(|c| ExtensionCopyDto {
+            browser: c.browser,
+            browser_label: c.browser_label,
+            profile: c.profile,
+            path: c.path,
+            version: c.version,
+            running_version: c.running_version,
+            stale: c.stale,
+        })
+        .collect::<Vec<_>>();
+
+    // 扩展自报是不是旧版。
+    //
+    // 但光靠这个不够：老版本扩展压根不发版本号（它没这段代码），
+    // 于是自报这一路永远是"没连上"。而浏览器注册信息里记着它跑的是
+    // 哪一版——那个读得到，也才是真正能认出"跑着旧代码"的地方。
+    //
+    // 两路信号取并集：任一路说旧，就是旧。
+    let self_reported_stale =
+        idm_shadow_bridge::extension_is_stale(&state.extension_version, &shipped);
+    let copy_stale = copies.iter().any(|c| c.stale);
+    let stale = self_reported_stale.unwrap_or(false) || copy_stale;
+
+    // 显示用的版本号：优先用扩展自报的（最准），没有就用浏览器注册的那个。
+    let running_version = idm_shadow_bridge::extension_version(&state.extension_version)
+        .or_else(|| {
+            copies
+                .iter()
+                .find(|c| c.stale)
+                .and_then(|c| c.running_version.clone())
+        })
+        .or_else(|| copies.first().and_then(|c| c.running_version.clone()));
+
     ExtensionStatus {
         dir: dir
             .as_ref()
@@ -223,18 +271,10 @@ fn inspect_extension(state: &AppState) -> ExtensionStatus {
             .unwrap_or_default(),
         installed: dir.as_ref().map(|d| d.is_dir()).unwrap_or(false),
         connected: idm_shadow_bridge::extension_connected(&state.extension_seen),
-        version: crate::extension::shipped_version(),
-        copies: crate::extension::loaded_copies_cached()
-            .into_iter()
-            .map(|c| ExtensionCopyDto {
-                browser: c.browser,
-                browser_label: c.browser_label,
-                profile: c.profile,
-                path: c.path,
-                version: c.version,
-                stale: c.stale,
-            })
-            .collect(),
+        version: shipped.clone(),
+        running_version,
+        stale,
+        copies,
         browsers: crate::extension::installed_browsers()
             .into_iter()
             .map(|b| BrowserDto {

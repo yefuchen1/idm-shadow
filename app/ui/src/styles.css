@@ -553,6 +553,32 @@ body {
   word-break: break-word;
 }
 
+.warn-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  background: #fdf3e7;
+  border: 1px solid #f0d3ae;
+  border-radius: var(--radius);
+  color: #8a5a1a;
+}
+
+.warn-banner-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.warn-banner-text span {
+  color: #7a5a2e;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .search-row {
   padding: 8px 16px 0;
 }

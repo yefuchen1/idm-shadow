@@ -90,6 +90,10 @@ export interface ExtensionStatus {
   browsers: { id: string; label: string; page: string }[];
   /** 应用随包发布的扩展版本。 */
   version: string;
+  /** 浏览器里实际在跑的扩展版本。扩展自己报上来的。 */
+  running_version: string | null;
+  /** 浏览器跑的是不是旧代码。 */
+  stale: boolean;
   /** 浏览器里实际加载的扩展副本。 */
   copies: ExtensionCopy[];
 }
@@ -101,8 +105,10 @@ export interface ExtensionCopy {
   profile: string;
   /** 扩展目录。 */
   path: string;
-  /** 那份副本自己的版本号。 */
+  /** 那份副本在磁盘上的版本号。 */
   version: string;
+  /** 浏览器实际在跑的版本。读不到就是 null。 */
+  running_version: string | null;
   /** 浏览器跑的是旧代码——点一次「重新加载」才生效。 */
   stale: boolean;
 }

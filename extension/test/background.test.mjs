@@ -12,7 +12,7 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const calls = { fetch: [], downloads: [], notifications: [], tabs: [] };
+const calls = { fetch: [], downloads: [], notifications: [], tabs: [], reload: [] };
 let storage = {
   bridgeUrl: 'http://127.0.0.1:16888',
   token: 'test-token',
@@ -82,6 +82,12 @@ const chrome = {
     onStartup: { addListener: (fn) => (listeners.onStartup = fn) },
     onMessage: { addListener: (fn) => (listeners.onMessage = fn) },
     getURL: (p) => `chrome-extension://test-id/${p}`,
+    // 扩展从这儿知道自己跑的是哪一版。
+    getManifest: () => ({ version: '0.1.5' }),
+    // 自动更新用：把自己重载一遍。
+    reload: () => {
+      calls.reload.push(true);
+    },
     sendMessage: () => {},
     lastError: null
   },
@@ -110,7 +116,7 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, reloadIfOutdated, compareVersions, extensionVersion };`
 );
 
 const fetchCalls = [];
@@ -515,6 +521,67 @@ await test('自动配置：应用没在跑时不乱改已有配置', async () =>
   assert.equal(storage.token, 'manual-token', '不该把已有 token 冲掉');
 
   bootstrapResponse = { port: 16888, token: 'auto-found-token' };
+});
+
+await test('请求会带上扩展自己的版本号', async () => {
+  // 应用要靠这个版本号认出"浏览器跑着旧代码的扩展"。
+  //
+  // 浏览器把已解压扩展的注册信息缓存住了：磁盘上的文件换了新版，
+  // 浏览器照样跑旧代码。而旧代码压根不发 X-IDM-Shadow-Client 头，
+  // 应用那边就只看到"扩展没连上"——和"扩展没装"没法区分。
+  // 带上版本号之后，应用就能直接告诉用户该去点「重新加载」。
+  fetchCalls.length = 0;
+  await api.capture({
+    id: 91,
+    url: 'https://example.com/versioned.bin',
+    filename: 'versioned.bin'
+  });
+
+  const posted = fetchCalls.find(
+    (c) => c.options.method === 'POST' && c.url.endsWith('/api/v1/tasks')
+  );
+  assert.ok(posted, '应该把下载投给了应用');
+  assert.equal(posted.options.headers['X-IDM-Shadow-Client'], 'extension');
+  assert.equal(posted.options.headers['X-IDM-Shadow-Version'], '0.1.5');
+});
+
+await test('版本号比较：只认"我更旧"', async () => {
+  assert.equal(api.compareVersions('0.1.4', '0.1.5'), -1);
+  assert.equal(api.compareVersions('0.1.5', '0.1.5'), 0);
+  assert.equal(api.compareVersions('0.1.6', '0.1.5'), 1);
+  assert.equal(api.compareVersions('0.2.0', '0.1.9'), 1);
+  assert.equal(api.compareVersions('0.1.4', '0.1.5.1'), -1);
+});
+
+await test('比应用旧就自己重载一次', async () => {
+  // 浏览器把已解压扩展的注册信息缓存住了：文件换了新版，浏览器照样跑
+  // 旧代码。以前只能靠用户知道要去扩展管理页点「重新加载」——
+  // 没人会主动做这个动作，症状又只是"点了下载没反应"。
+  // 扩展自己发现自己落后，就该把自己重载。
+  calls.reload.length = 0;
+  storage.lastReloadAttempt = 0;
+
+  await api.reloadIfOutdated('0.1.5');
+  assert.equal(calls.reload.length, 0, '版本一样不该重载');
+
+  await api.reloadIfOutdated('0.9.0');
+  assert.equal(calls.reload.length, 1, '比应用旧就该重载');
+});
+
+await test('不会把自己降级，也不会重载成死循环', async () => {
+  calls.reload.length = 0;
+  storage.lastReloadAttempt = 0;
+
+  // 用户自己装了个更新的扩展——不能把它降回去。
+  await api.reloadIfOutdated('0.1.0');
+  assert.equal(calls.reload.length, 0, '自己比应用新就不该动');
+
+  // 重载了也没生效时（文件还是旧的），十分钟内不再重载。
+  // 不加这个限制就是个不停重启扩展的死循环，比不更新还糟糕。
+  calls.reload.length = 0;
+  storage.lastReloadAttempt = Date.now();
+  await api.reloadIfOutdated('0.9.0');
+  assert.equal(calls.reload.length, 0, '十分钟内不该重复重载');
 });
 
 await test('自动配置：优先用已经配好的那个实例', async () => {

@@ -104,7 +104,15 @@ async function showAppWindow() {
       headers: {
         'X-IDM-Shadow-Token': s.token,
         // 让应用知道扩展还活着（设置页显示连接状态）
-        'X-IDM-Shadow-Client': 'extension'
+        'X-IDM-Shadow-Client': 'extension',
+        // 顺便报一下版本：应用要靠它区分"扩展没装"和"跑着旧代码的扩展"。
+        'X-IDM-Shadow-Version': (() => {
+          try {
+            return (chrome.runtime.getManifest() || {}).version || '';
+          } catch (err) {
+            return '';
+          }
+        })()
       }
     });
   } catch (err) {

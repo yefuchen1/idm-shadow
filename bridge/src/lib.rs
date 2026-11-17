@@ -28,6 +28,15 @@ pub const TOKEN_HEADER: &str = "x-idm-shadow-token";
 /// 光看进程/浏览器版本判断不了：扩展没启用、被禁用、被删掉，
 /// 应用这边都看不出来。让扩展自报身份最省事。
 pub const CLIENT_HEADER: &str = "x-idm-shadow-client";
+/// 扩展自报自己的版本号。
+///
+/// 浏览器会缓存已解压扩展的注册信息：磁盘上的文件换了新版，浏览器
+/// 照样跑着旧代码。旧代码连 `CLIENT_HEADER` 都不发，所以光看"连没连上"
+/// 分不清"扩展没装"和"跑着旧代码的扩展"——而这两者的症状对用户来说
+/// 是一样的：点下载一点反应都没有。
+///
+/// 有了版本号，应用就能明确告诉用户该去点「重新加载」。
+pub const VERSION_HEADER: &str = "x-idm-shadow-version";
 
 #[derive(Clone)]
 pub struct BridgeState {
@@ -44,6 +53,16 @@ pub struct BridgeState {
     /// 界面用它显示"已连接 / 未连接"。用 `Instant` 而不是时间戳，
     /// 免得用户改系统时间把状态搞乱。
     pub extension_seen: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// 扩展最近一次自报的版本号。
+    ///
+    /// 老版本扩展不发这个头，这里就是 None——那本身就是个信号：
+    /// 跑的是旧代码。
+    pub extension_version: Arc<std::sync::Mutex<Option<String>>>,
+    /// 应用随包发布的扩展版本号。
+    ///
+    /// 扩展拿它跟自己报的版本比一下，就知道自己是不是旧版，
+    /// 可以在界面上提醒用户去点「重新加载」。
+    pub shipped_extension_version: Arc<String>,
 }
 
 /// 统一错误响应。
@@ -302,6 +321,18 @@ async fn auth_middleware(
                 if let Ok(mut slot) = state.extension_seen.lock() {
                     *slot = Some(std::time::Instant::now());
                 }
+                // 顺便记下扩展自报的版本。
+                //
+                // 旧版扩展不发这个头，留着上一次的旧值也没意义——
+                // 那时候跑的就是旧代码。记成 None 才对。
+                if let Ok(mut slot) = state.extension_version.lock() {
+                    *slot = headers
+                        .get(VERSION_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string);
+                }
             }
             next.run(request).await
         }
@@ -345,6 +376,26 @@ pub fn extension_connected(
         .and_then(|slot| *slot)
         .map(|at| at.elapsed() < std::time::Duration::from_secs(180))
         .unwrap_or(false)
+}
+
+/// 扩展最近自报的版本号。
+pub fn extension_version(version: &std::sync::Mutex<Option<String>>) -> Option<String> {
+    version.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// 扩展是不是跑着旧代码。
+///
+/// 返回 `None` 表示扩展没连上——那不是"旧版"，是"没在跑"，
+/// 界面要提示的话得换个说法。
+pub fn extension_is_stale(
+    version: &std::sync::Mutex<Option<String>>,
+    shipped: &str,
+) -> Option<bool> {
+    let reported = extension_version(version)?;
+    if reported.is_empty() || shipped.is_empty() {
+        return None;
+    }
+    Some(reported != shipped)
 }
 
 /// 构造路由。
@@ -406,6 +457,11 @@ async fn health(State(state): State<BridgeState>) -> Json<Value> {
         // 浏览器扩展是不是还在连着。不涉及 token，健康检查
         // 本来就不需要鉴权，这里也不多暴露什么。
         "extension_connected": extension_connected(&state.extension_seen),
+        // 扩展自报的版本，和随包发布的版本。
+        //
+        // 两个都有才说明是"跑着旧代码"；扩展没连上时都是空的。
+        "extension_version": extension_version(&state.extension_version),
+        "shipped_extension_version": state.shipped_extension_version.as_str(),
     }))
 }
 
@@ -693,6 +749,9 @@ async fn get_settings(State(state): State<BridgeState>) -> Result<Json<Value>, A
         "max_concurrent_tasks": state.manager.max_concurrent_tasks().await,
         "default_download_tool": is_default_download_tool(&state.manager),
         "auto_start": is_auto_start_setting(&state.manager),
+        // 扩展自报的版本。跟随包版本对不上就说明浏览器跑的是旧代码。
+        "extension_version": extension_version(&state.extension_version),
+        "shipped_extension_version": state.shipped_extension_version.as_str(),
         "settings": settings,
     })))
 }
@@ -928,5 +987,27 @@ mod tests {
             axum::http::HeaderValue::from_static("chrome-extension://abc"),
         );
         assert!(is_extension_client(&headers));
+    }
+
+    #[test]
+    fn extension_version_is_recorded_and_compared() {
+        let version = std::sync::Mutex::new(None);
+
+        // 没连上的时候没有版本——那是"没启用"，不是"旧版"。
+        assert_eq!(extension_version(&version), None);
+        assert_eq!(extension_is_stale(&version, "0.1.4"), None);
+
+        // 连上了，版本跟随包发布的对得上。
+        *version.lock().unwrap() = Some("0.1.4".to_string());
+        assert_eq!(extension_version(&version).as_deref(), Some("0.1.4"));
+        assert_eq!(extension_is_stale(&version, "0.1.4"), Some(false));
+
+        // 浏览器缓存了旧代码：报的版本比随包发布的旧。
+        *version.lock().unwrap() = Some("0.1.0".to_string());
+        assert_eq!(extension_is_stale(&version, "0.1.4"), Some(true));
+
+        // 空版本号不算数（老扩展压根不发这个头）。
+        *version.lock().unwrap() = Some(String::new());
+        assert_eq!(extension_is_stale(&version, "0.1.4"), None);
     }
 }
