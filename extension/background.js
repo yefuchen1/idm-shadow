@@ -158,6 +158,17 @@ const CANDIDATE_PORTS = [16888, 16889, 16890, 16891, 16892, 16893, 16894, 16895]
  * 不会削弱 token 挡住"网站乱塞下载任务"的作用。
  */
 async function discoverApp() {
+  // 已经配好的地址先试。
+  //
+  // 这一步很要紧：机器上可能同时跑着好几个 IDM Shadow 实例
+  // （开发时、测试时、自动化脚本都会各起一个）。以前只按端口从小到大扫，
+  // 扫到的第一个是谁全看运气——用户明明装的是另一个实例，扩展却连上了
+  // 别人家那个，任务就投到不该投的地方去了。
+  //
+  // 用户手动配过的地址优先，这个才合乎直觉。
+  const configured = await configuredBridge();
+  if (configured) return configured;
+
   for (const port of CANDIDATE_PORTS) {
     const base = `http://127.0.0.1:${port}`;
     try {
@@ -171,6 +182,24 @@ async function discoverApp() {
     }
   }
   return null;
+}
+
+/// 已经配好的那个应用还活着吗？活着就还用它。
+async function configuredBridge() {
+  const s = await settings();
+  if (!s.bridgeUrl || !s.token) return null;
+  try {
+    const resp = await fetch(`${s.bridgeUrl}/api/v1/bootstrap`, { method: 'GET' });
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    if (!body || !body.token) return null;
+    // token 对不上说明那边换了新实例，就当没配过。
+    if (body.token !== s.token) return null;
+    return { bridgeUrl: s.bridgeUrl, token: s.token };
+  } catch (err) {
+    // 连不上就是没配好，退回扫端口。
+    return null;
+  }
 }
 
 // 自动配置：找到应用就把地址和 token 填上。

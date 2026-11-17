@@ -154,6 +154,40 @@ async function listTasks() {
   return body.tasks || [];
 }
 
+/// 别的实例（用户自己装的那个）里有没有出现本次测试的任务。
+///
+/// 认得出来的特征：URL 指向本次测试的服务器端口。
+/// 只查任务，不改任何东西——那是用户的数据。
+async function findForeignTask() {
+  for (const port of [16888, 16889, 16891, 16892, 16893, 16894, 16895]) {
+    if (port === PORT) continue;
+    let body;
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/api/v1/bootstrap`, {
+        method: 'GET'
+      });
+      if (!resp.ok) continue;
+      const boot = await resp.json();
+      if (!boot || !boot.token) continue;
+      const resp2 = await fetch(`http://127.0.0.1:${port}/api/v1/tasks`, {
+        headers: { 'X-IDM-Shadow-Token': boot.token }
+      });
+      if (!resp2.ok) continue;
+      body = await resp2.json();
+    } catch (err) {
+      // 这个端口没有应用
+      continue;
+    }
+    const hit = (body.tasks || []).find(
+      (t) =>
+        t.url && t.url.includes(`:${SERVER_PORT}/`) &&
+        !t.url.includes(`:${PAGE_PORT}/`)
+    );
+    if (hit) return hit;
+  }
+  return null;
+}
+
 // 确认连到的是测试自己启的那个实例。
 // 应用是单实例的，端口上要是坐着别的东西（哪怕 token 碰巧对得上），
 // 后面"扩展没投进来"这种报错会让人查错方向。
@@ -287,7 +321,11 @@ try {
 
   // 「自动配置」按钮：装好扩展后不用手抄 token。
   // 顺带验证引导接口在真实浏览器里能通（Origin 是扩展 origin）。
-  await optPage.fill('#token', '');
+  //
+  // 注意别把 token 清空再点：清空之后扩展只能靠扫端口找应用，
+  // 而机器上用户自己装的那个实例就占着默认端口——扫到的第一个是它，
+  // 不是测试这个。测试会把 token 写进用户的实例里。
+  // 从零开始扫端口的路径由单元测试覆盖。
   await optPage.click('#auto');
   await optPage.waitForFunction(
     () => document.getElementById('autoMsg').textContent.includes('配置好了'),
@@ -297,15 +335,18 @@ try {
   check('自动配置能找到应用并填好 token', autoMsg.includes('配置好了'), autoMsg);
 
   // 切回 auto 模式继续测接管。
-  //
-  // 注意：上一步"自动配置"会把扩展指向**第一个**能应答的端口。
-  // 机器上如果还装着 IDM Shadow，它占着 16888，扩展就被指到那个
-  // 已安装的实例上去了（token 对不上），后面的接管全都测不到。
-  // 所以这里明确指回测试自己的实例。
   await optPage.fill('#bridgeUrl', `http://127.0.0.1:${PORT}`);
   await optPage.fill('#token', TOKEN);
   await optPage.selectOption('#mode', 'auto');
   await optPage.click('#save');
+
+  // 确认扩展真的连的是测试这个实例。
+  // 连错了的话，任务会投到用户自己装的那个应用里去——既测不到东西，
+  // 又污染用户的任务列表。
+  const bridgedUrl = await optPage.inputValue('#bridgeUrl');
+  check('扩展连的是测试自己的实例',
+    bridgedUrl === `http://127.0.0.1:${PORT}`,
+    bridgedUrl);
 
   const before = await listTasks();
 
@@ -503,6 +544,16 @@ try {
   const afterOff = await listTasks();
   check('off 模式不会自动接管', afterOff.length === beforeOff.length,
     `${beforeOff.length} -> ${afterOff.length}`);
+
+  // 最后确认：测试全程没往别的实例投任务。
+  //
+  // 机器上常常还装着用户自己的 IDM Shadow（占着默认端口）。
+  // 扩展要是连错了实例，任务就会跑到用户那边去——既污染用户的
+  // 任务列表，也意味着这个测试根本没测到该测的东西。
+  const foreignTask = await findForeignTask();
+  check('测试没有把任务投到别的实例',
+    foreignTask === null,
+    foreignTask ? `发现任务: ${foreignTask.url}` : '');
 
   // popup 的「打开主界面」不该开出标签页。
   //

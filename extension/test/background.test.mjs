@@ -117,6 +117,8 @@ const fetchCalls = [];
 let settingsResponse = { default_download_tool: false };
 // 引导接口的响应，null 表示"这个端口没有应用"
 let bootstrapResponse = { port: 16888, token: 'auto-found-token' };
+// 按端口配置引导接口的响应。null = 整个引导接口都不通。
+let bootstrapResponsesByPort = null;
 // 让接下来的 N 次任务投递返回 401，用来模拟 token 过期/应用换端口。
 let rejectPosts = 0;
 const fakeFetch = async (url, options = {}) => {
@@ -124,6 +126,29 @@ const fakeFetch = async (url, options = {}) => {
   if (url.endsWith('/api/v1/bootstrap')) {
     if (!bootstrapResponse) {
       throw new Error('连接被拒绝');
+    }
+    // 每个端口给各自的 token——真实的机器上跑着好几个实例时，
+    // 每个实例的 token 都不一样。
+    const port = Number(new URL(url).port);
+    if (bootstrapResponsesByPort) {
+      const forPort = bootstrapResponsesByPort[port];
+      if (!forPort) {
+        throw new Error('连接被拒绝');
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => forPort,
+        text: async () => ''
+      };
+    }
+    if (port && port !== 16888) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ port, token: `token-for-${port}` }),
+        text: async () => ''
+      };
     }
     return {
       ok: true,
@@ -490,6 +515,47 @@ await test('自动配置：应用没在跑时不乱改已有配置', async () =>
   assert.equal(storage.token, 'manual-token', '不该把已有 token 冲掉');
 
   bootstrapResponse = { port: 16888, token: 'auto-found-token' };
+});
+
+await test('自动配置：优先用已经配好的那个实例', async () => {
+  // 机器上可能同时跑着好几个 IDM Shadow（开发、测试都会各起一个）。
+  // 以前只按端口从小到大扫，扫到的第一个是谁全看运气——
+  // 用户明明配的是另一个实例，扩展却连上了别人家那个，
+  // 任务就投到不该投的地方去了。
+  storage.bridgeUrl = 'http://127.0.0.1:16890';
+  storage.token = 'configured-token';
+  bootstrapResponsesByPort = {
+    16888: { port: 16888, token: 'token-for-16888' },
+    16890: { port: 16890, token: 'configured-token' }
+  };
+
+  const found = await api.discoverApp();
+  assert.ok(found, '应该找到应用');
+  assert.equal(
+    found.bridgeUrl,
+    'http://127.0.0.1:16890',
+    '已经配好的地址应该优先，不要被扫端口的结果覆盖'
+  );
+  assert.equal(found.token, 'configured-token');
+  bootstrapResponsesByPort = null;
+});
+
+await test('自动配置：配好的那个没了才退回扫端口', async () => {
+  // 配好的实例已经关了（应用重装、端口被占），这时才该去找新的。
+  storage.bridgeUrl = 'http://127.0.0.1:16899';
+  storage.token = 'configured-token';
+  bootstrapResponsesByPort = {
+    16888: { port: 16888, token: 'token-for-16888' },
+    16890: { port: 16890, token: 'token-for-16890' }
+  };
+
+  const found = await api.discoverApp();
+  assert.ok(found, '应该找到别的实例');
+  assert.equal(found.bridgeUrl, 'http://127.0.0.1:16888');
+  assert.equal(found.token, 'token-for-16888');
+
+  storage.bridgeUrl = 'http://127.0.0.1:16888';
+  bootstrapResponsesByPort = null;
 });
 
 await test('token 过期时自动重新配置，再投一次就成功', async () => {

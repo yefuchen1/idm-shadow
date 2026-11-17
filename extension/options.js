@@ -3,7 +3,29 @@ const $ = (id) => document.getElementById(id);
 // 和后台脚本一样的发现逻辑：依次试几个端口，问应用要地址和 token。
 const CANDIDATE_PORTS = [16888, 16889, 16890, 16891, 16892, 16893, 16894, 16895];
 
+/// 已经配好的地址先试。
+///
+/// 机器上可能同时跑着好几个 IDM Shadow 实例（开发、测试、自动化脚本
+/// 都会各起一个）。只按端口从小到大扫的话，扫到谁全看运气——
+/// 用户装的是另一个实例，扩展却连上了别人家那个。
+async function configuredBridge() {
+  const stored = await chrome.storage.local.get({ bridgeUrl: '', token: '' });
+  if (!stored.bridgeUrl || !stored.token) return null;
+  try {
+    const resp = await fetch(`${stored.bridgeUrl}/api/v1/bootstrap`, { method: 'GET' });
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    if (!body || !body.token || body.token !== stored.token) return null;
+    return { bridgeUrl: stored.bridgeUrl, token: stored.token };
+  } catch (err) {
+    return null;
+  }
+}
+
 async function discoverApp() {
+  const configured = await configuredBridge();
+  if (configured) return configured;
+
   for (const port of CANDIDATE_PORTS) {
     const base = `http://127.0.0.1:${port}`;
     try {
