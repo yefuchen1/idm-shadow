@@ -784,6 +784,15 @@ pub fn is_auto_start_setting(manager: &DownloadManager) -> bool {
 /// 每次启动都跑一遍：值改了要跟着改，exe 换目录要重写路径，
 /// 注册表被安全软件清掉也要能自愈。
 pub fn reconcile_auto_start(manager: &DownloadManager) {
+    // 隔离实例（自动化测试）不去碰共享的注册表启动项。
+    //
+    // 测试实例自己的数据库里没有开机自启设置，一对账就会把用户
+    // 真正的启动项删掉——跑一次测试，用户开机自启就没了。
+    if system::is_isolated_instance() {
+        tracing::debug!("隔离实例，跳过开机自启对账");
+        return;
+    }
+
     let Some(exe) = system::current_exe() else {
         tracing::warn!("拿不到程序自身路径，跳过开机自启对账");
         return;
@@ -809,6 +818,15 @@ pub fn reconcile_auto_start(manager: &DownloadManager) {
 /// 注册表写失败要回滚数据库里的值，否则界面显示"已开启"、
 /// 实际重启不会启动，就是这个项目踩过的坑。
 pub fn set_auto_start_setting(manager: &DownloadManager, enabled: bool) -> anyhow::Result<()> {
+    // 同上：隔离实例不写共享的注册表。
+    //
+    // 而且这里写的是"真的"启动项——写进去会把用户装的那个指向
+    // 临时目录里的测试 exe，开机时反而启动错了程序。
+    if system::is_isolated_instance() {
+        tracing::debug!("隔离实例，跳过开机自启设置");
+        return Ok(());
+    }
+
     let exe = system::current_exe()
         .ok_or_else(|| anyhow::anyhow!("找不到程序自身路径"))?;
     system::set_auto_start(enabled, &exe)?;

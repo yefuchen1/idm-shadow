@@ -80,6 +80,20 @@ pub fn current_exe() -> Option<std::path::PathBuf> {
     std::env::current_exe().ok()
 }
 
+/// 这份进程是不是"隔离实例"。
+///
+/// 自动化测试会用独立的数据目录跑起一个应用实例（端口、数据库、
+/// 扩展目录都是临时的）。那种实例绝不能去动共享的注册表启动项——
+/// 它自己的数据库里没有开机自启的设置，一对账就会把用户真正的
+/// 启动项删掉。跑一次测试，用户开机自启就没了。
+///
+/// 判据是数据目录：测试实例必然被指定了 IDM_SHADOW_DATA_DIR。
+pub fn is_isolated_instance() -> bool {
+    std::env::var("IDM_SHADOW_DATA_DIR")
+        .map(|dir| !dir.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// 调用 reg.exe。
 pub fn run_reg(args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("reg")
@@ -126,5 +140,29 @@ mod tests {
             .and_then(|line| line.split("REG_SZ").nth(1))
             .map(|value| value.trim().to_string());
         assert_eq!(value.as_deref(), Some(r#""C:\x\a.exe" --autostart"#));
+    }
+
+    #[test]
+    fn an_isolated_instance_never_touches_the_shared_registry() {
+        // 自动化测试用独立数据目录跑起一个应用实例。它自己的数据库里
+        // 没有开机自启的设置，一对账就会把用户真正的启动项删掉——
+        // 跑一次测试，用户开机自启就没了。
+        //
+        // 协议注册是同一个毛病：写进去就把 idmshadow:// 指向测试用的
+        // 临时 exe，用户点油猴脚本里的链接会启动到错的程序上去。
+        //
+        // 这个测试跑在 cargo test 里，而 cargo test 会带上
+        // IDM_SHADOW_DATA_DIR 吗？不会——所以这里得自己设。
+        let previous = std::env::var("IDM_SHADOW_DATA_DIR").ok();
+        std::env::set_var("IDM_SHADOW_DATA_DIR", r"C:\temp\idm-shadow-test");
+        assert!(
+            is_isolated_instance(),
+            "指定了数据目录就该算隔离实例"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("IDM_SHADOW_DATA_DIR", value),
+            None => std::env::remove_var("IDM_SHADOW_DATA_DIR"),
+        }
     }
 }

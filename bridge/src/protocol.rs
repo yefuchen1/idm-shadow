@@ -94,6 +94,14 @@ pub fn percent_encode(input: &str) -> String {
 
 /// 注册协议（当前用户）。
 pub fn register(exe: &Path) -> Result<()> {
+    // 隔离实例（自动化测试）不注册协议。
+    //
+    // 协议是全局的：写进去就把 idmshadow:// 指向测试用的临时 exe，
+    // 用户点油猴脚本里的链接会启动到错的程序上去。
+    if crate::system::is_isolated_instance() {
+        return Ok(());
+    }
+
     let exe = exe.to_string_lossy().to_string();
     let key = r"HKCU\Software\Classes\idmshadow";
 

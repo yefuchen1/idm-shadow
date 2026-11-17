@@ -1,7 +1,7 @@
 {
   "name": "idm-shadow",
   "private": true,
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "IDM Shadow：复刻 IDM 的下载工具，支持油猴脚本对接",
   "scripts": {
     "test": "node extension/test/background.test.mjs && node userscript/test/bridge.test.mjs",
