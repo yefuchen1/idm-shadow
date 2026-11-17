@@ -692,4 +692,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
+// service worker 起来就先跟应用打声招呼。
+//
+// 这一步不能省：自愈逻辑会调 chrome.runtime.reload()，重载之后
+// service worker 是全新的，onInstalled / onStartup 都不会再触发。
+// 不主动连一次的话，扩展要等下一次闹钟（最多一分钟）才会被应用
+// 认出来——用户那边看着就是「还是没反应」。
+//
+// 顺便把应用带的扩展版本问回来：比自己的旧就自己重载。
+syncWithApp();
 updateBadge();

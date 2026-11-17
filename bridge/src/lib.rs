@@ -55,8 +55,12 @@ pub struct BridgeState {
     pub extension_seen: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// 扩展最近一次自报的版本号。
     ///
-    /// 老版本扩展不发这个头，这里就是 None——那本身就是个信号：
-    /// 跑的是旧代码。
+    /// 三种状态：
+    ///  - None —— 扩展还没连上过；
+    ///  - Some("") —— 连上了，但没报版本号。那是老版本扩展
+    ///    （0.1.3 之前连身份头都不发，0.1.3~0.1.4 发身份头但不报版本），
+    ///    本身就是"跑着旧代码"的信号；
+    ///  - Some(v) —— 扩展自报的版本号。
     pub extension_version: Arc<std::sync::Mutex<Option<String>>>,
     /// 应用随包发布的扩展版本号。
     ///
@@ -323,15 +327,20 @@ async fn auth_middleware(
                 }
                 // 顺便记下扩展自报的版本。
                 //
-                // 旧版扩展不发这个头，留着上一次的旧值也没意义——
-                // 那时候跑的就是旧代码。记成 None 才对。
+                // 没带版本头也照记：记成空串。
+                //
+                // 这样"连上了但不报版本"和"上报了旧版本"是两种不同的
+                // 旧法，界面提示的话也不一样。记成 None 的话，
+                // 一次没带版本头的请求就会把之前记的版本抹掉。
                 if let Ok(mut slot) = state.extension_version.lock() {
-                    *slot = headers
+                    let reported = headers
                         .get(VERSION_HEADER)
                         .and_then(|v| v.to_str().ok())
                         .map(str::trim)
                         .filter(|v| !v.is_empty())
-                        .map(str::to_string);
+                        .unwrap_or("")
+                        .to_string();
+                    *slot = Some(reported);
                 }
             }
             next.run(request).await
@@ -392,9 +401,11 @@ pub fn extension_is_stale(
     shipped: &str,
 ) -> Option<bool> {
     let reported = extension_version(version)?;
-    if reported.is_empty() || shipped.is_empty() {
+    if shipped.is_empty() {
         return None;
     }
+    // 空版本号 = 连上了但不报版本 = 老版本扩展（它没这段代码）。
+    // 那正是要提示用户去点「重新加载」的情况。
     Some(reported != shipped)
 }
 
@@ -1015,6 +1026,10 @@ mod tests {
         assert_eq!(extension_version(&version), None);
         assert_eq!(extension_is_stale(&version, "0.1.4"), None);
 
+        // 连上了但没报版本号——那是老版本扩展，属于"旧版"。
+        *version.lock().unwrap() = Some(String::new());
+        assert_eq!(extension_is_stale(&version, "0.1.4"), Some(true));
+
         // 连上了，版本跟随包发布的对得上。
         *version.lock().unwrap() = Some("0.1.4".to_string());
         assert_eq!(extension_version(&version).as_deref(), Some("0.1.4"));
@@ -1023,9 +1038,5 @@ mod tests {
         // 浏览器缓存了旧代码：报的版本比随包发布的旧。
         *version.lock().unwrap() = Some("0.1.0".to_string());
         assert_eq!(extension_is_stale(&version, "0.1.4"), Some(true));
-
-        // 空版本号不算数（老扩展压根不发这个头）。
-        *version.lock().unwrap() = Some(String::new());
-        assert_eq!(extension_is_stale(&version, "0.1.4"), None);
     }
 }

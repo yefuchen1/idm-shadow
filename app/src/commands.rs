@@ -255,7 +255,12 @@ fn inspect_extension(state: &AppState) -> ExtensionStatus {
     let stale = self_reported_stale.unwrap_or(false) || copy_stale;
 
     // 显示用的版本号：优先用扩展自报的（最准），没有就用浏览器注册的那个。
-    let running_version = idm_shadow_bridge::extension_version(&state.extension_version)
+    //
+    // 自报的是空串 = 老版本扩展（压根没这段代码，报不出版本），
+    // 那时候显示浏览器注册的那个版本更有意义。
+    let self_reported = idm_shadow_bridge::extension_version(&state.extension_version)
+        .filter(|v| !v.is_empty());
+    let running_version = self_reported
         .or_else(|| {
             copies
                 .iter()

@@ -83,7 +83,14 @@ const chrome = {
     onMessage: { addListener: (fn) => (listeners.onMessage = fn) },
     getURL: (p) => `chrome-extension://test-id/${p}`,
     // 扩展从这儿知道自己跑的是哪一版。
-    getManifest: () => ({ version: '0.1.5' }),
+    //
+    // 读真实的 manifest.json——写死版本号的话，每次给扩展升版
+    // 都会漏改这里，变成一条莫名其妙的失败。
+    getManifest: () => ({
+      version: JSON.parse(
+        readFileSync(join(here, '..', 'manifest.json'), 'utf8')
+      ).version
+    }),
     // 自动更新用：把自己重载一遍。
     reload: () => {
       calls.reload.push(true);
@@ -542,7 +549,11 @@ await test('请求会带上扩展自己的版本号', async () => {
   );
   assert.ok(posted, '应该把下载投给了应用');
   assert.equal(posted.options.headers['X-IDM-Shadow-Client'], 'extension');
-  assert.equal(posted.options.headers['X-IDM-Shadow-Version'], '0.1.5');
+  assert.equal(
+    posted.options.headers['X-IDM-Shadow-Version'],
+    api.extensionVersion(),
+    '请求头里带的版本应该就是 manifest 里的版本'
+  );
 });
 
 await test('版本号比较：只认"我更旧"', async () => {
@@ -561,10 +572,11 @@ await test('比应用旧就自己重载一次', async () => {
   calls.reload.length = 0;
   storage.lastReloadAttempt = 0;
 
-  await api.reloadIfOutdated('0.1.5');
+  const mine = api.extensionVersion();
+  await api.reloadIfOutdated(mine);
   assert.equal(calls.reload.length, 0, '版本一样不该重载');
 
-  await api.reloadIfOutdated('0.9.0');
+  await api.reloadIfOutdated('99.0.0');
   assert.equal(calls.reload.length, 1, '比应用旧就该重载');
 });
 
@@ -573,14 +585,14 @@ await test('不会把自己降级，也不会重载成死循环', async () => {
   storage.lastReloadAttempt = 0;
 
   // 用户自己装了个更新的扩展——不能把它降回去。
-  await api.reloadIfOutdated('0.1.0');
+  await api.reloadIfOutdated('0.0.1');
   assert.equal(calls.reload.length, 0, '自己比应用新就不该动');
 
   // 重载了也没生效时（文件还是旧的），十分钟内不再重载。
   // 不加这个限制就是个不停重启扩展的死循环，比不更新还糟糕。
   calls.reload.length = 0;
   storage.lastReloadAttempt = Date.now();
-  await api.reloadIfOutdated('0.9.0');
+  await api.reloadIfOutdated('99.0.0');
   assert.equal(calls.reload.length, 0, '十分钟内不该重复重载');
 });
 
