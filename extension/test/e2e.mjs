@@ -104,12 +104,18 @@ function startApp() {
   // 独立端口 + 独立数据目录：测试不该碰到用户正在跑的实例，
   // 也不该动用户真实的任务库。
   const dataDir = mkdtempSync(join(tmpdir(), 'idm-ext-e2e-data-'));
+  // 扩展也写到独立目录。
+  //
+  // 不然测试用的构建会把扩展覆盖到用户真实的 %APPDATA%\IDM Shadow\extension 里——
+  // 用户浏览器里加载的正是那一份，等于被测试构建顶掉了。
+  const extOutDir = mkdtempSync(join(tmpdir(), 'idm-ext-e2e-ext-'));
   return spawn(exe, [], {
     env: {
       ...process.env,
       IDM_SHADOW_TOKEN: TOKEN,
       IDM_SHADOW_PORT: String(PORT),
-      IDM_SHADOW_DATA_DIR: dataDir
+      IDM_SHADOW_DATA_DIR: dataDir,
+      IDM_SHADOW_EXTENSION_DIR: extOutDir
     },
     stdio: ['ignore', out, out]
   });
@@ -194,6 +200,7 @@ if (await portAlreadyInUse(PORT)) {
 const app = startApp();
 
 let browser = null;
+let downloadDir = null;
 let failures = 0;
 
 function check(name, ok, detail = '') {
@@ -232,6 +239,33 @@ try {
       `--disable-extensions-except=${extDir}`,
       `--load-extension=${extDir}`
     ]
+  });
+
+  // 把浏览器的下载目录指到临时目录。
+  //
+  // 默认会下到用户的 Downloads——那里要是已经有同名文件，
+  // Chrome 会自动改名成 "xxx (1).bin"，文件名断言就会莫名其妙地失败。
+  // 测试的东西不该留在用户盘上，也该有个干净的环境。
+  const downloadDir = mkdtempSync(join(tmpdir(), 'idm-ext-e2e-dl-'));
+  // newCDPSession 需要一个 page/frame，先开一个空页。
+  const cdpPage = await browser.newPage();
+  const cdp = await browser.newCDPSession(cdpPage);
+  await cdp.send('Browser.setDownloadBehavior', {
+    behavior: 'allow',
+    downloadPath: downloadDir,
+    eventsEnabled: true
+  });
+  await cdpPage.close();
+
+  // 应用自己的下载目录也指到同一个临时目录。
+  // 不然 IDM Shadow 下载的文件会落进用户的 Downloads 里。
+  await fetch(`http://127.0.0.1:${PORT}/api/v1/settings`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-IDM-Shadow-Token': TOKEN
+    },
+    body: JSON.stringify({ download_dir: downloadDir })
   });
 
   // 等扩展的 service worker 起来
@@ -500,6 +534,7 @@ try {
   server.close();
   pageServer.close();
   rmSync(profileDir, { recursive: true, force: true });
+  if (downloadDir) rmSync(downloadDir, { recursive: true, force: true });
   if (asciiRoot) rmSync(asciiRoot, { recursive: true, force: true });
 }
 

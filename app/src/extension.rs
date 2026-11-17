@@ -30,6 +30,15 @@ const ICON32: &[u8] = include_bytes!("../../extension/icon32.png");
 /// Chrome 里已加载的扩展一旦找不到文件就会被禁用，
 /// 用户又得重新加载一遍。
 pub fn extension_dir() -> Option<PathBuf> {
+    // 自动化测试要能指定别的目录。
+    //
+    // 不然测试用的构建会把扩展覆盖到用户真实的 %APPDATA% 里——
+    // 用户浏览器里加载的就是那一份，等于用测试构建替换了用户的扩展。
+    if let Ok(dir) = std::env::var("IDM_SHADOW_EXTENSION_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
     let base = std::env::var("APPDATA").map(PathBuf::from).ok()?;
     Some(base.join("IDM Shadow").join("extension"))
 }
