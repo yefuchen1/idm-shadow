@@ -273,6 +273,16 @@ body {
   color: var(--green);
 }
 
+/* 浏览器里跑的是旧版扩展：不是错误，但必须让人看见。 */
+.extension-line.warn {
+  color: var(--amber);
+  line-height: 1.5;
+}
+
+.extension-line.warn svg {
+  flex: none;
+}
+
 .extension-dir {
   flex: 1 1 240px;
   font-family: "Cascadia Mono", Consolas, monospace;

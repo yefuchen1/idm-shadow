@@ -88,6 +88,23 @@ export interface ExtensionStatus {
   /** 最近三分钟内有没有带 token 的扩展请求。 */
   connected: boolean;
   browsers: { id: string; label: string; page: string }[];
+  /** 应用随包发布的扩展版本。 */
+  version: string;
+  /** 浏览器里实际加载的扩展副本。 */
+  copies: ExtensionCopy[];
+}
+
+/** 浏览器里实际加载的那份扩展。 */
+export interface ExtensionCopy {
+  browser: string;
+  browser_label: string;
+  profile: string;
+  /** 扩展目录。 */
+  path: string;
+  /** 那份副本自己的版本号。 */
+  version: string;
+  /** 浏览器跑的是旧代码——点一次「重新加载」才生效。 */
+  stale: boolean;
 }
 
 export interface UpdateInfo {

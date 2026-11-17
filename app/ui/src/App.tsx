@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  AlertTriangle,
   Ban,
   CircleCheck,
   CircleDashed,
@@ -705,6 +706,36 @@ export default function App() {
                     <Copy size={13} />
                   </button>
                 </div>
+                {extension.copies?.map((c) => (
+                  <div className="extension-line" key={`${c.browser}-${c.profile}-${c.path}`}>
+                    <span className="unit">
+                      {c.browser_label} · {c.profile}
+                    </span>
+                    <code className="extension-dir">{c.path}</code>
+                    <span className="unit">v{c.version}</span>
+                  </div>
+                ))}
+                {extension.copies?.filter((c) => c.stale).map((c) => (
+                  <div className="extension-line warn" key={`warn-${c.browser}-${c.profile}-${c.path}`}>
+                    <AlertTriangle size={13} />
+                    <span>
+                      {c.browser_label} 里跑的是 {c.version} 版旧代码，
+                      在扩展管理页点一下「重新加载」才会更新
+                    </span>
+                    <button
+                      className="btn small"
+                      title={`复制 ${c.browser_label} 扩展页地址`}
+                      onClick={() =>
+                        copy(
+                          extension.browsers.find((b) => b.id === c.browser)?.page ?? ""
+                        )
+                      }
+                    >
+                      <Copy size={13} />
+                      扩展页地址
+                    </button>
+                  </div>
+                ))}
                 <div className="extension-line">
                   {extension.installed ? (
                     <button

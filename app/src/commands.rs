@@ -183,6 +183,14 @@ pub struct ExtensionStatus {
     pub connected: bool,
     /// 这台机器上装了哪些受支持的浏览器。
     pub browsers: Vec<BrowserDto>,
+    /// 应用随包发布的扩展版本。
+    pub version: String,
+    /// 浏览器里实际加载的扩展副本。
+    ///
+    /// 用户常常加载的不是这个目录，而是当初手抄的一份。浏览器会缓存
+    /// 已解压扩展的注册信息，那份拷贝就一直跑着旧代码。界面上要把这件事
+    /// 说清楚，不然用户只会看到"点了下载一点反应都没有"。
+    pub copies: Vec<ExtensionCopyDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +202,18 @@ pub struct BrowserDto {
     pub page: String,
 }
 
+/// 浏览器里实际加载的那份扩展。
+#[derive(Debug, Serialize)]
+pub struct ExtensionCopyDto {
+    pub browser: String,
+    pub browser_label: String,
+    pub profile: String,
+    pub path: String,
+    pub version: String,
+    /// 文件和当前发布的对不上——浏览器跑的是旧代码。
+    pub stale: bool,
+}
+
 fn inspect_extension(state: &AppState) -> ExtensionStatus {
     let dir = crate::extension::extension_dir();
     ExtensionStatus {
@@ -203,6 +223,18 @@ fn inspect_extension(state: &AppState) -> ExtensionStatus {
             .unwrap_or_default(),
         installed: dir.as_ref().map(|d| d.is_dir()).unwrap_or(false),
         connected: idm_shadow_bridge::extension_connected(&state.extension_seen),
+        version: crate::extension::shipped_version(),
+        copies: crate::extension::loaded_copies_cached()
+            .into_iter()
+            .map(|c| ExtensionCopyDto {
+                browser: c.browser,
+                browser_label: c.browser_label,
+                profile: c.profile,
+                path: c.path,
+                version: c.version,
+                stale: c.stale,
+            })
+            .collect(),
         browsers: crate::extension::installed_browsers()
             .into_iter()
             .map(|b| BrowserDto {
@@ -460,6 +492,11 @@ pub async fn extension_status(state: State<'_, AppState>) -> Result<ExtensionSta
 pub async fn install_extension(state: State<'_, AppState>) -> Result<ExtensionStatus, String> {
     crate::extension::materialize()
         .map_err(|e| format!("写入扩展文件失败: {e}"))?;
+    // 浏览器实际加载的那份拷贝也一并更新。
+    //
+    // 浏览器缓存了已解压扩展的注册信息，写完文件还得让用户点一次
+    // 「重新加载」才生效，但至少文件不会再是旧的。
+    crate::extension::sync_loaded_copies();
     Ok(inspect_extension(&state))
 }
 
