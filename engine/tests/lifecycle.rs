@@ -770,6 +770,60 @@ async fn confirm_without_custom_path_lands_in_the_default_dir() {
 }
 
 #[tokio::test]
+async fn confirm_starts_a_task_that_was_only_registered() {
+    // 回归测试：bridge 的 autostart=false（扩展投递、网页「提交下载」）。
+    //
+    // 这种任务只登记、不启动，等用户在保存位置弹窗里点确认才开始。
+    // 以前 confirm_path 只把状态改成「下载中」，没人真正拉起引擎，
+    // 界面上的进度就永远停在 0 字节，看起来像网络卡死；
+    // 手动点一次继续才突然跑完。
+    let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(serve_slow(listener, Arc::new(body.clone())));
+
+    let dir = temp_dir("confirm-not-started");
+    let mgr = manager(&dir);
+
+    let task = mgr
+        .add(TaskRequest {
+            url: format!("http://{addr}/registered.bin"),
+            filename: Some("registered.bin".to_string()),
+            dir: Some(dir.to_string_lossy().to_string()),
+            needs_confirm: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.get(task.id).unwrap().unwrap().status,
+        TaskStatus::AwaitingConfirm
+    );
+
+    // 只确认，不手动 start——这一步必须自己把下载拉起来。
+    mgr.confirm_path(task.id, Some(dir.join("registered.bin")))
+        .await
+        .unwrap();
+
+    let done = wait_for(
+        || {
+            mgr.get(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(done, "确认之后任务应当自己开始并下载完成");
+
+    let content = std::fs::read(dir.join("registered.bin")).unwrap();
+    assert!(content == body, "内容必须一致");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn confirm_while_downloading_keeps_running_until_the_file_lands() {
     // 回归测试：下载进行中点确认。
     //

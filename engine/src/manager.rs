@@ -704,6 +704,16 @@ impl DownloadManager {
             return Ok(());
         }
 
+        // 有些调用方建任务时只登记、不启动（bridge 的 autostart=false）。
+        // 这种任务从没跑过引擎，确认时若只把状态改成「下载中」，
+        // 就再也没人把它真正拉起来——界面上的进度会永远停在 0 字节。
+        let never_started = task.status == TaskStatus::AwaitingConfirm
+            && !self.inner.running.lock().await.contains_key(&id);
+        if never_started {
+            self.start(id).await?;
+            return Ok(());
+        }
+
         // 还在下载中：状态改回下载中，等下载结束那一步转存。
         if task.status == TaskStatus::AwaitingConfirm {
             self.inner
