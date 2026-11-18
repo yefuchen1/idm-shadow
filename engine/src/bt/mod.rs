@@ -24,21 +24,109 @@ use crate::task::Task;
 
 pub mod listener;
 pub mod discovery;
+pub mod metadata;
 pub mod pe;
 pub mod peer_session;
+pub mod sparse;
 pub mod tracker;
 
 use listener::InboundConfig;
 
-/// 下载磁力链接或 .torrent 文件。
-pub fn download(
+/// 准备阶段：拿到文件清单、写好 `.torrent` 缓存、给所有文件做稀疏占位。
+///
+/// 这一步发生在建会话之前。关键点：
+///
+/// - 磁力链接只在这里抓 info dict，不经过库的 `transition_from_metadata`
+/// - 占位用 `sparse::create_sparse_file`，逻辑大小等于文件大小，
+///   实际占用接近 0
+/// - 库在建会话时看到文件已经存在，会跳过 `File::create + set_len`
+pub fn prepare(task: &Task, ctx: &EngineCtx) -> Result<metadata::FetchedMetadata> {
+    let url = task.url.trim();
+    let download_dir = task.dir.clone();
+    std::fs::create_dir_all(&download_dir).ok();
+
+    let meta = if is_magnet(url) {
+        let info_hash = metadata::info_hash_of_magnet(url)?;
+        let cache = download_dir.join(format!("{}.torrent", metadata::hex(&info_hash)));
+        if cache.is_file() {
+            metadata::read_torrent_file(&cache)?
+        } else {
+            send_note(ctx, "正在获取磁力信息…");
+            let cancel = ctx.cancel.clone();
+            let meta = metadata::fetch(
+                url,
+                Duration::from_secs(120),
+                Arc::new(move || *cancel.borrow()),
+                &|stage| send_note(ctx, stage.text()),
+            )?;
+            metadata::write_torrent_cache(&download_dir, &meta)?;
+            meta
+        }
+    } else {
+        let torrent_path = fetch_torrent_file(url, &download_dir)?;
+        let meta = metadata::read_torrent_file(&torrent_path)?;
+        metadata::write_torrent_cache(&download_dir, &meta)?;
+        meta
+    };
+
+    let created = metadata::create_placeholders(&download_dir, &meta)?;
+    tracing::info!(
+        "BT: 文件清单 {} 个文件，共 {} 字节；稀疏占位 {created} 个",
+        meta.files.len(),
+        meta.total_size
+    );
+    Ok(meta)
+}
+
+/// 发一条只有说明文字的进度。界面靠它显示"正在获取磁力信息"。
+pub(crate) fn send_note(ctx: &EngineCtx, note: &str) {
+    ctx.send_progress(TaskProgress {
+        downloaded: 0,
+        total: None,
+        speed: 0,
+        connections: 0,
+        segments: Vec::new(),
+        pieces: None,
+        verified_pieces: None,
+        corrupted_pieces: None,
+        dht_nodes: None,
+        note: Some(note.to_string()),
+    });
+}
+
+/// 下载已经准备好的种子。
+///
+/// `selected` 是用户勾选的文件下标；空表示全部。
+pub fn download_prepared(
     task: &Task,
     ctx: &EngineCtx,
+    meta: &metadata::FetchedMetadata,
+    selected: &[usize],
 ) -> Result<()> {
-    let url = task.url.trim();
-    let dir = task.write_path();
-    let download_dir = dir.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let download_dir = task.dir.clone();
     std::fs::create_dir_all(&download_dir).ok();
+
+    let torrent_path =
+        download_dir.join(format!("{}.torrent", metadata::hex(&meta.info_hash)));
+    if !torrent_path.is_file() {
+        metadata::write_torrent_cache(&download_dir, meta)?;
+    }
+
+    // 空选择 = 全部。库的 `select_files` 传空数组会把所有文件标成 Skip，
+    // 所以这里必须先展开。
+    let selection: Vec<usize> = if selected.is_empty() {
+        (0..meta.files.len()).collect()
+    } else {
+        selected.to_vec()
+    };
+    let selected_total: u64 = selection
+        .iter()
+        .filter_map(|i| meta.files.get(*i))
+        .map(|f| f.length)
+        .sum();
+    if selected_total == 0 {
+        return Err(anyhow!("没有选中任何文件"));
+    }
 
     // 端口先定下来。
     //
@@ -56,32 +144,22 @@ pub fn download(
     // 打开异步校验：开了它 piece 的哈希校验走后台线程池，
     // 不阻塞下载；而且校验结果（尤其是坏块）会被统计出来，
     // 界面上就能显示"坏块重传统计"。
-    let mut session = if url.starts_with("magnet:") {
-        let config = session_config_magnet(listen_port);
-        let url = normalize_magnet(url);
-        // 磁力链接没有 tracker 会很难找到 peer，
-        // 补一批实测可达的。
-        let ctx = bittorrent_rs::TorrentSession::from_magnet(url, &download_dir)
-            .seeding(false)
-            .enable_pex(true)
-            .enable_async_verification(true)
-            .config(config.clone())
-            .build()
-            .context("创建磁力会话失败")?;
-        discovery::inject_fallback_trackers(&ctx.context());
-        ctx
-    } else {
-        // 普通的 .torrent 文件或者 http 直链
-        let torrent_path = fetch_torrent_file(url, &download_dir)?;
-        let config = session_config(&torrent_path, &download_dir, listen_port);
-        TorrentSession::builder(&torrent_path, &download_dir)
-            .seeding(false)
-            .enable_pex(true)
-            .enable_async_verification(true)
-            .config(config)
-            .build()
-            .context("创建 BT 会话失败")?
-    };
+    // 全新任务跳过整盘哈希校验：占位文件全是 0，扫一遍纯属浪费时间。
+    // 断点续传（downloaded > 0）才需要认真校验。
+    let config = session_config(
+        &torrent_path,
+        &download_dir,
+        listen_port,
+        task.downloaded == 0,
+    );
+    let mut session = TorrentSession::builder(&torrent_path, &download_dir)
+        .seeding(false)
+        .enable_pex(true)
+        .enable_async_verification(true)
+        .select_files(&selection)
+        .config(config)
+        .build()
+        .context("创建 BT 会话失败")?;
 
     // swarm 上限单独提。
     //
@@ -108,14 +186,7 @@ pub fn download(
     // 这个线程补上主动宣告这一半，让别的 peer 能反过来找到我们。
     let dht_stats = Arc::new(discovery::DhtStats::default());
     let dht_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let dht_info_hash = {
-        let ctx_arc = session.context();
-        let guard = ctx_arc.lock_safe();
-        let mut ih = [0u8; 20];
-        let n = guard.info_hash.len().min(20);
-        ih[..n].copy_from_slice(&guard.info_hash[..n]);
-        ih
-    };
+    let dht_info_hash = meta.info_hash;
     let (dht_announcer, dht_thread) = discovery::DhtAnnouncer::spawn(
         dht_info_hash,
         listen_port,
@@ -199,8 +270,11 @@ pub fn download(
         feed_dht_candidates(&session, &dht_announcer);
 
         if let Some(stats) = session.try_stats() {
-            let downloaded = stats.bytes_downloaded;
-            let total = stats.bytes_downloaded + stats.bytes_left;
+            // 只选了部分文件时，库的 `bytes_left` 是整个种子的剩余量，
+            // 拿来当总大小的话进度条永远到不了 100%。这里用勾选文件的
+            // 总字节数当分母。
+            let downloaded = stats.bytes_downloaded.min(selected_total);
+            let total = selected_total;
             let speed = stats.download_speed.max(0.0) as u64;
 
             // 报一次阶段变化，任务状态从"探测中"变成"下载中"。
@@ -237,7 +311,14 @@ pub fn download(
                 note: None,
             });
 
-            if stats.progress >= 100.0 && stats.bytes_left == 0 {
+            // 完成判定必须用 wants-aware 的 `is_download_complete()`：
+            // 未勾选的文件本来就不会有数据，`bytes_left` 不会归零。
+            let complete = session
+                .context()
+                .try_lock()
+                .map(|ctx| ctx.is_download_complete())
+                .unwrap_or_else(|_| stats.bytes_left == 0);
+            if complete {
                 finished = true;
                 break;
             }
@@ -386,7 +467,12 @@ fn read_pieces(session: &TorrentSession) -> Option<(Vec<bool>, Vec<u16>, u64)> {
 ///
 /// 全新下载没什么可校验的（盘上什么都没有），直接跳过；
 /// 断点续传才需要认真校验，知道哪些块已经下好了。
-fn session_config(torrent_path: &Path, download_dir: &Path, listen_port: u16) -> SessionConfig {
+fn session_config(
+    torrent_path: &Path,
+    download_dir: &Path,
+    listen_port: u16,
+    fresh: bool,
+) -> SessionConfig {
     let mut config = SessionConfig::default();
 
     apply_common_config(&mut config, listen_port);
@@ -401,18 +487,14 @@ fn session_config(torrent_path: &Path, download_dir: &Path, listen_port: u16) ->
         Err(_) => true,
     };
 
-    config.skip_hash_check = !existing;
+    // `fresh` 由任务本身决定：全新任务（downloaded == 0）跳过校验。
+    // 光看文件在不在不行——我们刚给所有文件做了稀疏占位，
+    // 文件一定存在，但里面全是 0。
+    config.skip_hash_check = fresh || !existing;
     tracing::info!(
         "BT: 盘上已有数据={existing}，跳过整盘哈希校验={}",
         config.skip_hash_check
     );
-    config
-}
-
-/// 磁力链接的会话配置。
-fn session_config_magnet(listen_port: u16) -> SessionConfig {
-    let mut config = SessionConfig::default();
-    apply_common_config(&mut config, listen_port);
     config
 }
 
@@ -709,6 +791,25 @@ pub fn looks_like_bt(url: &str) -> bool {
     path.ends_with(".torrent")
 }
 
+/// 新建 BT 任务时先用这个名字占位。
+///
+/// 真正的种子名要等拿到 info dict 才知道，这里只是让任务列表
+/// 不显示一个光秃秃的 "download"。`prepare` 成功后会把
+/// `Task.filename` 改成 info dict 里的名字。
+pub fn suggested_filename(url: &str) -> Option<String> {
+    if is_magnet(url) {
+        let normalized = normalize_magnet(url);
+        let link = bittorrent_rs::magnet::MagnetLink::parse(&normalized).ok()?;
+        link.display_name
+            .map(|name| crate::task::sanitize_filename(&name))
+    } else {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let name = path.rsplit('/').next()?.trim();
+        let stem = name.strip_suffix(".torrent").unwrap_or(name);
+        (!stem.is_empty()).then(|| crate::task::sanitize_filename(stem))
+    }
+}
+
 
 
 #[cfg(test)]
@@ -893,5 +994,161 @@ mod tests {
 
         // 前 100 块下好了 -> 第一格是"部分下载"（一格里有的有的是不是）
         assert_eq!(status.cells[0].state, PieceState::Partial);
+    }
+
+    #[test]
+    fn prepare_creates_sparse_placeholders_and_file_list() {
+        use bittorrent_rs::utils::bencode::{BNode, Bencode};
+
+        let dir = std::env::temp_dir().join(format!("idm-bt-prepare-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pieces = [0u8; 20];
+        let info = Bencode::encode(&BNode::Dictionary(vec![
+            (
+                b"files".as_slice(),
+                BNode::List(vec![
+                    BNode::Dictionary(vec![
+                        (b"length".as_slice(), BNode::Number(b"1024")),
+                        (
+                            b"path".as_slice(),
+                            BNode::List(vec![BNode::String(b"a.bin")]),
+                        ),
+                    ]),
+                    BNode::Dictionary(vec![
+                        (b"length".as_slice(), BNode::Number(b"2048")),
+                        (
+                            b"path".as_slice(),
+                            BNode::List(vec![BNode::String(b"b.bin")]),
+                        ),
+                    ]),
+                ]),
+            ),
+            (b"name".as_slice(), BNode::String(b"sample")),
+            (b"piece length".as_slice(), BNode::Number(b"16384")),
+            (b"pieces".as_slice(), BNode::String(&pieces)),
+        ]));
+        let torrent_path = dir.join("sample.torrent");
+        std::fs::write(
+            &torrent_path,
+            metadata::build_torrent_bytes(&info, &["http://127.0.0.1:1/announce".into()]),
+        )
+        .unwrap();
+
+        let task = Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskRequest {
+                url: torrent_path.to_string_lossy().to_string(),
+                engine: crate::task::EngineKind::Bt,
+                ..Default::default()
+            },
+            dir.clone(),
+            "sample".to_string(),
+        );
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (phase_tx, _phase_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = EngineCtx::new(cancel_rx, cancel_tx, progress_tx, phase_tx);
+
+        let meta = prepare(&task, &ctx).unwrap();
+        assert_eq!(meta.files.len(), 2);
+        assert_eq!(meta.total_size, 3072);
+        assert_eq!(meta.name, "sample");
+
+        let first = dir.join("sample").join("a.bin");
+        let second = dir.join("sample").join("b.bin");
+        assert_eq!(std::fs::metadata(&first).unwrap().len(), 1024);
+        assert_eq!(std::fs::metadata(&second).unwrap().len(), 2048);
+        #[cfg(windows)]
+        {
+            assert!(sparse::is_sparse(&first).unwrap());
+            // 稀疏文件的真实占用应当远小于逻辑大小。
+            assert!(sparse::allocated_size(&first).unwrap() < 1024);
+        }
+
+        // `.torrent` 缓存的名字必须是 info hash，库靠它认缓存。
+        let cache = dir.join(format!("{}.torrent", metadata::hex(&meta.info_hash)));
+        assert!(cache.is_file());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn suggested_name_comes_from_magnet_display_name() {
+        let name = suggested_filename(
+            "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel",
+        );
+        assert_eq!(name.as_deref(), Some("Sintel"));
+    }
+
+    /// 真实网络：只勾选字幕文件，验证 mp4 不被下载、字幕完整落地。
+    ///
+    /// ```text
+    /// $env:IDM_BT_LIVE_MAGNET="magnet:?xt=urn:btih:08ada...&dn=Sintel&tr=..."
+    /// cargo test -p idm-shadow-engine --lib live_download_only_selected_files -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn live_download_only_selected_files() {
+        let magnet = std::env::var("IDM_BT_LIVE_MAGNET")
+            .expect("需要设置 IDM_BT_LIVE_MAGNET");
+        let dir = std::env::temp_dir().join(format!("idm-bt-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let task = Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskRequest {
+                url: magnet,
+                engine: crate::task::EngineKind::Bt,
+                ..Default::default()
+            },
+            dir.clone(),
+            "Sintel".to_string(),
+        );
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (phase_tx, _phase_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = EngineCtx::new(cancel_rx, cancel_tx, progress_tx, phase_tx);
+
+        let meta = prepare(&task, &ctx).unwrap();
+        let selected: Vec<usize> = meta
+            .files
+            .iter()
+            .filter(|f| f.path.ends_with(".srt"))
+            .map(|f| f.index)
+            .collect();
+        assert!(selected.len() >= 5, "这个种子应当有多个字幕文件");
+
+        // 看门狗：网络卡住时别让测试永远挂着。
+        let watchdog = ctx.cancel_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(180));
+            let _ = watchdog.send(true);
+        });
+
+        // 后台把进度读掉，别让通道堆着。
+        let drain = std::thread::spawn(move || {
+            while progress_rx.blocking_recv().is_some() {}
+        });
+
+        download_prepared(&task, &ctx, &meta, &selected).unwrap();
+
+        for file in meta.files.iter().filter(|f| selected.contains(&f.index)) {
+            let path = dir.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let size = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(size, file.length, "{} 应当完整下载", file.path);
+        }
+
+        let mp4 = dir.join("Sintel").join("Sintel.mp4");
+        assert_eq!(std::fs::metadata(&mp4).unwrap().len(), 129_241_752);
+        #[cfg(windows)]
+        assert!(
+            sparse::allocated_size(&mp4).unwrap() < 1024 * 1024,
+            "没勾选的 mp4 不应该被下载"
+        );
+
+        drop(ctx);
+        drain.join().ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

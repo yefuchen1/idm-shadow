@@ -115,6 +115,12 @@ pub struct TaskDto {
     pub error: Option<String>,
     /// 是否在等用户确认保存位置。
     pub needs_confirm: bool,
+    /// BT 任务的文件清单。None = 不是 BT 任务，或者还没抓到 metadata。
+    pub bt_files: Option<idm_shadow_engine::task::BtFileList>,
+    /// 用户勾选的文件下标。None = 还没选。
+    pub bt_selected: Option<Vec<usize>>,
+    /// 当前阶段的说明文字（"正在获取磁力信息…"之类）。
+    pub note: Option<String>,
     /// 当前各连接持有的区间（分段可视化用）。
     pub segments: Vec<SegmentDto>,
     /// BT 任务的分片状态（piece 校验可视化用）。
@@ -212,6 +218,9 @@ impl TaskDto {
                 .unwrap_or(default_max_connections),
             error: task.error.as_ref().map(|e| e.message.clone()),
             needs_confirm: task.needs_confirm,
+            bt_files: task.bt_files.clone(),
+            bt_selected: task.bt_selected.clone(),
+            note: live.and_then(|p| p.note.clone()),
             segments: live
                 .map(|p| {
                     p.segments
@@ -694,6 +703,8 @@ pub struct ConfirmBody {
     pub path: Option<String>,
     /// 只给了目录时，用它加上原文件名。
     pub dir: Option<String>,
+    /// BT 任务：用户勾选的文件下标。
+    pub files: Option<Vec<usize>>,
 }
 
 async fn confirm_task(
@@ -718,7 +729,7 @@ async fn confirm_task(
 
     state
         .manager
-        .confirm_path(id, path)
+        .confirm_path(id, path, body.files)
         .await
         .map_err(|e| ApiError::new("confirm_failed", e.to_string()))?;
     Ok(Json(json!({ "ok": true })))

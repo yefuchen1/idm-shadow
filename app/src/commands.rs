@@ -342,6 +342,7 @@ pub async fn confirm_task(
     state: State<'_, AppState>,
     id: String,
     dir: Option<String>,
+    files: Option<Vec<usize>>,
 ) -> Result<(), String> {
     let id = parse_id(&id)?;
     // 只给目录时，目录 + 原文件名才是最终落盘位置。
@@ -361,7 +362,7 @@ pub async fn confirm_task(
     };
     state
         .manager
-        .confirm_path(id, path)
+        .confirm_path(id, path, files)
         .await
         .map_err(|e| e.to_string())
 }

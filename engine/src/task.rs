@@ -9,6 +9,31 @@ use uuid::Uuid;
 
 pub type TaskId = Uuid;
 
+/// BT 种子里的一个文件。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BtFileInfo {
+    /// 在种子文件列表里的下标。跟库的 `files_to_download` 下标一致。
+    pub index: usize,
+    /// 相对路径（含种子根目录名）。多文件种子是 `根目录/子目录/文件`。
+    pub path: String,
+    /// 文件大小（字节）。
+    pub length: u64,
+}
+
+/// BT 任务抓到的文件列表。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BtFileList {
+    /// 种子名。多文件种子是根目录名，单文件种子是文件名。
+    pub name: String,
+    /// 种子里的全部文件。
+    pub files: Vec<BtFileInfo>,
+    /// 是否还需要用户勾选。
+    ///
+    /// 断点续传时之前已经选过了，这时是 false——
+    /// 不然每次恢复都弹一次窗。
+    pub needs_selection: bool,
+}
+
 /// 任务使用的引擎。`Auto` 由 probe 结果决定落到 Http 或 Hls。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +171,13 @@ pub struct Task {
     pub final_path: Option<PathBuf>,
     /// 是否需要用户确认保存位置（IDM 式弹窗流程）。
     pub needs_confirm: bool,
+    /// 磁力/种子任务抓到的文件清单。None = 不是 BT 或还没抓。
+    pub bt_files: Option<BtFileList>,
+    /// 用户勾选要下载的文件下标。
+    ///
+    /// None = 还没选过（多文件种子会等用户勾选）；
+    /// Some(空) 非法，交给上层校验。
+    pub bt_selected: Option<Vec<usize>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -168,6 +200,8 @@ impl Task {
             headers: req.headers,
             max_connections: req.max_connections,
             needs_confirm: req.needs_confirm,
+            bt_files: None,
+            bt_selected: None,
             error: None,
             etag: None,
             last_modified: None,

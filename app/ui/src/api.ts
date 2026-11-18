@@ -25,6 +25,10 @@ export interface TaskDto {
   max_connections: number;
   error: string | null;
   needs_confirm: boolean;
+  /** BT 任务的文件清单。null = 不是 BT 任务，或者还没抓到 metadata。 */
+  bt_files: BtFileListDto | null;
+  /** 用户勾选的文件下标。null = 还没选。 */
+  bt_selected: number[] | null;
   /** 产物说明，比如 HLS 合并后是不是标准 mp4。 */
   note: string | null;
   /** 各连接持有的区间，分段可视化用。 */
@@ -37,6 +41,18 @@ export interface TaskDto {
   file_exists: boolean | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface BtFileInfoDto {
+  index: number;
+  path: string;
+  length: number;
+}
+
+export interface BtFileListDto {
+  name: string;
+  files: BtFileInfoDto[];
+  needs_selection: boolean;
 }
 
 export interface SegmentDto {
@@ -139,8 +155,8 @@ export const api = {
   addTask: (url: string, filename?: string, dir?: string) =>
     invoke<string>("add_task", { url, filename, dir }),
   /** 确认保存位置。dir 是目录（空表示用默认目录），最终路径 = 目录 + 原文件名。 */
-  confirmTask: (id: string, dir?: string) =>
-    invoke<void>("confirm_task", { id, dir }),
+  confirmTask: (id: string, dir?: string, files?: number[]) =>
+    invoke<void>("confirm_task", { id, dir, files: files ?? null }),
   openDialog: (id: string) => invoke<void>("open_dialog", { id }),
   closeDialog: (id: string) => invoke<void>("close_dialog", { id }),
   /** 把对话框窗口调整到刚好包住内容。height 是前端量出来的。 */

@@ -68,6 +68,8 @@ impl Store {
                 staging_path    TEXT,
                 final_path      TEXT,
                 needs_confirm   INTEGER NOT NULL DEFAULT 0,
+                bt_files        TEXT,
+                bt_selected     TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
@@ -167,6 +169,11 @@ impl Store {
         add_column_if_missing(conn, "final_path", "TEXT")?;
         add_column_if_missing(conn, "needs_confirm", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute("PRAGMA user_version = 2", [])?;
+
+        // v3：BT 文件勾选
+        add_column_if_missing(conn, "bt_files", "TEXT")?;
+        add_column_if_missing(conn, "bt_selected", "TEXT")?;
+        conn.execute("PRAGMA user_version = 3", [])?;
         Ok(())
     }
 
@@ -182,9 +189,10 @@ impl Store {
                 id, engine, url, filename, dir, status, total_size, downloaded,
                 referer, user_agent, cookies, headers, max_connections, error,
                 etag, last_modified, accepts_ranges,
-                staging_path, final_path, needs_confirm, created_at, updated_at
+                staging_path, final_path, needs_confirm,
+                bt_files, bt_selected, created_at, updated_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                      ?18, ?19, ?20, ?21, ?22)
+                      ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             "#,
             params![
                 task.id.to_string(),
@@ -207,6 +215,8 @@ impl Store {
                 task.staging_path.as_ref().map(|p| p.to_string_lossy().to_string()),
                 task.final_path.as_ref().map(|p| p.to_string_lossy().to_string()),
                 task.needs_confirm as i64,
+                task.bt_files.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+                task.bt_selected.as_ref().and_then(|v| serde_json::to_string(v).ok()),
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
             ],
@@ -224,7 +234,7 @@ impl Store {
                 cookies = ?11, headers = ?12, max_connections = ?13, error = ?14,
                 etag = ?15, last_modified = ?16, accepts_ranges = ?17,
                 staging_path = ?18, final_path = ?19, needs_confirm = ?20,
-                updated_at = ?21
+                bt_files = ?21, bt_selected = ?22, updated_at = ?23
             WHERE id = ?1
             "#,
             params![
@@ -248,6 +258,8 @@ impl Store {
                 task.staging_path.as_ref().map(|p| p.to_string_lossy().to_string()),
                 task.final_path.as_ref().map(|p| p.to_string_lossy().to_string()),
                 task.needs_confirm as i64,
+                task.bt_files.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+                task.bt_selected.as_ref().and_then(|v| serde_json::to_string(v).ok()),
                 task.updated_at.to_rfc3339(),
             ],
         )?;
@@ -430,6 +442,12 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task> {
             .get::<_, Option<String>>("final_path")?
             .map(PathBuf::from),
         needs_confirm: row.get::<_, i64>("needs_confirm")? != 0,
+        bt_files: row
+            .get::<_, Option<String>>("bt_files")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        bt_selected: row
+            .get::<_, Option<String>>("bt_selected")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
         created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),

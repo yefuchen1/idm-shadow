@@ -120,6 +120,100 @@ where
     false
 }
 
+/// 磁力/种子任务：抓完文件清单后先停在确认框，勾选结果要落库，
+/// 确认后能重新启动下载。
+#[tokio::test]
+async fn bt_task_waits_for_file_selection_then_restarts() {
+    use bittorrent_rs::utils::bencode::{BNode, Bencode};
+
+    let dir = std::env::temp_dir().join(format!("idm-bt-lifecycle-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let pieces = [0u8; 20];
+    let info = Bencode::encode(&BNode::Dictionary(vec![
+        (
+            b"files".as_slice(),
+            BNode::List(vec![
+                BNode::Dictionary(vec![
+                    (b"length".as_slice(), BNode::Number(b"1024")),
+                    (
+                        b"path".as_slice(),
+                        BNode::List(vec![BNode::String(b"a.bin")]),
+                    ),
+                ]),
+                BNode::Dictionary(vec![
+                    (b"length".as_slice(), BNode::Number(b"2048")),
+                    (
+                        b"path".as_slice(),
+                        BNode::List(vec![BNode::String(b"b.bin")]),
+                    ),
+                ]),
+            ]),
+        ),
+        (b"name".as_slice(), BNode::String(b"sample")),
+        (b"piece length".as_slice(), BNode::Number(b"16384")),
+        (b"pieces".as_slice(), BNode::String(&pieces)),
+    ]));
+    let torrent_path = dir.join("sample.torrent");
+    std::fs::write(
+        &torrent_path,
+        idm_shadow_engine::bt::metadata::build_torrent_bytes(
+            &info,
+            &["http://127.0.0.1:1/announce".to_string()],
+        ),
+    )
+    .unwrap();
+
+    let mgr = manager(&dir);
+    let task = mgr
+        .add(TaskRequest {
+            url: torrent_path.to_string_lossy().to_string(),
+            dir: Some(dir.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(task.engine, idm_shadow_engine::task::EngineKind::Bt);
+
+    mgr.start(task.id).await.unwrap();
+    let ready = wait_for(
+        || {
+            mgr.get(task.id)
+                .ok()
+                .flatten()
+                .map(|t| t.bt_files.is_some())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(ready, "prepare 应当很快读出本地种子的文件清单");
+
+    let waiting = mgr.get(task.id).unwrap().unwrap();
+    assert_eq!(waiting.status, TaskStatus::AwaitingConfirm);
+    let files = waiting.bt_files.as_ref().unwrap();
+    assert_eq!(files.files.len(), 2);
+    assert!(files.needs_selection);
+    assert_eq!(waiting.filename, "sample");
+    assert!(dir.join("sample").join("a.bin").is_file());
+    assert_eq!(
+        std::fs::metadata(dir.join("sample").join("b.bin"))
+            .unwrap()
+            .len(),
+        2048
+    );
+
+    mgr.confirm_path(task.id, None, Some(vec![1])).await.unwrap();
+    let confirmed = mgr.get(task.id).unwrap().unwrap();
+    assert_eq!(confirmed.bt_selected, Some(vec![1]));
+    assert!(!confirmed.needs_confirm);
+
+    // 这个种子没有真实 peer，下载会一直等；收尾别让测试挂着。
+    mgr.pause(task.id).await.ok();
+    mgr.cancel(task.id).await.ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn pause_keeps_task_paused_and_resume_restarts_it() {
     let body: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
@@ -428,7 +522,7 @@ async fn confirm_flow_stages_then_transfers_to_chosen_path() {
     // 确认到一个别的目录
     let custom = dir.join("custom");
     std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("c.bin")))
+    mgr.confirm_path(task.id, Some(custom.join("c.bin")), None)
         .await
         .unwrap();
 
@@ -537,7 +631,7 @@ async fn confirm_before_start_still_transfers_to_chosen_path() {
     // 先确认，再启动
     let custom = dir.join("early-target");
     std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("early.bin")))
+    mgr.confirm_path(task.id, Some(custom.join("early.bin")), None)
         .await
         .unwrap();
 
@@ -617,7 +711,7 @@ async fn confirm_after_completion_moves_the_file() {
     // 用户确认另一个位置
     let custom = dir.join("late-target");
     std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("late.bin")))
+    mgr.confirm_path(task.id, Some(custom.join("late.bin")), None)
         .await
         .unwrap();
 
@@ -683,7 +777,7 @@ async fn confirm_long_after_completion_moves_the_file() {
 
     let custom = dir.join("late-target");
     std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("late.bin")))
+    mgr.confirm_path(task.id, Some(custom.join("late.bin")), None)
         .await
         .unwrap();
 
@@ -732,7 +826,7 @@ async fn confirm_without_custom_path_lands_in_the_default_dir() {
         .unwrap();
 
     // 直接下载：不给路径
-    mgr.confirm_path(task.id, None).await.unwrap();
+    mgr.confirm_path(task.id, None, None).await.unwrap();
 
     let confirmed = mgr.get(task.id).unwrap().unwrap();
     assert!(
@@ -801,7 +895,7 @@ async fn confirm_starts_a_task_that_was_only_registered() {
     );
 
     // 只确认，不手动 start——这一步必须自己把下载拉起来。
-    mgr.confirm_path(task.id, Some(dir.join("registered.bin")))
+    mgr.confirm_path(task.id, Some(dir.join("registered.bin")), None)
         .await
         .unwrap();
 
@@ -866,7 +960,7 @@ async fn confirm_while_downloading_keeps_running_until_the_file_lands() {
     // 下载中确认到另一个目录
     let custom = dir.join("live-target");
     std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("live.bin")))
+    mgr.confirm_path(task.id, Some(custom.join("live.bin")), None)
         .await
         .unwrap();
 
@@ -923,7 +1017,7 @@ async fn removing_a_task_deletes_the_file_it_actually_landed_on() {
 
     let custom = dir.join("rm-target");
     std::fs::create_dir_all(&custom).unwrap();
-    mgr.confirm_path(task.id, Some(custom.join("rm.bin")))
+    mgr.confirm_path(task.id, Some(custom.join("rm.bin")), None)
         .await
         .unwrap();
 

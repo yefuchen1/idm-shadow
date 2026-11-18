@@ -29,6 +29,9 @@ function DownloadDialog() {
   const [phase, setPhase] = useState<Phase>("choose");
   const [autoClose, setAutoClose] = useState(false);
   const [busy, setBusy] = useState(false);
+  // BT 任务勾选的文件下标。
+  // 第一次拿到文件清单时默认全选；之后轮询刷新不覆盖用户的选择。
+  const [picked, setPicked] = useState<number[] | null>(null);
   // 出错就把原因摆出来。
   //
   // 之前这里什么都不显示，插件调用被权限拦掉的时候，
@@ -58,6 +61,12 @@ function DownloadDialog() {
     const t = window.setInterval(load, 1000);
     return () => window.clearInterval(t);
   }, [load]);
+
+  const btFiles = task?.bt_files ?? null;
+  useEffect(() => {
+    if (!btFiles) return;
+    setPicked((cur) => cur ?? btFiles.files.map((f) => f.index));
+  }, [btFiles]);
 
   // 阶段跟着任务状态走。
   //
@@ -157,6 +166,13 @@ function DownloadDialog() {
   const percent = total ? Math.min(100, (downloaded / total) * 100) : 0;
   // 字节下完了但还没确认存哪——进度条满了，人还在等选择。
   const bytesDone = total !== null && downloaded >= total;
+  // metadata 还没到：按钮先禁用，避免用户在不知道文件清单时确认。
+  const metadataPending = task?.engine === "bt" && !btFiles;
+  const pickedSet = useMemo(() => new Set(picked ?? []), [picked]);
+  const pickedFiles = btFiles?.files.filter((f) => pickedSet.has(f.index)) ?? [];
+  const pickedTotal = pickedFiles.reduce((sum, f) => sum + f.length, 0);
+  const allPicked =
+    !!btFiles && pickedFiles.length === btFiles.files.length;
   // 这个任务实际会存到哪。任务自己带了目录的话（扩展投过来的、
   // 或者在别处新建的），占位符就该显示它自己的目录，
   // 而不是全局默认目录——不然按"立即下载"落地的位置跟占位符对不上。
@@ -177,7 +193,11 @@ function DownloadDialog() {
         if (!picked) return;
         target = picked;
       }
-      await api.confirmTask(task.id, target || undefined);
+      await api.confirmTask(
+        task.id,
+        target || undefined,
+        picked && picked.length > 0 ? picked : undefined
+      );
       setPhase("downloading");
     } catch (err) {
       console.warn("[IDM Shadow] 确认失败", err);
@@ -236,7 +256,9 @@ function DownloadDialog() {
         <div className="dlg-title">
           <span className="dlg-filename">{task?.filename ?? "…"}</span>
           <span className="dlg-sub">
-            {total
+            {task?.engine === "bt" && !btFiles
+              ? task?.note ?? "正在获取文件列表…"
+              : total
               ? `${formatSize(downloaded)} / ${formatSize(total)}`
               : formatSize(downloaded)}
             {bytesDone && phase === "choose"
@@ -269,17 +291,71 @@ function DownloadDialog() {
 
       {phase === "choose" && (
         <>
+          {btFiles && btFiles.files.length > 1 && (
+            <div className="dlg-files">
+              <div className="dlg-files-head">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allPicked}
+                    onChange={(e) =>
+                      setPicked(
+                        e.target.checked
+                          ? btFiles.files.map((f) => f.index)
+                          : []
+                      )
+                    }
+                  />
+                  <span>全选</span>
+                </label>
+                <span>
+                  {pickedFiles.length}/{btFiles.files.length} 个文件 ·{" "}
+                  {formatSize(pickedTotal)}
+                </span>
+              </div>
+              <div className="dlg-files-list">
+                {btFiles.files.map((file) => (
+                  <label className="dlg-file" key={file.index} title={file.path}>
+                    <input
+                      type="checkbox"
+                      checked={pickedSet.has(file.index)}
+                      onChange={(e) =>
+                        setPicked((cur) => {
+                          const base = new Set(cur ?? []);
+                          if (e.target.checked) base.add(file.index);
+                          else base.delete(file.index);
+                          return [...base].sort((a, b) => a - b);
+                        })
+                      }
+                    />
+                    <span className="dlg-file-name">{file.path}</span>
+                    <span className="dlg-file-size">
+                      {formatSize(file.length)}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="dlg-actions">
             <button
               className="btn primary"
-              disabled={busy}
+              disabled={
+                busy ||
+                metadataPending ||
+                (!!btFiles && pickedFiles.length === 0)
+              }
               onClick={() => start(false)}
             >
-              立即下载
+              {metadataPending ? "获取文件列表中…" : "立即下载"}
             </button>
             <button
               className="btn"
-              disabled={busy}
+              disabled={
+                busy ||
+                metadataPending ||
+                (!!btFiles && pickedFiles.length === 0)
+              }
               onClick={() => start(true)}
             >
               另存为…

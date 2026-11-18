@@ -225,23 +225,36 @@ impl DownloadManager {
         //  2. 探测已经在下载前做过一次（engine/src/http/engine.rs），
         //     那次的响应头里已经有 Content-Disposition 和 Content-Type，
         //     这里再走一遍是同一次网络往返，不算额外成本。
-        let filename = self.resolve_task_filename(&req).await;
-        let path = unique_path(&dir, &filename);
-        let filename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or(filename);
+        // 先定引擎，再定文件名：BT 任务不走 HTTP 探测，
+        // 也不能被 unique_path 改名——种子里的文件路径是固定的。
+        let mut engine = req.engine;
+        if engine == crate::task::EngineKind::Auto && looks_like_hls(&req.url) {
+            engine = crate::task::EngineKind::Hls;
+        }
+        if engine == crate::task::EngineKind::Auto && crate::bt::looks_like_bt(&req.url) {
+            engine = crate::task::EngineKind::Bt;
+        }
+
+        let filename = if engine == crate::task::EngineKind::Bt {
+            crate::bt::suggested_filename(&req.url)
+                .unwrap_or_else(|| "magnet".to_string())
+        } else {
+            let filename = self.resolve_task_filename(&req).await;
+            let path = unique_path(&dir, &filename);
+            path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(filename)
+        };
 
         let id = Uuid::new_v4();
         let mut task = Task::new(id, req, dir, filename);
+        task.engine = engine;
 
-        // 自动判断引擎类型：URL 看着像 m3u8 就走 HLS。
-        // 用户显式指定 engine 时不动。
-        if task.engine == crate::task::EngineKind::Auto && looks_like_hls(&task.url) {
-            task.engine = crate::task::EngineKind::Hls;
-        }
-        if task.engine == crate::task::EngineKind::Auto && crate::bt::looks_like_bt(&task.url) {
-            task.engine = crate::task::EngineKind::Bt;
+        // 磁力任务要弹窗让用户确认保存位置、勾选文件。
+        // 文件清单要等 prepare 阶段抓完 metadata 才有，弹窗先出现，
+        // 清单到了再补上。
+        if task.engine == crate::task::EngineKind::Bt {
+            task.needs_confirm = true;
         }
 
         // 需要确认保存位置的：先写到暂存文件，用户选完再转存。
@@ -251,9 +264,11 @@ impl DownloadManager {
         // 这跟 IDM 一样（弹窗出现时下载已经在跑）。
         // 状态只是"在等用户点确认"，不代表没在下载。
         if task.needs_confirm {
-            let staging_dir = task.staging_dir();
-            std::fs::create_dir_all(&staging_dir).ok();
-            task.staging_path = Some(staging_dir.join(format!("{id}.part")));
+            if task.engine != crate::task::EngineKind::Bt {
+                let staging_dir = task.staging_dir();
+                std::fs::create_dir_all(&staging_dir).ok();
+                task.staging_path = Some(staging_dir.join(format!("{id}.part")));
+            }
             task.status = TaskStatus::AwaitingConfirm;
         }
         self.inner.store.insert_task(&task)?;
@@ -473,16 +488,75 @@ impl DownloadManager {
                 crate::task::EngineKind::Bt => {
                     // BT 库是阻塞式、线程模型的，放到专用线程上跑，
                     // 别占着 tokio 的工作线程。
+                    //
+                    // 分两段：
+                    //  1. prepare：抓 info dict、写 .torrent 缓存、稀疏占位
+                    //  2. 需要用户勾选文件时先停下；否则直接下载
                     let bt_task = task.clone();
                     let bt_ctx = ctx.clone();
+                    let bt_store = store.clone();
+                    let bt_events = events.clone();
                     // 进度直接用 ctx 里的 tokio 通道发——
                     // tokio 的 mpsc sender 是 Send + Sync，跨线程发没问题，
                     // 不需要中间再套一层转发线程。
                     //
                     // 之前那层转发用 std::sync::mpsc 的 recv()，
                     // 那是阻塞调用，会占死一个 tokio 工作线程。
-                    let joined = tokio::task::spawn_blocking(move || {
-                        crate::bt::download(&bt_task, &bt_ctx)
+                    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        let meta = crate::bt::prepare(&bt_task, &bt_ctx)?;
+
+                        // 拿到 info dict 之后，任务名和总大小才有准信。
+                        let mut fresh = bt_store
+                            .get_task(id)?
+                            .ok_or_else(|| anyhow!("任务不存在"))?;
+                        let name = crate::task::sanitize_filename(&meta.name);
+                        fresh.filename = name;
+                        fresh.total_size = Some(meta.total_size);
+                        fresh.bt_files = Some(crate::task::BtFileList {
+                            name: meta.name.clone(),
+                            files: meta.files.clone(),
+                            needs_selection: meta.needs_selection()
+                                && fresh.bt_selected.is_none(),
+                        });
+                        bt_store.update_task(&fresh)?;
+
+                        // 多文件种子、还没勾选、也还没确认保存位置：停下来等。
+                        //
+                        // 关键：这个线程**不能退出**。确认弹窗里的勾选结果
+                        // 只写数据库，由这里轮询拿到再继续下载。
+                        // 如果这里返回、让 confirm_path 重新 start，
+                        // 会跟本线程的收尾撞在一起——running 表里还挂着 id，
+                        // start 以为任务在跑，结果谁也没真正下载。
+                        if fresh.bt_selected.is_none()
+                            && meta.needs_selection()
+                            && fresh.needs_confirm
+                        {
+                            let _ = bt_events
+                                .send(TaskEvent::StatusChanged(id, TaskStatus::AwaitingConfirm));
+                            let _ = bt_events.send(TaskEvent::ConfirmNeeded(id));
+                            crate::bt::send_note(&bt_ctx, "等待选择要下载的文件…");
+
+                            loop {
+                                if *bt_ctx.cancel.borrow() {
+                                    return Err(anyhow!("已取消"));
+                                }
+                                let current = bt_store
+                                    .get_task(id)?
+                                    .ok_or_else(|| anyhow!("任务不存在"))?;
+                                fresh = current;
+                                if fresh.bt_selected.is_some() || !fresh.needs_confirm {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                        }
+
+                        if let Some(files) = fresh.bt_files.as_mut() {
+                            files.needs_selection = false;
+                        }
+                        bt_store.update_task(&fresh)?;
+                        let selection = fresh.bt_selected.clone().unwrap_or_default();
+                        crate::bt::download_prepared(&fresh, &bt_ctx, &meta, &selection)
                     })
                     .await;
 
@@ -516,7 +590,8 @@ impl DownloadManager {
                     c.final_path.is_some() && !c.transferred
                 };
 
-                if ready {
+                // BT 的文件本来就写在最终目录里，没有暂存文件可转存。
+                if ready && task.engine != crate::task::EngineKind::Bt {
                     let target = {
                         let mut map = task_confirms.lock().await;
                         let c = map.entry(id).or_default();
@@ -644,7 +719,12 @@ impl DownloadManager {
     ///
     /// `path` 为 None 表示"直接下载"，用默认目录。
     /// 转存在下载完成时执行。
-    pub async fn confirm_path(&self, id: TaskId, path: Option<PathBuf>) -> Result<()> {
+    pub async fn confirm_path(
+        &self,
+        id: TaskId,
+        path: Option<PathBuf>,
+        files: Option<Vec<usize>>,
+    ) -> Result<()> {
         let mut task = self
             .inner
             .store
@@ -664,7 +744,44 @@ impl DownloadManager {
         // 落库，重启后也知道最终位置
         task.final_path = Some(resolved.clone());
         task.needs_confirm = false;
+
+        // BT 任务：用户选的是目录，文件按种子里的相对路径落在那里。
+        // 勾选的文件下标也一并落库，下一次 start 直接用。
+        if task.engine == crate::task::EngineKind::Bt {
+            if let Some(dir) = resolved.parent() {
+                if !dir.as_os_str().is_empty() {
+                    task.dir = dir.to_path_buf();
+                }
+            }
+            if let Some(files) = files {
+                let total = task.bt_files.as_ref().map(|f| f.files.len()).unwrap_or(0);
+                if files.is_empty() {
+                    return Err(anyhow!("至少要勾选一个文件"));
+                }
+                if let Some(bad) = files.iter().find(|i| **i >= total) {
+                    return Err(anyhow!("文件下标超出范围: {bad}"));
+                }
+                task.bt_selected = Some(files);
+            }
+        }
         self.inner.store.update_task(&task)?;
+
+        // BT 任务没有暂存文件，不需要转存；确认后直接启动/继续。
+        if task.engine == crate::task::EngineKind::Bt {
+            let never_started = !self.inner.running.lock().await.contains_key(&id);
+            if never_started {
+                self.start(id).await?;
+            } else if task.status == TaskStatus::AwaitingConfirm {
+                self.inner
+                    .store
+                    .set_status(id, TaskStatus::Downloading, None)?;
+                self.inner
+                    .events
+                    .send(TaskEvent::StatusChanged(id, TaskStatus::Downloading))
+                    .ok();
+            }
+            return Ok(());
+        }
 
         // 和下载结束那一步协调。
         //
@@ -790,7 +907,13 @@ impl DownloadManager {
 
                 for path in paths {
                     if path.exists() {
-                        tokio::fs::remove_file(&path).await.ok();
+                        // BT 的多文件种子落地的是一个目录，
+                        // remove_file 对目录会失败，得整棵删。
+                        if path.is_dir() {
+                            tokio::fs::remove_dir_all(&path).await.ok();
+                        } else {
+                            tokio::fs::remove_file(&path).await.ok();
+                        }
                     }
                 }
                 // 暂存目录空了就删掉
