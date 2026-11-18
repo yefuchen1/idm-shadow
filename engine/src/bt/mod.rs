@@ -58,6 +58,7 @@ pub fn download(
     // 界面上就能显示"坏块重传统计"。
     let mut session = if url.starts_with("magnet:") {
         let config = session_config_magnet(listen_port);
+        let url = normalize_magnet(url);
         // 磁力链接没有 tracker 会很难找到 peer，
         // 补一批实测可达的。
         let ctx = bittorrent_rs::TorrentSession::from_magnet(url, &download_dir)
@@ -81,6 +82,14 @@ pub fn download(
             .build()
             .context("创建 BT 会话失败")?
     };
+
+    // swarm 上限单独提。
+    //
+    // `config.max_connections` 管的是**出站**线程数，
+    // 但 peer 真正能不能进 swarm 是 `add_peer()` 说了算，
+    // 它拿 `ctx.maximum_swarm_size` 当准入条件（默认 100）。
+    // 不改这个字段的话，连接上限调再多也卡在 100 个。
+    raise_swarm_limit(&session, MAX_SWARM_SIZE);
 
     // 坏块记录：piece 序号 → 校验失败次数。
     // 库把校验结果内部消化掉了（失败就丢掉数据重下），
@@ -434,6 +443,33 @@ const MAX_CONNECTIONS: usize = 200;
 /// peer 候选队列上限。
 const MAX_PEER_CANDIDATES: usize = 2000;
 
+/// swarm 里同时保留的 peer 数上限。
+///
+/// 库把这个数写死在 `constants::MAXIMUM_SWARM_SIZE = 100`，
+/// 比 `config.max_connections` 更严格——后者管的是出站线程数，
+/// 前者管的是 peer 能不能进 swarm。不改这个的话连接上限调再多也卡在 100。
+const MAX_SWARM_SIZE: usize = 400;
+
+/// 把 swarm 的 peer 上限提上去。
+///
+/// `TorrentContext.maximum_swarm_size` 是 public 字段，
+/// `add_peer()` 拿它当准入条件：
+///
+/// ```text
+/// is_space_in_swarm(ip) => swarm.len() < self.maximum_swarm_size
+/// ```
+///
+/// 顺带把 `swarm_topology` / `swarm_manager` 里那份副本也改了，
+/// 免得 PEX 广播出去的时候还按 100 算。
+pub fn raise_swarm_limit(session: &TorrentSession, limit: usize) {
+    let ctx = session.context();
+    let mut guard = ctx.lock_safe();
+    guard.maximum_swarm_size = limit;
+    guard.swarm_topology.maximum_swarm_size = limit;
+    guard.swarm_manager.maximum_swarm_size = limit;
+    tracing::info!("BT: swarm 上限提到 {limit}");
+}
+
 /// 画图最多用多少格。
 const MAX_PIECE_CELLS: usize = 240;
 
@@ -506,6 +542,128 @@ fn build_piece_status(
         cells,
     }
 }
+/// 把磁力链接里的 base64 info hash 换成 hex。
+///
+/// 库的 `magnet` 解析器只认两种 v1 hash：40 位 hex 和 32 位 base32。
+/// 但磁力链接还有第三种常见写法——**base64**（27 个字符，
+/// 结尾带一个 `=`）。这种链接在浏览器里点开是能下的，
+/// 丢给我们却直接报「Invalid info hash format」。
+///
+/// 所以这里把 base64 解出来，改写成 hex 再交给库。
+/// 顺手也把 base32 归一成 hex，省得库那边两套解析逻辑。
+///
+/// 认不出来就原样返回，让库自己报错——
+/// 总比在这儿乱改要好。
+fn normalize_magnet(url: &str) -> String {
+    const PREFIX: &str = "urn:btih:";
+
+    // 找到 xt=urn:btih: 的位置。磁力链接里可能有多个 xt，
+    // 但 v1 的那个一定在最前面（v2 的是 urn:btmh:）。
+    let Some(start) = url.find(PREFIX) else {
+        return url.to_string();
+    };
+    let hash_start = start + PREFIX.len();
+    let hash_end = url[hash_start..]
+        .find('&')
+        .map(|i| hash_start + i)
+        .unwrap_or(url.len());
+    let hash = &url[hash_start..hash_end];
+
+    // 已经是 hex（40 位）就不用动了。
+    if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return url.to_string();
+    }
+
+    let bytes = if hash.len() == 27 || hash.len() == 28 {
+        // base64：20 字节 → 28 个字符（尾部带一个 '=' 填充）。
+        // 有的实现会省掉填充，就只剩 27 个——两种都认。
+        decode_base64_20(hash)
+    } else if hash.len() == 32 {
+        decode_base32_20(hash)
+    } else {
+        None
+    };
+
+    let Some(bytes) = bytes else {
+        return url.to_string();
+    };
+    if bytes.len() != 20 {
+        return url.to_string();
+    }
+
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut out = String::with_capacity(url.len() + 13);
+    out.push_str(&url[..hash_start]);
+    out.push_str(&hex);
+    out.push_str(&url[hash_end..]);
+    out
+}
+
+/// 解 base64 的 20 字节 info hash。
+fn decode_base64_20(s: &str) -> Option<Vec<u8>> {
+    // 磁力链接的 base64 用的字符集是标准的，
+    // 但有的实现会写成 URL-safe（'-' 和 '_'）。
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(20);
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+            if out.len() == 20 {
+                return Some(out);
+            }
+        }
+    }
+    if out.len() == 20 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 解 base32 的 20 字节 info hash。
+fn decode_base32_20(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(20);
+    let mut buf = 0u64;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        } as u64;
+        buf = (buf << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+            if out.len() == 20 {
+                return Some(out);
+            }
+        }
+    }
+    if out.len() == 20 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// 下载 .torrent 文件本身。
 fn fetch_torrent_file(url: &str, dir: &Path) -> Result<std::path::PathBuf> {
     // 已经是本地文件就直接用
@@ -562,6 +720,58 @@ mod tests {
         assert!(is_magnet("magnet:?xt=urn:btih:abc123"));
         assert!(is_magnet("MAGNET:?xt=urn:btih:abc"));
         assert!(!is_magnet("http://a.com/x.torrent"));
+    }
+
+    #[test]
+    fn magnet_base64_hash_is_rewritten_to_hex() {
+        // 真实的一组：base64 的 20 字节 info hash。
+        let m = "magnet:?xt=urn:btih:AcE3KH1vDtBaVnQtrnlPYyx5/z0=&dn=ubuntu";
+        let out = normalize_magnet(m);
+        assert_eq!(
+            out,
+            "magnet:?xt=urn:btih:01c137287d6f0ed05a56742dae794f632c79ff3d&dn=ubuntu"
+        );
+        // 改完库才认得。
+        assert!(bittorrent_rs::core::magnet::MagnetLink::parse(&out).is_ok());
+    }
+
+    #[test]
+    fn magnet_base32_hash_is_rewritten_to_hex() {
+        let m = "magnet:?xt=urn:btih:AHATOKD5N4HNAWSWOQW246KPMMWHT7Z5&dn=ubuntu";
+        let out = normalize_magnet(m);
+        assert_eq!(
+            out,
+            "magnet:?xt=urn:btih:01c137287d6f0ed05a56742dae794f632c79ff3d&dn=ubuntu"
+        );
+        assert!(bittorrent_rs::core::magnet::MagnetLink::parse(&out).is_ok());
+    }
+
+    #[test]
+    fn magnet_hex_hash_is_left_alone() {
+        let m = "magnet:?xt=urn:btih:01c137287d6f0ed05a56742dae794f632c79ff3d&dn=ubuntu";
+        assert_eq!(normalize_magnet(m), m);
+    }
+
+    #[test]
+    fn magnet_that_cannot_be_decoded_is_left_alone() {
+        // 长度不对、字符不认识——原样交给库，让它报原本的错。
+        let m = "magnet:?xt=urn:btih:!!!!&dn=ubuntu";
+        assert_eq!(normalize_magnet(m), m);
+
+        let m2 = "magnet:?xt=urn:btih:abc&dn=ubuntu";
+        assert_eq!(normalize_magnet(m2), m2);
+    }
+
+    #[test]
+    fn magnet_keeps_other_parameters() {
+        // 后面跟着 tracker 和别的参数时，只能换 hash 那一段。
+        let m = "magnet:?xt=urn:btih:AcE3KH1vDtBaVnQtrnlPYyx5/z0=\
+                 &dn=ubuntu&tr=udp%3A%2F%2Ftracker.example%3A80&ws=https%3A%2F%2Fmirror.example%2Ff";
+        let out = normalize_magnet(m);
+        assert!(out.starts_with("magnet:?xt=urn:btih:01c137287d6f0ed05a56742dae794f632c79ff3d"));
+        assert!(out.contains("&dn=ubuntu"));
+        assert!(out.contains("&tr=udp%3A%2F%2Ftracker.example%3A80"));
+        assert!(out.contains("&ws=https%3A%2F%2Fmirror.example%2Ff"));
     }
 
     #[test]

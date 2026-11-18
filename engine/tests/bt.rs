@@ -606,11 +606,269 @@ fn magnet_tasks_get_bt_engine() {
     assert!(idm_shadow_engine::bt::looks_like_bt(&req.url));
 }
 
+/// swarm 的 peer 上限要真的能提上去。
+///
+/// 库把 `maximum_swarm_size` 写死成 100，而 `add_peer()`
+/// 拿它当准入条件（`swarm.len() < maximum_swarm_size`）。
+/// 只调 `config.max_connections` 没用——那个管的是出站线程数，
+/// swarm 满了照样加不进新 peer。
+///
+/// 这个测试验证三件事：
+/// 1. 建好的会话默认确实是 100（证明库确实写死了）；
+/// 2. `raise_swarm_limit` 之后三个副本都被改了；
+/// 3. 改完之后 `is_space_in_swarm` 用的就是新的上限。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swarm_limit_can_be_raised_above_the_library_default() {
+    let dir = temp_dir("swarm-limit");
+    let payload: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let torrent_bytes = make_torrent_with_announce("data.bin", &payload, 16 * 1024, "");
+    let torrent_path = dir.join("test.torrent");
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+
+    let mut cfg = bittorrent_rs::session::config::SessionConfig::default();
+    cfg.listen_port = 0;
+    cfg.dht_port = 0;
+    cfg.dht_enabled = false;
+
+    let session = TorrentSession::builder(&torrent_path, &dir)
+        .seeding(false)
+        .config(cfg)
+        .build()
+        .expect("会话应当能建起来");
+
+    // 库写死的默认值。
+    {
+        let ctx = session.context();
+        let guard = ctx.lock_safe();
+        assert_eq!(
+            guard.maximum_swarm_size, 100,
+            "库的默认 swarm 上限应当是 100"
+        );
+    }
+
+    let raised = 400;
+    idm_shadow_engine::bt::raise_swarm_limit(&session, raised);
+
+    // 三个副本都要改到，不然 PEX 广播还按 100 算。
+    {
+        let ctx = session.context();
+        let guard = ctx.lock_safe();
+        assert_eq!(guard.maximum_swarm_size, raised);
+        assert_eq!(guard.swarm_topology.maximum_swarm_size, raised);
+        assert_eq!(guard.swarm_manager.maximum_swarm_size, raised);
+
+        // 准入判断用的是同一个字段。
+        assert!(
+            guard.is_space_in_swarm("10.0.0.1"),
+            "空 swarm 时任何 ip 都该有位置"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// 临时目录清理用得到。
 #[test]
 fn temp_dir_is_created() {
     let dir = temp_dir("sanity");
     assert!(dir.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 入站会话断开时，必须把它占着的块还回去。
+///
+/// 库在 peer 断开时只做 `remove_peer`，**不会**释放 block 占位
+/// （`Peer::close()` 里没这一步）。库的出站连接靠 worker 退出时的
+/// `check_request_timeouts` 兜底——超时 15 秒后才撤。
+///
+/// 我们是入站连接：会话一结束就没人来撤了。
+/// 占位记在全局 assembler 里，那个块从此不会被任何人要，
+/// 积少成多会让整个下载停摆。
+///
+/// 这个测试让一个 peer 握完手、发 bitfield、放开我们（Unchoke），
+/// 把我们要的块记下来，然后突然消失，
+/// 最后检查那些块在 assembler 里已经还回去了。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_disconnect_releases_reserved_blocks() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let piece_len = 16 * 1024;
+
+    let dir = temp_dir("inbound-release");
+    let torrent_bytes = make_torrent_with_announce(
+        "data.bin",
+        &payload,
+        piece_len,
+        "http://127.0.0.1:1/announce",
+    );
+    let info_hash = extract_info_hash(&torrent_bytes);
+    let torrent_path = dir.join("test.torrent");
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+
+    let mut cfg = bittorrent_rs::session::config::SessionConfig::default();
+    cfg.listen_port = 0;
+    cfg.dht_port = 0;
+    cfg.dht_enabled = false;
+
+    let mut session = TorrentSession::builder(&torrent_path, &dir)
+        .seeding(false)
+        .config(cfg)
+        .build()
+        .expect("会话应当能建起来");
+    session.start_download().expect("应当能启动下载");
+
+    let ctx = session.context();
+    let info_hash_arr: [u8; 20] = {
+        let guard = ctx.lock_safe();
+        let mut ih = [0u8; 20];
+        ih.copy_from_slice(&guard.info_hash[..20]);
+        ih
+    };
+
+    // 起入站监听。
+    let port = idm_shadow_engine::bt::listener::find_port(46200).unwrap();
+    let stats = Arc::new(idm_shadow_engine::bt::peer_session::InboundStats::default());
+    let listener_ctx = ctx.clone();
+    let listener_stats = stats.clone();
+    let _handle = idm_shadow_engine::bt::listener::spawn_inbound_listener(
+        &idm_shadow_engine::bt::listener::InboundConfig {
+            port,
+            enabled: true,
+        },
+        move |stream, addr| {
+            let peer_port = stream.peer_addr().map(|a| a.port()).unwrap_or(0);
+            idm_shadow_engine::bt::peer_session::handle_inbound_peer(
+                stream,
+                addr,
+                peer_port,
+                &info_hash_arr,
+                listener_ctx.clone(),
+                listener_stats.clone(),
+            );
+        },
+    )
+    .unwrap()
+    .expect("入站监听线程应当起来了");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 假装一个做种端：握手 → 发 bitfield → Unchoke。
+    // Unchoke 很关键：我们的入站会话只有在对端放开之后才会去要块，
+    // 才会真正在 assembler 里占位。
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("应当能连上");
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut hs = Vec::with_capacity(68);
+    hs.push(19);
+    hs.extend_from_slice(b"BitTorrent protocol");
+    hs.extend_from_slice(&[0u8; 8]);
+    hs.extend_from_slice(&info_hash);
+    hs.extend_from_slice(b"-SEED-0001-000000000");
+    conn.write_all(&hs).unwrap();
+    conn.flush().unwrap();
+
+    // 读对方握手，确认连上了。
+    let mut peer_hs = [0u8; 68];
+    conn.read_exact(&mut peer_hs).unwrap();
+
+    // 发 bitfield：我全都有。
+    let piece_count = payload.len().div_ceil(piece_len);
+    let bitfield_len = piece_count.div_ceil(8);
+    let mut bitfield = vec![0u8; bitfield_len];
+    for i in 0..piece_count {
+        bitfield[i / 8] |= 0x80 >> (i % 8);
+    }
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&((1 + bitfield.len()) as u32).to_be_bytes());
+    msg.push(5);
+    msg.extend_from_slice(&bitfield);
+    conn.write_all(&msg).unwrap();
+    conn.flush().unwrap();
+
+    // Unchoke：放开我们，我们才会开始要块。
+    conn.write_all(&[0, 0, 0, 1, 1]).unwrap();
+    conn.flush().unwrap();
+
+    // 把我们发出去的 Request 记下来——这些就是「被占住」的块。
+    let mut requested: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && requested.len() < 3 {
+            let mut len_buf = [0u8; 4];
+            if conn.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len == 0 {
+                // keep-alive
+                continue;
+            }
+            if len > buf.len() {
+                break;
+            }
+            if conn.read_exact(&mut buf[..len]).is_err() {
+                break;
+            }
+            // 消息 id 6 = Request
+            if buf[0] == 6 && len >= 13 {
+                let index = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+                let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
+                requested.push((index, begin));
+            }
+        }
+    }
+    assert!(
+        !requested.is_empty(),
+        "我们的入站会话应当已经向对方要过块，否则这个测试证明不了任何东西"
+    );
+
+    // 此刻这些块确实被占着（请求已发出，但对方不给数据）。
+    {
+        let guard = ctx.lock_safe();
+        for (pn, begin) in &requested {
+            let block_index = begin / 16384;
+            assert!(
+                guard.is_block_requested(*pn, block_index),
+                "块 ({pn}, {block_index}) 应当正被占着"
+            );
+        }
+    }
+
+    // 突然消失。
+    drop(conn);
+
+    // 等入站会话处理完断开。
+    for _ in 0..50 {
+        if stats.active() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        stats.active(),
+        0,
+        "入站会话应当已经结束"
+    );
+
+    // 关键断言：这些块必须已经还回全局 assembler。
+    // 不还的话它们永远不会被任何人要——下载会卡死。
+    let guard = ctx.lock_safe();
+    for (pn, begin) in &requested {
+        let block_index = begin / 16384;
+        assert!(
+            !guard.is_block_requested(*pn, block_index),
+            "块 ({pn}, {block_index}) 在入站会话断开后还被占着——它永远下不来了"
+        );
+    }
+    // 必须先放开 ctx 的锁。
+    // `session.stop()` 内部还会再拿一次 ctx 锁，
+    // `std::sync::Mutex` 不可重入——拿着锁不放就是自己把自己锁死。
+    drop(guard);
+
+    let _ = session.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -878,3 +1136,6 @@ fn inbound_peer_can_pull_data_from_us() {
     let _ = session.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+
+

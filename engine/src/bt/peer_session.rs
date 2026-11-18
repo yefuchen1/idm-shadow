@@ -357,7 +357,54 @@ fn run_session(
         guard.remove_peer(&peer_key);
     }
 
+    // 把这个 peer 手里还占着的块全部释放掉。
+    //
+    // 库在 peer 断开时只 `remove_peer`，**不会**释放 block 占位
+    // （`Peer::close()` 里没有这一步，`remove_peer` 也只清 unchoke 计数）。
+    // 库的出站连接靠 worker 线程退出时的 `check_request_timeouts`
+    // 兜底——超时 15 秒后才撤。
+    //
+    // 但我们是**入站**连接：会话一结束，占位就再也没人来撤了。
+    // 而占位是记在全局 assembler 里的，那个块从此不会被任何人要——
+    // 一个块占住就是 16 KB 永远下不下来，
+    // 积少成多会让整个下载停摆。
+    //
+    // 所以这里必须自己把占位清干净。
+    release_all_reservations(&ctx, &peer);
+
     result
+}
+
+/// 释放一个 peer 名下所有还占着的块。
+///
+/// peer 断开时，库不会替我们清这些占位，
+/// 不清的话那些块就永远下不来了。
+fn release_all_reservations(
+    ctx: &Arc<Mutex<TorrentContext>>,
+    peer: &Arc<Mutex<Peer>>,
+) {
+    let reserved: Vec<(u32, u32)> = {
+        let guard = peer.lock_safe();
+        guard
+            .reserved_blocks
+            .iter()
+            .map(|&(pn, bi, _)| (pn, bi))
+            .collect()
+    };
+    if reserved.is_empty() {
+        return;
+    }
+
+    {
+        let guard = ctx.lock_safe();
+        for (pn, bi) in &reserved {
+            guard.release_block_request(*pn, *bi);
+        }
+    }
+
+    let mut guard = peer.lock_safe();
+    guard.reserved_blocks.clear();
+    guard.outstanding_requests_count = 0;
 }
 
 /// 处理一条收到的消息。

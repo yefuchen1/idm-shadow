@@ -18,5 +18,10 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `system-proxy` 要显式开：`default-features = false` 把它关掉了。
+#
+# 不开的话 reqwest 不读 Windows 的系统代理设置，
+# 用户的浏览器/别的工具走了 Clash 之类的代理，我们这边却直连——
+# 表现就是同一个网址 curl 能下、程序里下不来。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "system-proxy"] }
 tokio = { version = "1", features = ["full"] }
