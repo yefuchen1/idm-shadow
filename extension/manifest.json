@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IDM Shadow",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "把浏览器里的下载交给 IDM Shadow 接管，支持油猴脚本触发的下载。",
   "permissions": [
     "downloads",
@@ -9,7 +9,8 @@
     "storage",
     "contextMenus",
     "alarms",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -20,7 +21,7 @@
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_idle",
-      "all_frames": false
+      "all_frames": true
     }
   ],
   "action": {

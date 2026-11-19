@@ -16,9 +16,18 @@ use crate::http::{RequestContext, ResourceMeta};
 use crate::limiter::RateLimiter;
 use crate::store::Store;
 use crate::task::{
-    is_temporary_name, resolve_download_filename, sanitize_filename, unique_path, EngineKind, Task,
-    TaskError, TaskId, TaskRequest, TaskStatus,
+    is_temporary_name, looks_like_image_url, resolve_download_filename, sanitize_filename,
+    unique_path, EngineKind, Task, TaskError, TaskId, TaskRequest, TaskStatus,
 };
+
+/// 定文件名时顺手带回来的探测结果。
+///
+/// Content-Type 用来兜住"没有后缀的图片预览"：扩展侧按 URL 拦一层，
+/// 引擎侧拿到响应头再确认一次。
+struct ResolvedFilename {
+    name: String,
+    meta: Option<ResourceMeta>,
+}
 
 /// 任务状态变化事件。UI 与扩展都靠它订阅。
 #[derive(Clone, Debug)]
@@ -204,10 +213,27 @@ impl DownloadManager {
     }
 
     /// 新建任务。落到队列里等待启动。
-    pub async fn add(&self, req: TaskRequest) -> Result<Task> {
+    pub async fn add(&self, mut req: TaskRequest) -> Result<Task> {
         if req.url.trim().is_empty() {
             return Err(anyhow!("URL 不能为空"));
         }
+
+        // 页面自动发起 / 浏览器恢复的下载，用户当时没有说"我要下"。
+        // 这类请求在应用这一层也必须拒绝——扩展可能漏判，老客户端
+        // 甚至不会带来源。宁可让浏览器自己下，也不能再自动弹框。
+        if req.source.is_blocked() {
+            return Err(anyhow!("这个下载不是用户发起的，已跳过"));
+        }
+
+        // 浏览器侧的图片预览（NAS 封面、图床缩略图）常常没有后缀，
+        // 但路径上写得很清楚。扩展会自动生成任务的话这里再拦一次。
+        if req.source.is_auto_capture() && looks_like_image_url(&req.url) {
+            return Err(anyhow!("图片预览不创建下载任务"));
+        }
+
+        // 确认框只给用户明确触发的下载。扩展/内部来源即使误带了
+        // needs_confirm，也不能打断用户。
+        req.needs_confirm = req.needs_confirm && req.source.may_confirm();
 
         let default_dir = self.default_dir().await;
         let dir = req
@@ -239,7 +265,15 @@ impl DownloadManager {
             crate::bt::suggested_filename(&req.url)
                 .unwrap_or_else(|| "magnet".to_string())
         } else {
-            let filename = self.resolve_task_filename(&req).await;
+            let resolved = self.resolve_task_filename(&req).await;
+            // Content-Type 是比 URL 更可靠的证据：`/api/capture_image`
+            // 没有后缀，服务器返回 image/jpeg。
+            if req.source.is_auto_capture()
+                && resolved.meta.as_ref().map(|m| m.is_image()).unwrap_or(false)
+            {
+                return Err(anyhow!("图片预览不创建下载任务"));
+            }
+            let filename = resolved.name;
             let path = unique_path(&dir, &filename);
             path.file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -253,7 +287,7 @@ impl DownloadManager {
         // 磁力任务要弹窗让用户确认保存位置、勾选文件。
         // 文件清单要等 prepare 阶段抓完 metadata 才有，弹窗先出现，
         // 清单到了再补上。
-        if task.engine == crate::task::EngineKind::Bt {
+        if task.engine == crate::task::EngineKind::Bt && task.source.may_confirm() {
             task.needs_confirm = true;
         }
 
@@ -288,7 +322,7 @@ impl DownloadManager {
     ///
     /// 调用方给的名字如果像"真的名字"，就直接用；只给了一堆占位词
     /// （`download`、`download (2)`、空），就当没给，探测服务器定名。
-    async fn resolve_task_filename(&self, req: &TaskRequest) -> String {
+    async fn resolve_task_filename(&self, req: &TaskRequest) -> ResolvedFilename {
         let provided = req.filename.as_deref().filter(|name| {
             let cleaned = sanitize_filename(name);
             !cleaned.is_empty() && !is_temporary_name(&cleaned)
@@ -301,15 +335,24 @@ impl DownloadManager {
         // 补上扩展名它才能被播放器认出来。
         if let Some(name) = provided {
             if crate::task::has_extension(&name) {
-                return name.to_string();
+                return ResolvedFilename {
+                    name: name.to_string(),
+                    meta: None,
+                };
             }
         }
 
         match self.probe_filename(req, provided).await {
-            Some(name) => name,
-            None => match provided {
-                Some(name) => sanitize_filename(name),
-                None => "download".to_string(),
+            Some((name, meta)) => ResolvedFilename {
+                name,
+                meta: Some(meta),
+            },
+            None => ResolvedFilename {
+                name: match provided {
+                    Some(name) => sanitize_filename(name),
+                    None => "download".to_string(),
+                },
+                meta: None,
             },
         }
     }
@@ -322,7 +365,7 @@ impl DownloadManager {
         &self,
         req: &TaskRequest,
         provided: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<(String, ResourceMeta)> {
         let client = crate::http::build_client(req.user_agent.as_deref()).ok()?;
         let ctx = RequestContext {
             url: req.url.clone(),
@@ -343,7 +386,7 @@ impl DownloadManager {
         if name.is_empty() {
             None
         } else {
-            Some(name)
+            Some((name, meta))
         }
     }
 

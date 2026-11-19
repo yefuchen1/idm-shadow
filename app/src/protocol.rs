@@ -1,7 +1,7 @@
 // 处理 idmshadow:// 协议链接。
 
 use idm_shadow_bridge::protocol::{self, ProtocolAction};
-use idm_shadow_engine::task::TaskRequest;
+use idm_shadow_engine::task::{TaskRequest, TaskSource};
 use tauri::{AppHandle, Manager as TauriManager};
 
 use crate::AppState;
@@ -42,6 +42,7 @@ fn create_task(app: &AppHandle, url: String, name: Option<String>) {
         let request = TaskRequest {
             url,
             filename: name,
+            source: TaskSource::Protocol,
             ..Default::default()
         };
         match manager.add(request).await {

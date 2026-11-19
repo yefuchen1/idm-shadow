@@ -12,7 +12,14 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const calls = { fetch: [], downloads: [], notifications: [], tabs: [], reload: [] };
+const calls = {
+  fetch: [],
+  downloads: [],
+  erase: [],
+  notifications: [],
+  tabs: [],
+  reload: []
+};
 let storage = {
   bridgeUrl: 'http://127.0.0.1:16888',
   token: 'test-token',
@@ -56,6 +63,7 @@ const chrome = {
     },
     onChanged: { addListener: (fn) => (listeners.onChanged = fn) },
     cancel: record('downloads'),
+    erase: record('erase'),
     search: async () => []
   },
   notifications: {
@@ -108,7 +116,9 @@ const chrome = {
     onAlarm: { addListener: (fn) => (listeners.onAlarm = fn) }
   },
   tabs: {
-    create: record('tabs')
+    create: record('tabs'),
+    query: async () => [],
+    onActivated: { addListener: (fn) => (listeners.onActivated = fn) }
   },
   action: {
     setBadgeText: () => {},
@@ -123,7 +133,7 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, reloadIfOutdated, compareVersions, extensionVersion };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, shouldSkipImage, isRestoredDownload, hasUserGesture, noteGesture, recentGestures, dropRestored, reloadIfOutdated, compareVersions, extensionVersion };`
 );
 
 const fetchCalls = [];
@@ -311,6 +321,159 @@ await test('关掉过滤之后图片照常接管', async () => {
   storage.skipImages = true;
 });
 
+await test('没有后缀的 NAS 预览图也会被跳过', async () => {
+  // 事故里漏掉的那一条：路径叫 capture_image，没有 .jpg，
+  // 文件名也只有 capture_image。只看后缀会当成正式下载。
+  const nas = 'http://192.168.2.39/api/capture_image?source=0';
+  assert.equal(api.looksLikeImage(nas), true);
+  assert.equal(api.looksLikeImage('capture_image'), true);
+  assert.equal(await api.shouldSkip({ url: nas, filename: 'capture_image' }), true);
+
+  // 服务器给了 image/* 也算。
+  assert.equal(
+    await api.shouldSkip({ url: 'https://x.com/api/raw', mime: 'image/jpeg' }),
+    true
+  );
+
+  // 主机名里带 images 不代表资源是图片。
+  assert.equal(api.looksLikeImage('https://images.example.com/file.zip'), false);
+});
+
+await test('浏览器恢复的旧下载不接管，0 字节记录会被清掉', async () => {
+  // 复现 2026-11-19 20:12 的事故：浏览器重启时把几天前没下完的
+  // 条目重新创建出来，startTime 还是旧的。它不是用户此刻发起的。
+  api.recentGestures.length = 0;
+  calls.downloads.length = 0;
+  calls.erase.length = 0;
+  fetchCalls.length = 0;
+
+  const old = new Date(Date.now() - 4 * 24 * 3600 * 1000).toISOString();
+  await listeners.onCreated({
+    id: 7001,
+    url: 'https://dl.kookapp.cn/assets/release/html_pc/kook_3321/Kook_PC_Setup.exe',
+    filename: 'Kook_PC_Setup.exe',
+    referrer: 'https://www.kookapp.cn/',
+    startTime: old,
+    bytesReceived: 0,
+    state: 'in_progress'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(
+    fetchCalls.filter((f) => f.url.endsWith('/api/v1/tasks')).length,
+    0,
+    '恢复的旧下载不该变成任务'
+  );
+  assert.equal(calls.downloads.length, 1, '应当取消浏览器恢复的下载');
+  assert.equal(calls.downloads[0][0], 7001);
+  assert.equal(calls.erase.length, 1, '应当清掉 0 字节的历史记录，避免下次启动再复活');
+  assert.equal(calls.erase[0][0].id, 7001);
+});
+
+await test('已经下了部分字节的恢复下载交给浏览器，不取消', async () => {
+  api.recentGestures.length = 0;
+  calls.downloads.length = 0;
+  calls.erase.length = 0;
+  fetchCalls.length = 0;
+
+  const old = new Date(Date.now() - 4 * 24 * 3600 * 1000).toISOString();
+  await listeners.onCreated({
+    id: 7002,
+    url: 'https://example.com/big.bin',
+    filename: 'big.bin',
+    referrer: 'https://example.com/',
+    startTime: old,
+    bytesReceived: 1024,
+    state: 'in_progress'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(
+    fetchCalls.filter((f) => f.url.endsWith('/api/v1/tasks')).length,
+    0
+  );
+  assert.equal(calls.downloads.length, 0, '已经下了部分字节的别动');
+  assert.equal(calls.erase.length, 0);
+});
+
+await test('页面自动发起的下载不接管、不取消', async () => {
+  // 没有任何用户手势，referrer 指向页面。这种是页面脚本自己下载，
+  // 不是用户点的。扩展不该投任务，也不该打断浏览器的下载。
+  api.recentGestures.length = 0;
+  calls.downloads.length = 0;
+  calls.erase.length = 0;
+  fetchCalls.length = 0;
+
+  await listeners.onCreated({
+    id: 8001,
+    url: 'https://ads.example.com/promo.exe',
+    filename: 'promo.exe',
+    referrer: 'https://ads.example.com/landing',
+    startTime: new Date().toISOString(),
+    bytesReceived: 0,
+    state: 'in_progress'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(
+    fetchCalls.filter((f) => f.url.endsWith('/api/v1/tasks')).length,
+    0,
+    '页面自动下载不该变成任务'
+  );
+  assert.equal(calls.downloads.length, 0, '也不该取消浏览器的下载');
+  assert.equal(calls.erase.length, 0);
+});
+
+await test('用户点击后的下载照常接管，并标记来源', async () => {
+  api.recentGestures.length = 0;
+  api.noteGesture('https://example.com/page', 'click');
+  calls.downloads.length = 0;
+  fetchCalls.length = 0;
+
+  await listeners.onCreated({
+    id: 8002,
+    url: 'https://example.com/setup.exe',
+    filename: 'setup.exe',
+    referrer: 'https://example.com/page',
+    startTime: new Date().toISOString(),
+    bytesReceived: 0,
+    state: 'in_progress'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const posted = fetchCalls.find(
+    (f) => f.options.method === 'POST' && f.url.endsWith('/api/v1/tasks')
+  );
+  assert.ok(posted, '用户点击的下载应当被接管');
+  const body = JSON.parse(posted.options.body);
+  assert.equal(body.source, 'user');
+  assert.equal(body.needs_confirm, true);
+  assert.equal(calls.downloads.length, 1, '接管成功后取消浏览器下载');
+});
+
+await test('没有 user 标记的 capture-url 不接管', async () => {
+  // 老内容脚本不会带 source。放进来就等于分不清点击和页面自动下载。
+  api.recentGestures.length = 0;
+  fetchCalls.length = 0;
+
+  const response = await new Promise((resolve) => {
+    listeners.onMessage(
+      {
+        type: 'capture-url',
+        url: 'https://example.com/auto.bin',
+        referer: 'https://example.com/'
+      },
+      { tab: { id: 1 }, url: 'https://example.com/' },
+      resolve
+    );
+  });
+  assert.equal(response.ok, false);
+  assert.equal(
+    fetchCalls.filter((f) => f.options.method === 'POST').length,
+    0
+  );
+});
+
 await test('blob: 与 data: URL 不接管', async () => {
   for (const url of ['blob:http://x/123', 'data:text/plain,hi', 'chrome-extension://abc/x']) {
     fetchCalls.length = 0;
@@ -323,6 +486,8 @@ await test('blob: 与 data: URL 不接管', async () => {
 await test('接管成功后取消浏览器下载', async () => {
   calls.downloads.length = 0;
   fetchCalls.length = 0;
+  api.recentGestures.length = 0;
+  api.noteGesture('https://example.com/', 'click');
   await listeners.onCreated({
     id: 7,
     url: 'https://example.com/x.zip',

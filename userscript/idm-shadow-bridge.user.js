@@ -109,6 +109,10 @@
         headers: opts.headers || {},
         engine: opts.engine || 'auto',
         maxConnections: opts.maxConnections,
+        // 油猴脚本的下载都是脚本自己触发的——通常是用户点了页面上的
+        // 某个按钮，或者脚本用了 GM_download()。应用那边要求写明
+        // 来源，不带的话会被当成"来源不明"拒掉。
+        source: opts.source || 'userscript',
         // 让应用弹保存位置确认框（IDM 式流程）
         needsConfirm: opts.needsConfirm !== false,
         autostart: true

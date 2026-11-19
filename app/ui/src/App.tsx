@@ -24,6 +24,7 @@ import {
   formatEta,
   formatSize,
   formatSpeed,
+  SOURCE_LABEL,
   STATUS_LABEL,
   type ExtensionStatus,
   type SettingsDto,
@@ -1019,6 +1020,12 @@ export default function App() {
                   }
                 >
                   {task.filename}
+                </span>
+                <span
+                  className={`source-badge ${task.source}`}
+                  title="任务来源：用户点击 / 页面自动 / 浏览器恢复 / 扩展接管 / 内部探测"
+                >
+                  {SOURCE_LABEL[task.source] ?? task.source}
                 </span>
                 <span className="suburl" title={task.url}>
                   {task.url}

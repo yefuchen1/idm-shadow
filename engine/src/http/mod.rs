@@ -39,6 +39,24 @@ pub struct ResourceMeta {
 }
 
 impl ResourceMeta {
+    /// 服务器明确说这是图片。
+    ///
+    /// 只在 Content-Type 可信时返回 true；`application/octet-stream`
+    /// 这种看不出来的不算。
+    pub fn is_image(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .map(|ct| {
+                ct.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("image/")
+            })
+            .unwrap_or(false)
+    }
+
     /// 判断是不是 HLS 播放列表。
     pub fn looks_like_hls(&self) -> bool {
         let url = self.final_url.to_ascii_lowercase();

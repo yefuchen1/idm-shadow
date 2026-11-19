@@ -1,7 +1,7 @@
 // 给前端用的 Tauri 命令。
 
 use idm_shadow_bridge::TaskDto;
-use idm_shadow_engine::task::{TaskId, TaskRequest};
+use idm_shadow_engine::task::{TaskId, TaskRequest, TaskSource};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager as TauriManager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -324,6 +324,7 @@ pub async fn add_task(
         filename,
         dir,
         needs_confirm: needs_confirm.unwrap_or(false),
+        source: TaskSource::Ui,
         ..Default::default()
     };
 

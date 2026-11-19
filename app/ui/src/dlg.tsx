@@ -2,7 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactDOM from "react-dom/client";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderCog } from "lucide-react";
-import { api, formatSize, formatSpeed, type TaskDto } from "./api";
+import {
+  api,
+  formatSize,
+  formatSpeed,
+  SOURCE_LABEL,
+  type TaskDto
+} from "./api";
 import "./styles.css";
 
 /**
@@ -264,6 +270,7 @@ function DownloadDialog() {
             {bytesDone && phase === "choose"
               ? " · 已下载完，等待确认保存位置"
               : ""}
+            {task?.source ? ` · 来源：${SOURCE_LABEL[task.source]}` : ""}
           </span>
         </div>
       </div>

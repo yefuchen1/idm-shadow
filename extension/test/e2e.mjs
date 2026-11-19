@@ -80,6 +80,48 @@ function startFileServer(payload) {
 function startPageServer() {
   return new Promise((resolvePromise) => {
     const server = require('node:http').createServer((req, res) => {
+      const path = (req.url || '/').split('?')[0];
+
+      // 页面脚本自己发起的下载：没有用户手势。
+      //
+      // 2026-11-19 的事故里，浏览器重启时把几天前没下完的下载重新
+      // 创建了一遍，扩展照单全收，7 个任务一起弹了确认框。
+      // 这一类（页面自动发起 / 浏览器恢复）都不该被接管。
+      if (path === '/auto') {
+        const html = `<!doctype html><html><body>
+<script>
+  // 页面自己跳转触发下载，没有用户参与。
+  //
+  // 延一点再跳：页面得先 load 完，测试的 goto 才不会卡在
+  // "等待 load" 上（跳去下载地址会让这次导航永远不结束）。
+  setTimeout(function () {
+    location.href = 'http://127.0.0.1:${SERVER_PORT}/auto.bin';
+  }, 300);
+</script>
+</body></html>`;
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Length': Buffer.byteLength(html)
+        });
+        res.end(html);
+        return;
+      }
+
+      // NAS 封面预览图：路径里没有后缀，Content-Type 是 image/jpeg。
+      if (path === '/api/capture_image') {
+        const png = Buffer.from(
+          '89504e470d0a1a0a0000000d494844520000000100000001080600000' +
+            '01f15c4890000000a49444154789c6300010000050001',
+          'hex'
+        );
+        res.writeHead(200, {
+          'Content-Type': 'image/png',
+          'Content-Length': png.length
+        });
+        res.end(png);
+        return;
+      }
+
       const html = `<!doctype html><html><body>
 <a id="dl" download="clip.mp4"
    href="http://127.0.0.1:${SERVER_PORT}/api/download?url=x">download</a>
@@ -544,6 +586,48 @@ try {
   const afterOff = await listTasks();
   check('off 模式不会自动接管', afterOff.length === beforeOff.length,
     `${beforeOff.length} -> ${afterOff.length}`);
+
+  // 页面脚本自己发起的下载：不接管，也不打断浏览器的下载。
+  //
+  // 事故的核心诉求。页面自动下载用户当时没表达过"我要下"，
+  // 接管它就等于替用户做决定。
+  await optPage.selectOption('#mode', 'auto');
+  await optPage.click('#save');
+
+  const beforeAuto = await listTasks();
+  const pageAuto = await browser.newPage();
+  try {
+    await pageAuto.goto(`http://127.0.0.1:${PAGE_PORT}/auto`);
+  } catch (err) {
+    if (!/Download is starting/i.test(err.message)) throw err;
+  }
+  await new Promise((r) => setTimeout(r, 3000));
+
+  const afterAuto = await listTasks();
+  check('页面自动发起的下载不会被接管',
+    afterAuto.length === beforeAuto.length,
+    `${beforeAuto.length} -> ${afterAuto.length}`);
+  check('页面自动发起的下载不会出现在任务里',
+    !afterAuto.some((t) => t.url.includes('/auto.bin')),
+    afterAuto.filter((t) => t.url.includes('/auto.bin')).map((t) => t.url).join(','));
+
+  // NAS 封面预览图：没有后缀，Content-Type 是图片。
+  const beforeShot = await listTasks();
+  const pageShot = await browser.newPage();
+  try {
+    await pageShot.goto(`http://127.0.0.1:${PAGE_PORT}/api/capture_image?source=0`);
+  } catch (err) {
+    if (!/Download is starting/i.test(err.message)) throw err;
+  }
+  await new Promise((r) => setTimeout(r, 3000));
+
+  const afterShot = await listTasks();
+  check('NAS 预览图不会被当成下载任务',
+    afterShot.length === beforeShot.length,
+    `${beforeShot.length} -> ${afterShot.length}`);
+  check('NAS 预览图不会出现在任务里',
+    !afterShot.some((t) => t.url.includes('/api/capture_image')),
+    afterShot.filter((t) => t.url.includes('/api/capture_image')).map((t) => t.url).join(','));
 
   // 最后确认：测试全程没往别的实例投任务。
   //

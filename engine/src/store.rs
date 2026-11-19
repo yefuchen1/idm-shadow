@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::interval::IntervalSet;
-use crate::task::{EngineKind, Task, TaskError, TaskId, TaskStatus};
+use crate::task::{EngineKind, Task, TaskError, TaskId, TaskSource, TaskStatus};
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -174,6 +174,11 @@ impl Store {
         add_column_if_missing(conn, "bt_files", "TEXT")?;
         add_column_if_missing(conn, "bt_selected", "TEXT")?;
         conn.execute("PRAGMA user_version = 3", [])?;
+
+        // v4：任务来源。老记录当作"用户点击"——那时候还没有来源概念，
+        // 也没有页面自动下载被接管的记录。
+        add_column_if_missing(conn, "source", "TEXT NOT NULL DEFAULT 'user'")?;
+        conn.execute("PRAGMA user_version = 4", [])?;
         Ok(())
     }
 
@@ -190,9 +195,9 @@ impl Store {
                 referer, user_agent, cookies, headers, max_connections, error,
                 etag, last_modified, accepts_ranges,
                 staging_path, final_path, needs_confirm,
-                bt_files, bt_selected, created_at, updated_at
+                bt_files, bt_selected, source, created_at, updated_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                      ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                      ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             "#,
             params![
                 task.id.to_string(),
@@ -217,6 +222,7 @@ impl Store {
                 task.needs_confirm as i64,
                 task.bt_files.as_ref().and_then(|v| serde_json::to_string(v).ok()),
                 task.bt_selected.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+                task.source.as_str(),
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
             ],
@@ -234,7 +240,7 @@ impl Store {
                 cookies = ?11, headers = ?12, max_connections = ?13, error = ?14,
                 etag = ?15, last_modified = ?16, accepts_ranges = ?17,
                 staging_path = ?18, final_path = ?19, needs_confirm = ?20,
-                bt_files = ?21, bt_selected = ?22, updated_at = ?23
+                bt_files = ?21, bt_selected = ?22, source = ?23, updated_at = ?24
             WHERE id = ?1
             "#,
             params![
@@ -260,6 +266,7 @@ impl Store {
                 task.needs_confirm as i64,
                 task.bt_files.as_ref().and_then(|v| serde_json::to_string(v).ok()),
                 task.bt_selected.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+                task.source.as_str(),
                 task.updated_at.to_rfc3339(),
             ],
         )?;
@@ -417,6 +424,10 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> Result<Task> {
             .map_err(|_| anyhow::anyhow!("任务 id 非法"))?,
         engine: EngineKind::from_str_opt(&row.get::<_, String>("engine")?)
             .unwrap_or(EngineKind::Auto),
+        source: row
+            .get::<_, Option<String>>("source")?
+            .and_then(|s| TaskSource::from_str_opt(&s))
+            .unwrap_or(TaskSource::User),
         url: row.get("url")?,
         filename: row.get("filename")?,
         dir: PathBuf::from(row.get::<_, String>("dir")?),

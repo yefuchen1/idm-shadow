@@ -14,6 +14,8 @@ export type TaskStatus =
 export interface TaskDto {
   id: string;
   engine: string;
+  /** 任务来源：user / page / restored / extension / userscript / protocol / ui / probe。 */
+  source: TaskSourceKind;
   url: string;
   filename: string;
   path: string;
@@ -42,6 +44,30 @@ export interface TaskDto {
   created_at: string;
   updated_at: string;
 }
+
+export type TaskSourceKind =
+  | "user"
+  | "page"
+  | "restored"
+  | "extension"
+  | "userscript"
+  | "protocol"
+  | "ui"
+  | "probe"
+  | "legacy";
+
+/** 来源的中文名。列表和弹窗里直接展示，误接管的来源一眼能认出来。 */
+export const SOURCE_LABEL: Record<TaskSourceKind, string> = {
+  user: "用户点击",
+  page: "页面自动",
+  restored: "浏览器恢复",
+  extension: "扩展接管",
+  userscript: "油猴脚本",
+  protocol: "协议唤起",
+  ui: "手动新建",
+  probe: "内部探测",
+  legacy: "旧版客户端"
+};
 
 export interface BtFileInfoDto {
   index: number;

@@ -105,6 +105,8 @@ await test('download 会 POST 到 bridge 并带上 referer 与 cookie', async ()
   assert.equal(body.filename, 'v.mp4');
   assert.equal(body.referer, 'https://example.com/page');
   assert.equal(body.cookies, 'a=1');
+  // 应用要求写明来源，否则会被当成"来源不明"拒掉。
+  assert.equal(body.source, 'userscript');
   assert.equal(result.id, 'abc');
 });
 

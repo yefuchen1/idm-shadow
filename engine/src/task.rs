@@ -65,6 +65,110 @@ impl EngineKind {
     }
 }
 
+/// 任务是从哪儿来的。
+///
+/// 起因是 2026-11-19 的事故：浏览器重启时恢复了 7 个几天前没下完的
+/// 下载，`downloads.onCreated` 把它们当成新下载，应用这边看不出区别，
+/// 于是自动开跑、连弹确认框。
+///
+/// 现在来源是任务模型的一部分：
+///  - `page` / `restored` / `legacy` 直接拒绝，不建任务；
+///  - `extension` 建任务但不自动开始、不弹框，等用户自己处理；
+///  - 只有 `user` / `userscript` 允许弹保存位置确认框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSource {
+    /// 用户在页面里点击、右键，或者在主界面手动新建。
+    #[default]
+    User,
+    /// 页面脚本自己发起的下载（没有用户手势）。
+    Page,
+    /// 浏览器启动时恢复的旧下载。
+    Restored,
+    /// 扩展接管了，但无法确认是用户手势（兼容/兜底）。
+    Extension,
+    /// 油猴脚本调用。
+    Userscript,
+    /// `idmshadow://` 协议唤起。
+    Protocol,
+    /// 主界面手动新建。
+    Ui,
+    /// 应用内部探测（检查更新等）。
+    Probe,
+    /// 老版本客户端没带来源。按不可信处理。
+    Legacy,
+}
+
+impl TaskSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskSource::User => "user",
+            TaskSource::Page => "page",
+            TaskSource::Restored => "restored",
+            TaskSource::Extension => "extension",
+            TaskSource::Userscript => "userscript",
+            TaskSource::Protocol => "protocol",
+            TaskSource::Ui => "ui",
+            TaskSource::Probe => "probe",
+            TaskSource::Legacy => "legacy",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(TaskSource::User),
+            "page" => Some(TaskSource::Page),
+            "restored" => Some(TaskSource::Restored),
+            "extension" => Some(TaskSource::Extension),
+            "userscript" => Some(TaskSource::Userscript),
+            "protocol" => Some(TaskSource::Protocol),
+            "ui" => Some(TaskSource::Ui),
+            "probe" => Some(TaskSource::Probe),
+            "legacy" => Some(TaskSource::Legacy),
+            _ => None,
+        }
+    }
+
+    /// 这些来源不允许建任务。
+    ///
+    /// 页面自动下载和浏览器恢复的下载在用户当时都没有表达过"我要下"，
+    /// 接管它们就是这次事故。未知来源也按不可信处理。
+    pub fn is_blocked(self) -> bool {
+        matches!(
+            self,
+            TaskSource::Page | TaskSource::Restored | TaskSource::Legacy
+        )
+    }
+
+    /// 能不能弹保存位置确认框。
+    ///
+    /// 只有用户明确触发的下载才有资格打断用户。页面自动/恢复/不确定
+    /// 手势的下载即使建了任务，也不弹框。
+    pub fn may_confirm(self) -> bool {
+        matches!(self, TaskSource::User | TaskSource::Userscript)
+    }
+
+    /// 建完任务后能不能立刻开始下载。
+    pub fn may_autostart(self) -> bool {
+        matches!(
+            self,
+            TaskSource::User
+                | TaskSource::Userscript
+                | TaskSource::Protocol
+                | TaskSource::Ui
+                | TaskSource::Probe
+        )
+    }
+
+    /// 是不是"浏览器自己发起"的来源。这类来源要做图片预览过滤。
+    pub fn is_auto_capture(self) -> bool {
+        matches!(
+            self,
+            TaskSource::Page | TaskSource::Restored | TaskSource::Extension
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -147,6 +251,8 @@ impl TaskError {
 pub struct Task {
     pub id: TaskId,
     pub engine: EngineKind,
+    /// 任务来源。界面上直接展示，排查误接管时不用再猜。
+    pub source: TaskSource,
     pub url: String,
     pub filename: String,
     pub dir: PathBuf,
@@ -188,6 +294,7 @@ impl Task {
         Self {
             id,
             engine: req.engine,
+            source: req.source,
             url: req.url,
             filename,
             dir,
@@ -260,6 +367,8 @@ pub struct TaskRequest {
     /// 是否需要用户确认保存位置（IDM 式弹窗流程）。
     pub needs_confirm: bool,
     pub engine: EngineKind,
+    /// 任务来源。调用方必须如实填写；老客户端缺省按 `Legacy` 处理。
+    pub source: TaskSource,
 }
 
 impl Default for TaskRequest {
@@ -275,6 +384,7 @@ impl Default for TaskRequest {
             max_connections: None,
             needs_confirm: false,
             engine: EngineKind::Auto,
+            source: TaskSource::User,
         }
     }
 }
@@ -382,6 +492,15 @@ pub fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
         "audio/ogg" => ".ogg",
         "audio/wav" | "audio/x-wav" => ".wav",
         "audio/flac" | "audio/x-flac" => ".flac",
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/bmp" | "image/x-ms-bmp" => ".bmp",
+        "image/svg+xml" => ".svg",
+        "image/avif" => ".avif",
+        "image/x-icon" | "image/vnd.microsoft.icon" => ".ico",
+        "image/tiff" => ".tiff",
         "application/pdf" => ".pdf",
         "application/zip" | "application/x-zip-compressed" => ".zip",
         "application/x-rar-compressed" | "application/vnd.rar" => ".rar",
@@ -392,6 +511,86 @@ pub fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
         _ => return None,
     };
     Some(ext)
+}
+
+/// URL 看起来是不是一张图片（带不带扩展名都算）。
+///
+/// 摄像头/NAS/图床的预览接口经常长成 `/api/capture_image`、`/snapshot`，
+/// 路径和文件名都没有 `.jpg`，只看后缀会漏。扩展侧已经挡了一层，
+/// 这里是引擎侧的兜底：老客户端、或者扩展漏判时还能拦住。
+pub fn looks_like_image_url(url: &str) -> bool {
+    if url.trim().is_empty() {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+
+    // 拆出路径和查询串（不关心主机名，避免 images.example.com/x.zip
+    // 这类主机名把压缩包误判成图片）。
+    let without_scheme = lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&lower);
+    let path_and_query = match without_scheme.find('/') {
+        Some(idx) => &without_scheme[idx..],
+        None => "",
+    };
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path_and_query, ""),
+    };
+
+    const IMAGE_EXT: &[&str] = &[
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif", ".ico", ".tif",
+        ".tiff",
+    ];
+    if IMAGE_EXT.iter().any(|ext| path.ends_with(ext)) {
+        return true;
+    }
+
+    const IMAGE_SEGMENTS: &[&str] = &[
+        "capture_image",
+        "capture-image",
+        "snapshot",
+        "screenshot",
+        "thumbnail",
+        "thumb",
+        "thumbs",
+        "preview",
+        "cover",
+        "poster",
+        "avatar",
+        "favicon",
+        "mjpeg",
+        "stream",
+        "photo",
+        "picture",
+        "image",
+        "images",
+        "img",
+    ];
+    if path
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .any(|seg| IMAGE_SEGMENTS.contains(&seg))
+    {
+        return true;
+    }
+
+    // `?format=jpg`、`?mime=image%2Fpng`
+    query.split('&').any(|pair| {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("");
+        if !matches!(key, "format" | "ext" | "type" | "mime" | "content-type") {
+            return false;
+        }
+        value.contains("image%2f")
+            || value.contains("image/")
+            || matches!(
+                value,
+                "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif" | "svg"
+            )
+    })
 }
 
 /// 统一的文件名定夺。

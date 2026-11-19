@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
 use idm_shadow_engine::manager::DownloadManager;
-use idm_shadow_engine::task::{EngineKind, Task, TaskId, TaskRequest};
+use idm_shadow_engine::task::{EngineKind, Task, TaskId, TaskRequest, TaskSource};
 
 pub const TOKEN_HEADER: &str = "x-idm-shadow-token";
 /// 扩展在每个请求上打这个头，用来判断"浏览器接管是不是真的在工作"。
@@ -103,6 +103,8 @@ impl IntoResponse for ApiError {
 pub struct TaskDto {
     pub id: String,
     pub engine: String,
+    /// 任务来源：user / page / restored / extension / userscript / protocol / ui / probe。
+    pub source: String,
     pub url: String,
     pub filename: String,
     pub path: String,
@@ -197,6 +199,7 @@ impl TaskDto {
         Self {
             id: task.id.to_string(),
             engine: task.engine.as_str().to_string(),
+            source: task.source.as_str().to_string(),
             url: task.url.clone(),
             filename: task.filename.clone(),
             // 用户在确认弹窗里选了别的位置时，文件其实落在 final_path。
@@ -292,6 +295,8 @@ pub struct CreateTaskBody {
     /// 是否弹出保存位置确认（IDM 式流程）。默认 false。
     #[serde(default, alias = "needsConfirm")]
     pub needs_confirm: bool,
+    /// 任务来源。新增字段；老客户端不带，按不可信处理。
+    pub source: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -299,7 +304,16 @@ fn default_true() -> bool {
 }
 
 impl CreateTaskBody {
+    /// 解析来源。缺省/未知一律按 `Legacy` 处理，不能当成用户点击。
+    fn source_kind(&self) -> TaskSource {
+        self.source
+            .as_deref()
+            .and_then(TaskSource::from_str_opt)
+            .unwrap_or(TaskSource::Legacy)
+    }
+
     pub fn into_request(self) -> TaskRequest {
+        let source = self.source_kind();
         TaskRequest {
             url: self.url,
             filename: self.filename,
@@ -310,12 +324,13 @@ impl CreateTaskBody {
             headers: self.headers.into_iter().collect(),
             // None = 跟随全局设置
             max_connections: self.max_connections.map(|v| v.clamp(1, 64)),
-            needs_confirm: self.needs_confirm,
+            needs_confirm: self.needs_confirm && source.may_confirm(),
             engine: self
                 .engine
                 .as_deref()
                 .and_then(EngineKind::from_str_opt)
                 .unwrap_or(EngineKind::Auto),
+            source,
         }
     }
 }
@@ -530,7 +545,16 @@ async fn create_task(
         return Err(ApiError::new("invalid_request", "URL 不能为空"));
     }
 
-    let autostart = body.autostart;
+    let source = body.source_kind();
+    if source.is_blocked() {
+        return Err(ApiError::new(
+            "not_user_triggered",
+            "这个下载不是用户发起的，已跳过。请在扩展里重新加载后重试。",
+        ));
+    }
+
+    // 无法确认用户手势的来源可以建任务，但不自动开始、不弹框。
+    let autostart = body.autostart && source.may_autostart();
     let request = body.into_request();
     let task = state
         .manager

@@ -636,6 +636,30 @@ body {
   color: var(--accent);
 }
 
+/* 任务来源。事故之后加的：误接管的下载和用户点击的下载
+   在列表里必须一眼能分开。 */
+.source-badge {
+  align-self: flex-start;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #eceff3;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.source-badge.page,
+.source-badge.restored,
+.source-badge.legacy {
+  background: #fdf0ef;
+  color: var(--red);
+}
+
+.source-badge.extension {
+  background: #fdf3e3;
+  color: var(--amber);
+}
+
 .conn-list {
   display: flex;
   flex-wrap: wrap;

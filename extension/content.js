@@ -13,6 +13,12 @@
   if (window.__idmShadowInjected) return;
   window.__idmShadowInjected = true;
 
+  // 只有顶层页面才挂「↓ IDM」按钮。
+  //
+  // 内容脚本在所有框架里都跑（iframe 里的点击不会冒泡到顶层，
+  // 手势消息会丢），但按钮每个框架都挂一份就到处都是了。
+  const isTop = window.top === window;
+
   const MEDIA_RE = /\.(m3u8|mp4|mkv|webm|flv|ts)(\?|#|$)/i;
 
   // 是不是跨源的。
@@ -31,7 +37,15 @@
 
   function send(url, filename) {
     chrome.runtime.sendMessage(
-      { type: 'capture-url', url: url, filename: filename || '', referer: location.href },
+      {
+        type: 'capture-url',
+        url: url,
+        filename: filename || '',
+        referer: location.href,
+        // 这是用户点了按钮才发出来的。后台只认带这个标记的请求，
+        // 页面脚本没法伪造（内容脚本在隔离世界里）。
+        source: 'user'
+      },
       (response) => {
         if (chrome.runtime.lastError) {
           console.warn('[IDM Shadow] 发送失败', chrome.runtime.lastError);
@@ -63,6 +77,7 @@
   }
 
   function scan() {
+    if (!isTop) return;
     document.querySelectorAll('a[href]').forEach((anchor) => {
       if (anchor.dataset.idmShadowDone) return;
       const href = anchor.getAttribute('href') || '';
@@ -91,6 +106,12 @@
     document.addEventListener(
       'click',
       (event) => {
+        // 只认真实点击。
+        //
+        // `isTrusted` 为 false 说明这个事件是页面脚本用
+        // dispatchEvent 造出来的——那不是用户点的。放进来等于
+        // 给页面留了一个"假装用户下载"的后门。
+        if (!event.isTrusted) return;
         // 只处理左键单击。右键菜单另说（浏览器自己会弹"下载"菜单项）。
         if (event.defaultPrevented) return;
         if (event.button !== 0) return;
@@ -131,7 +152,8 @@
             type: 'capture-url',
             url: resolved,
             filename: name,
-            referer: location.href
+            referer: location.href,
+            source: 'user'
           },
           (response) => {
             if (chrome.runtime.lastError) {
@@ -172,4 +194,44 @@
   setTimeout(() => clearInterval(timer), 60000);
   scan();
   installDownloadInterceptor();
+
+  // 把用户手势报给后台。
+  //
+  // `downloads.onCreated` 分不清"用户点了下载"和"页面自己下载"。
+  // 真实点击的 `isTrusted` 是 true；页面脚本 dispatch 的点击是 false，
+  // 这里只报前者。后台据此决定要不要接管。
+  let lastGestureAt = 0;
+  function reportGesture(kind) {
+    const now = Date.now();
+    // 连点几下不用每一下都发消息。
+    if (now - lastGestureAt < 400) return;
+    lastGestureAt = now;
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'user-gesture', pageUrl: location.href, kind: kind },
+        () => {
+          // 后台可能刚重载，读一下 lastError 免得控制台报
+          // "Unchecked runtime.lastError"。
+          void chrome.runtime.lastError;
+        }
+      );
+    } catch (err) {
+      // 扩展上下文失效（刚更新/重载），等页面刷新后重新注入
+    }
+  }
+
+  document.addEventListener(
+    'click',
+    (event) => {
+      if (event.isTrusted) reportGesture('click');
+    },
+    true
+  );
+  document.addEventListener(
+    'contextmenu',
+    (event) => {
+      if (event.isTrusted) reportGesture('context');
+    },
+    true
+  );
 })();

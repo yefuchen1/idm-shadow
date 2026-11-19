@@ -20,6 +20,38 @@ const DEFAULTS = {
 // 图片类后缀。用来把"页面预览图"挡在接管之外。
 const IMAGE_EXT = /\.(jpe?g|png|gif|webp|bmp|svg|avif|ico|tiff?)$/i;
 
+// 没有后缀的图片接口。摄像头/NAS/图床经常把预览图放在
+// `/api/capture_image`、`/snapshot`、`/thumbnail` 这类路径上，
+// URL 和文件名都没有扩展名，只看后缀会漏过去。
+const IMAGE_PATH =
+  /(?:^|\/)(?:api\/)?(?:capture[_-]?image|snapshot|screenshot|thumbnail|thumbs?|preview|cover|poster|avatar|favicon|frame|mjpeg|stream|photo|picture|images?|img)(?:[\/._-]|$)/i;
+
+// 查询串里明确写了图片格式的（`?format=jpg`、`?mime=image/png`）。
+const IMAGE_QUERY =
+  /(?:^|[?&])(?:format|ext|type|mime|content-?type)=(?:image%2f|image\/|jpe?g|png|gif|webp|bmp|avif|svg)/i;
+
+/// 任务来源。写进任务库，界面上直接给用户看。
+///
+/// 这不是"锦上添花"的字段：事故里 7 个任务全是浏览器恢复的旧下载，
+/// 但任务库里看不出任何区别。有了来源，误接管一眼就能认出来。
+const SOURCE = {
+  USER: 'user',
+  PAGE: 'page',
+  RESTORED: 'restored',
+  EXTENSION: 'extension'
+};
+
+/// 浏览器恢复的旧下载，`startTime` 会保留原始时间。
+/// 超过这个年龄的 `onCreated` 不可能是刚刚的用户点击。
+const RESTORED_AGE_MS = 10 * 60 * 1000;
+
+/// 用户点击/右键之后，多久内发生的下载算"用户发起的"。
+///
+/// 页面里的下载经常是异步的：点击 → 请求签名地址 → 再触发下载。
+/// 30 秒足够覆盖这条链路，又不会让几分钟后的页面自动下载蹭到。
+const GESTURE_TTL_MS = 30 * 1000;
+const CONTEXT_GESTURE_TTL_MS = 2 * 60 * 1000;
+
 // 打到本地 bridge 的请求都带上这个头，应用靠它判断扩展还活着
 // （设置页显示"已连接 / 未连接"）。不参与鉴权——鉴权始终是 token。
 const CLIENT_HEADER = 'X-IDM-Shadow-Client';
@@ -70,9 +102,33 @@ function basename(name) {
 
 function looksLikeImage(text) {
   if (!text) return false;
-  // 去掉查询串再判断后缀
-  const path = String(text).split(/[?#]/)[0];
-  return IMAGE_EXT.test(path);
+  const raw = String(text).trim();
+  let path = raw;
+  let search = '';
+
+  // 有协议头的按 URL 解析，只看路径和查询串。
+  //
+  // 不能直接对整串做路径匹配：`https://images.example.com/x.zip`
+  // 会把主机名里的 "images" 也匹配进来，把压缩包当成图片。
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
+    try {
+      const url = new URL(raw);
+      path = url.pathname;
+      search = url.search;
+    } catch (err) {
+      return false;
+    }
+  } else {
+    const cut = raw.search(/[?#]/);
+    if (cut >= 0) {
+      path = raw.slice(0, cut);
+      search = raw.slice(cut);
+    }
+  }
+
+  return (
+    IMAGE_EXT.test(path) || IMAGE_PATH.test(path) || IMAGE_QUERY.test(search)
+  );
 }
 
 // 本地文件：浏览器不会为这些触发"下载"，但页面另存、file:// 打开、
@@ -96,7 +152,13 @@ function isLocalFile(item) {
 async function shouldSkipImage(item) {
   const s = await settings();
   if (!s.skipImages) return false;
-  return looksLikeImage(item.url) || looksLikeImage(item.filename);
+  if (looksLikeImage(item.url) || looksLikeImage(item.filename)) return true;
+
+  // 服务器已经告诉我们这是图片。`onCreated` 阶段 mime 有时还没到，
+  // 但恢复的下载、带 Content-Disposition 的响应通常已经有了。
+  const mime = item.mime || item.mimeType || '';
+  if (/^image\//i.test(String(mime).trim())) return true;
+  return false;
 }
 
 // 这个下载要不要放过去不管。
@@ -114,6 +176,101 @@ let followAppMode = true;
 
 // downloadId → 任务 id。文件名定下来后要回填。
 const taskByDownload = {};
+
+// 最近发生过的用户手势（页面里的点击 / 右键）。
+//
+// 浏览器不告诉扩展"这个下载是不是用户点的"。`downloads.onCreated`
+// 对用户点击、页面脚本自动下载、浏览器恢复旧下载一视同仁。
+// 内容脚本在真实点击时发一条消息过来，这里记一小段时间；
+// 只有带着手势的下载才允许接管。
+//
+// 放内存里就够：点击和下载几乎同时发生，service worker 不会在这中间
+// 被回收。真被回收了，最坏结果是这次交给浏览器下载，不会误接管。
+const recentGestures = [];
+
+function stripHash(url) {
+  return String(url || '').split('#')[0];
+}
+
+/// 取 origin + pathname 用来比手势。
+///
+/// 不直接比整串：浏览器给的 referrer 和页面自己的 location.href
+/// 经常差在尾斜杠、端口写法、或者重定向后的路径上。按整串比会把
+/// 用户真正的点击判成"没有手势"，正常的下载就接不上了。
+function gestureKey(url) {
+  const raw = stripHash(url);
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`.toLowerCase();
+  } catch (err) {
+    return raw.toLowerCase();
+  }
+}
+
+function noteGesture(pageUrl, kind) {
+  const now = Date.now();
+  recentGestures.push({
+    url: gestureKey(pageUrl),
+    raw: stripHash(pageUrl),
+    at: now,
+    ttl: kind === 'context' ? CONTEXT_GESTURE_TTL_MS : GESTURE_TTL_MS
+  });
+  // 只留最近的几十条，别让一个自动点击的页面把内存撑起来。
+  while (recentGestures.length > 40) recentGestures.shift();
+}
+
+/// 这个下载有没有用户手势。
+///
+/// - 有 referrer：必须是同一个页面上的点击/右键；
+/// - 没有 referrer：地址栏输入、直接导航、浏览器 UI 发起的下载，
+///   这类本来就没有页面手势，放行。
+function hasUserGesture(referrer) {
+  const ref = stripHash(referrer);
+  if (!ref) return true;
+  const key = gestureKey(ref);
+
+  const now = Date.now();
+  for (let i = recentGestures.length - 1; i >= 0; i--) {
+    const g = recentGestures[i];
+    if (now - g.at > g.ttl) continue;
+    if (g.url === key || g.raw === ref) return true;
+  }
+  return false;
+}
+
+/// 浏览器恢复的旧下载。
+///
+/// Chromium 重启后会把 `state=in_progress` 的下载重新创建一遍，
+/// `startTime` 保留的是原始时间。事故里 7 个任务全是 3~5 天前的记录，
+/// 却以"新下载"的形式出现在 `onCreated` 里。
+function isRestoredDownload(item) {
+  const started = Date.parse(item && item.startTime ? item.startTime : '');
+  if (!Number.isFinite(started)) return false;
+  return Date.now() - started > RESTORED_AGE_MS;
+}
+
+/// 取消并清掉浏览器自己恢复的旧下载。
+///
+/// 只处理 0 字节的：这种记录每次浏览器启动都会被重新拉起来，
+/// 不清掉就会一直复活。已经下了部分字节的交给浏览器，别动用户数据。
+async function dropRestored(item) {
+  try {
+    await chrome.downloads.cancel(item.id);
+  } catch (err) {
+    // 下载可能已经结束
+  }
+  try {
+    await chrome.downloads.erase({ id: item.id });
+  } catch (err) {
+    // 老版本浏览器没有 erase，或者条目已经没了
+  }
+  console.info(
+    '[IDM Shadow] 已忽略浏览器恢复的旧下载:',
+    item.url,
+    item.startTime
+  );
+}
 
 /// 改任务的文件名。
 async function renameTask(taskId, filename) {
@@ -424,7 +581,10 @@ async function launchApp(url, name) {
 }
 
 // 把一个下载项交给应用。
-async function capture(item) {
+//
+// `source` 会原样写进任务库。只有 `user` 才允许弹保存位置确认框——
+// 页面自动发起的、浏览器恢复的下载没有资格打断用户。
+async function capture(item, source = SOURCE.USER) {
   const url = item.url || '';
   if (!url) return false;
   // blob / data URL 由页面内生命周期决定，引擎取不到
@@ -457,8 +617,9 @@ async function capture(item) {
     cookies: await cookieHeader(url),
     engine: 'auto',
     autostart: true,
-    // 让应用弹保存位置确认框（IDM 式流程）
-    needs_confirm: true
+    source,
+    // 让应用弹保存位置确认框（IDM 式流程）。只对用户点击生效。
+    needs_confirm: source === SOURCE.USER
   };
 
   let task = await tryCreateTask(payload);
@@ -558,12 +719,38 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (await isHandled(item.id)) return;
 
   if (mode === 'auto') {
+    // 1. 浏览器恢复的旧下载。
+    //
+    // 这不是用户此刻发起的：浏览器重启时会把上次没下完的条目
+    // 重新创建一遍，历史记录里的 startTime 还是几天前。
+    // 事故就是这么来的——7 个旧下载同时复活，7 个确认框一起弹。
+    //
+    // 不接管。0 字节的连历史一起清掉，免得每次启动都复活；
+    // 已经下了部分字节的留给浏览器，不动用户数据。
+    if (isRestoredDownload(item)) {
+      if ((item.bytesReceived || 0) === 0) {
+        await dropRestored(item);
+      }
+      return;
+    }
+
+    // 2. 页面自己发起的下载。
+    //
+    // onCreated 不区分"用户点了下载"和"页面脚本自己下载"。
+    // 内容脚本在真实点击时记一笔手势，这里只认带手势的。
+    // 没有手势就交给浏览器：不投任务，也不取消，页面自己的行为
+    // 不该由我们来打断。
+    if (!hasUserGesture(item.referrer || item.referer)) {
+      console.info('[IDM Shadow] 页面自动发起的下载，交给浏览器:', item.url);
+      return;
+    }
+
     // 过滤掉的（比如页面预览图）不接管。
     // 也不取消浏览器的下载——让它自己下下去，我们不打扰用户。
     if (await shouldSkip(item)) {
       return;
     }
-    const ok = await capture(item);
+    const ok = await capture(item, SOURCE.USER);
     if (ok) {
       try {
         await chrome.downloads.cancel(item.id);
@@ -609,6 +796,7 @@ chrome.runtime.onInstalled.addListener(() => {
 // 应用可能换了端口（上一个占着），token 也可能重新生成过。
 chrome.runtime.onStartup.addListener(() => {
   autoConfigure(true);
+  injectActiveTabs();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -652,8 +840,68 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // 定期问桌面应用"默认下载工具"的开关有没有变。
 chrome.alarms.create('sync-app-mode', { periodInMinutes: 1 });
 
+// 扩展更新/重载之后，已经打开的页面里没有内容脚本了。
+//
+// Manifest 里的 content_scripts 只在新导航时注入。用户不会为了
+// 一次扩展更新去刷新所有标签页，而这些页面里的点击恰恰需要
+// 手势消息才能被认成"用户主动下载"。所以把当前活动标签页补一针，
+// 之后切换标签页时也各补一针。页面里已有脚本时它会自己跳过。
+const injectedTabs = new Set();
+
+async function injectContentInto(tabId) {
+  if (!chrome.scripting || !chrome.scripting.executeScript) return;
+  if (!tabId || injectedTabs.has(tabId)) return;
+  injectedTabs.add(tabId);
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content.js']
+    });
+  } catch (err) {
+    // chrome:// / edge:// 页面、还没加载完的标签页注入不了，忽略。
+    injectedTabs.delete(tabId);
+  }
+}
+
+async function injectActiveTabs() {
+  if (!chrome.tabs || !chrome.tabs.query) return;
+  try {
+    const tabs = await chrome.tabs.query({ active: true });
+    for (const tab of tabs) {
+      await injectContentInto(tab.id);
+    }
+  } catch (err) {
+    // 拿不到标签页就算了，新导航时 manifest 会注入
+  }
+}
+
+if (chrome.tabs && chrome.tabs.onActivated) {
+  chrome.tabs.onActivated.addListener(({ tabId }) => {
+    injectContentInto(tabId);
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === 'user-gesture') {
+    // 内容脚本在真实点击/右键时发来的。页面自己 dispatch 的
+    // click 事件 `isTrusted` 是 false，内容脚本那边已经挡住了。
+    noteGesture(
+      message.pageUrl || (sender && sender.url) || (sender && sender.tab && sender.tab.url),
+      message.kind
+    );
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message && message.type === 'capture-url') {
+    // 只接受内容脚本在用户点击时发来的请求。
+    //
+    // 老内容脚本不带 source，一律拒绝：它分不清点击和页面自动下载，
+    // 放进来就等于把刚堵上的口子又打开了。拒绝之后内容脚本会让
+    // 浏览器自己下载，不会丢文件。
+    if (message.source !== SOURCE.USER) {
+      sendResponse({ ok: false });
+      return false;
+    }
     // 内容脚本发来的接管请求也要守模式。
     //
     // 用户在设置里选了"不接管"，内容脚本却照样把下载抢走的话，
@@ -661,11 +909,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     settings()
       .then((s) => {
         if (effectiveMode(s) === 'off') return false;
-        return capture({
-          url: message.url,
-          filename: message.filename || '',
-          referer: message.referer
-        });
+        return capture(
+          {
+            url: message.url,
+            filename: message.filename || '',
+            referer: message.referer
+          },
+          SOURCE.USER
+        );
       })
       .then((ok) => sendResponse({ ok }))
       .catch(() => sendResponse({ ok: false }));
@@ -702,3 +953,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // 顺便把应用带的扩展版本问回来：比自己的旧就自己重载。
 syncWithApp();
 updateBadge();
+injectActiveTabs();
