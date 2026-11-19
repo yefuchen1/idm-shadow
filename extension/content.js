@@ -13,6 +13,41 @@
   if (window.__idmShadowInjected) return;
   window.__idmShadowInjected = true;
 
+  // 扩展上下文还有效吗？
+  //
+  // 扩展更新/重载之后，页面里跑的这份脚本就变成了"孤儿"：
+  // 监听器还挂着，但 chrome.runtime.sendMessage 已经失效，
+  // 发出去的消息没人接。而它拦住跨源 a[download] 那一步用了
+  // preventDefault()——消息发不出去，点击就彻底没反应。
+  //
+  // 后台靠这个标记判断要不要往页面里补一份新的。
+  function contextAlive() {
+    try {
+      // 扩展被停用/重载之后，sendMessage 会失败。
+      //
+      // 不能只看 chrome.runtime.id——重载前后 id 是一样的。
+      // 真正会变的是 sendMessage 的回调：上下文还在时它会带响应，
+      // 上下文没了就抛 "Extension context invalidated"。
+      //
+      // 这里用一次真实的往返来判断。代价是几十秒一次，很轻。
+      return new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage(
+            { type: 'content-alive' },
+            (response) => {
+              void chrome.runtime.lastError;
+              resolve(Boolean(response && response.alive));
+            }
+          );
+        } catch (err) {
+          resolve(false);
+        }
+      });
+    } catch (err) {
+      return Promise.resolve(false);
+    }
+  }
+
   // 只有顶层页面才挂「↓ IDM」按钮。
   //
   // 内容脚本在所有框架里都跑（iframe 里的点击不会冒泡到顶层，
@@ -103,9 +138,8 @@
   // 所以这里在捕获阶段先拦下来，交给后台去下载。
   // 拦不住或者后台失败，就让浏览器按原来的方式走（见下面的兜底）。
   function installDownloadInterceptor() {
-    document.addEventListener(
-      'click',
-      (event) => {
+    // 记下来，扩展重载后要能摘掉（见 __idmShadowCleanup）。
+    onDownloadClick = (event) => {
         // 只认真实点击。
         //
         // `isTrusted` 为 false 说明这个事件是页面脚本用
@@ -167,9 +201,8 @@
             }
           }
         );
-      },
-      true
-    );
+    };
+    document.addEventListener('click', onDownloadClick, true);
   }
 
   // 接管失败时的兜底：让浏览器自己下。
@@ -190,10 +223,9 @@
     }
   }
 
-  const timer = setInterval(scan, 1500);
-  setTimeout(() => clearInterval(timer), 60000);
-  scan();
-  installDownloadInterceptor();
+  // 跨源 a[download] 的拦截器。函数体在下面赋值，这里先声明，
+  // 好让 __idmShadowCleanup 能把它摘掉。
+  let onDownloadClick = null;
 
   // 把用户手势报给后台。
   //
@@ -220,18 +252,45 @@
     }
   }
 
-  document.addEventListener(
-    'click',
-    (event) => {
-      if (event.isTrusted) reportGesture('click');
-    },
-    true
-  );
-  document.addEventListener(
-    'contextmenu',
-    (event) => {
-      if (event.isTrusted) reportGesture('context');
-    },
-    true
-  );
+  // 监听器都记下来，扩展重载后要能把自己摘掉。
+  const onClick = (event) => {
+    if (event.isTrusted) reportGesture('click');
+  };
+  const onContextMenu = (event) => {
+    if (event.isTrusted) reportGesture('context');
+  };
+
+  const timer = setInterval(scan, 1500);
+  setTimeout(() => clearInterval(timer), 60000);
+  scan();
+  installDownloadInterceptor();
+
+  document.addEventListener('click', onClick, true);
+  document.addEventListener('contextmenu', onContextMenu, true);
+
+  // 后台在补新脚本之前会调这个，把旧脚本的监听器和定时器摘掉。
+  //
+  // 不摘的话新旧两个脚本会同时拦点击：新脚本能正常工作，但旧脚本
+  // 那个失效的 sendMessage 回调会先 preventDefault，消息发不出去。
+  window.__idmShadowCleanup = function () {
+    clearInterval(timer);
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('contextmenu', onContextMenu, true);
+    document.removeEventListener('click', onDownloadClick, true);
+    window.__idmShadowInjected = false;
+    window.__idmShadowAlive = false;
+  };
+
+  // 活着标记。后台靠它判断页面里这份脚本还能用。
+  //
+  // 定期更新：扩展被停用/重载之后 sendMessage 就发不出去了，
+  // 这时把标记翻成 false，后台就知道该往页面里补一份新的。
+  contextAlive().then((alive) => {
+    window.__idmShadowAlive = alive;
+  });
+  setInterval(() => {
+    contextAlive().then((alive) => {
+      window.__idmShadowAlive = alive;
+    });
+  }, 30000);
 })();

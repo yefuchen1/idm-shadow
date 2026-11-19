@@ -18,7 +18,8 @@ const calls = {
   erase: [],
   notifications: [],
   tabs: [],
-  reload: []
+  reload: [],
+  scripting: []
 };
 let storage = {
   bridgeUrl: 'http://127.0.0.1:16888',
@@ -120,6 +121,16 @@ const chrome = {
     query: async () => [],
     onActivated: { addListener: (fn) => (listeners.onActivated = fn) }
   },
+  scripting: {
+    executeScript: async (opts) => {
+      calls.scripting.push(opts);
+      // 模拟探测结果：页面里没有能用的脚本，需要补一份。
+      if (opts.func && opts.func.toString().includes('__idmShadowInjected')) {
+        return [{ result: false }];
+      }
+      return [{ result: undefined }];
+    }
+  },
   action: {
     setBadgeText: () => {},
     setBadgeBackgroundColor: () => {}
@@ -133,7 +144,7 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, shouldSkipImage, isRestoredDownload, hasUserGesture, noteGesture, recentGestures, dropRestored, reloadIfOutdated, compareVersions, extensionVersion };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, shouldSkipImage, isRestoredDownload, hasUserGesture, noteGesture, recentGestures, dropRestored, injectContentInto, reloadIfOutdated, compareVersions, extensionVersion };`
 );
 
 const fetchCalls = [];
@@ -452,7 +463,8 @@ await test('用户点击后的下载照常接管，并标记来源', async () =>
 });
 
 await test('没有 user 标记的 capture-url 不接管', async () => {
-  // 老内容脚本不会带 source。放进来就等于分不清点击和页面自动下载。
+  // 老内容脚本不会带 source，也没有手势记录。
+  // 这时候拒绝是对的：页面自动下载和用户点击分不清。
   api.recentGestures.length = 0;
   fetchCalls.length = 0;
 
@@ -472,6 +484,54 @@ await test('没有 user 标记的 capture-url 不接管', async () => {
     fetchCalls.filter((f) => f.options.method === 'POST').length,
     0
   );
+});
+
+await test('老内容脚本在有手势时照常接管', async () => {
+  // 扩展升级之后，用户已经打开的标签页里跑的还是旧内容脚本——
+  // 它不带 source。直接拒绝的话，扩展升级后一段时间里正常下载
+  // 完全接不上，用户会觉得"扩展坏了"。
+  //
+  // 折中：老脚本的请求用手势记录来补。新内容脚本在用户点击时
+  // 会先发一条 user-gesture，手势记录就是可信证据。
+  api.recentGestures.length = 0;
+  api.noteGesture('https://example.com/page', 'click');
+  fetchCalls.length = 0;
+
+  const response = await new Promise((resolve) => {
+    listeners.onMessage(
+      {
+        type: 'capture-url',
+        url: 'https://example.com/legacy.bin',
+        referer: 'https://example.com/page'
+      },
+      { tab: { id: 1 }, url: 'https://example.com/page' },
+      resolve
+    );
+  });
+  assert.equal(response.ok, true);
+  const posted = fetchCalls.find(
+    (f) => f.options.method === 'POST' && f.url.endsWith('/api/v1/tasks')
+  );
+  assert.ok(posted, '有手势时老内容脚本的请求应当被接管');
+  assert.equal(JSON.parse(posted.options.body).source, 'user');
+});
+
+await test('扩展重载后往页面里补一份新的内容脚本', async () => {
+  // 重载之后，页面里跑着的那份旧脚本变成了孤儿：监听器还挂着，
+  // 但 sendMessage 已经失效。而它拦住跨源 a[download] 时用了
+  // preventDefault()——消息发不出去，点击就彻底没反应。
+  //
+  // 所以补注入之前要先摘掉旧脚本的监听器。
+  calls.scripting.length = 0;
+  await api.injectContentInto(42);
+
+  assert.ok(calls.scripting.length >= 3, '应当探测、清理、再注入三步');
+  const cleanup = calls.scripting.find(
+    (c) => c.func && c.func.toString().includes('__idmShadowCleanup')
+  );
+  assert.ok(cleanup, '注入前应当先摘掉旧脚本的监听器');
+  const inject = calls.scripting.find((c) => c.files && c.files.includes('content.js'));
+  assert.ok(inject, '应当注入新的 content.js');
 });
 
 await test('blob: 与 data: URL 不接管', async () => {

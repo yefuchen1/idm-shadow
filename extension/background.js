@@ -840,12 +840,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // 定期问桌面应用"默认下载工具"的开关有没有变。
 chrome.alarms.create('sync-app-mode', { periodInMinutes: 1 });
 
-// 扩展更新/重载之后，已经打开的页面里没有内容脚本了。
+// 扩展更新/重载之后，已经打开的页面里跑的还是旧内容脚本。
 //
-// Manifest 里的 content_scripts 只在新导航时注入。用户不会为了
-// 一次扩展更新去刷新所有标签页，而这些页面里的点击恰恰需要
-// 手势消息才能被认成"用户主动下载"。所以把当前活动标签页补一针，
-// 之后切换标签页时也各补一针。页面里已有脚本时它会自己跳过。
+// 旧脚本在扩展重载后变成了"孤儿"：它的监听器还挂在页面上，但
+// chrome.runtime.sendMessage 已经失效——消息发不出去。
+//
+// 而它拦住跨源 a[download] 的那一步是 preventDefault()：消息发不出去，
+// 点击就彻底没反应了（比不接管还糟）。
+//
+// 所以重载之后必须把旧脚本换掉。做法是往页面里注入一段新的，
+// 由它把旧脚本的监听器摘掉。
 const injectedTabs = new Set();
 
 async function injectContentInto(tabId) {
@@ -853,6 +857,41 @@ async function injectContentInto(tabId) {
   if (!tabId || injectedTabs.has(tabId)) return;
   injectedTabs.add(tabId);
   try {
+    // 先看看页面里有没有已经能用的脚本。
+    //
+    // 有就别注入——重复注入会让两个脚本都去拦点击，行为不可预期。
+    const probe = await chrome.scripting.executeScript({
+      target: { tabId },
+      // 返回 Promise：executeScript 会等它 resolve 再把结果带回来。
+      func: async () => {
+        if (!window.__idmShadowInjected) return false;
+        // 标记还没算出来（刚注入）时，等它一下。
+        if (window.__idmShadowAlive === undefined) {
+          for (let i = 0; i < 20 && window.__idmShadowAlive === undefined; i++) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        return Boolean(window.__idmShadowAlive);
+      }
+    });
+    if (probe && probe[0] && probe[0].result === true) {
+      injectedTabs.delete(tabId);
+      return;
+    }
+
+    // 没有能用的脚本：把旧脚本的监听器摘掉，再注入新的。
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (window.__idmShadowCleanup) {
+          try {
+            window.__idmShadowCleanup();
+          } catch (err) {
+            // 旧脚本清理失败也要继续注入新的
+          }
+        }
+      }
+    });
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content.js']
@@ -882,6 +921,14 @@ if (chrome.tabs && chrome.tabs.onActivated) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === 'content-alive') {
+    // 内容脚本用它确认扩展上下文还在。
+    //
+    // 扩展重载之后，页面里跑着的那份脚本就变成了孤儿：监听器还挂着，
+    // 但消息发不出去。它靠这个往返来判断自己是不是该退场。
+    sendResponse({ alive: true });
+    return false;
+  }
   if (message && message.type === 'user-gesture') {
     // 内容脚本在真实点击/右键时发来的。页面自己 dispatch 的
     // click 事件 `isTrusted` 是 false，内容脚本那边已经挡住了。
@@ -895,10 +942,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === 'capture-url') {
     // 只接受内容脚本在用户点击时发来的请求。
     //
-    // 老内容脚本不带 source，一律拒绝：它分不清点击和页面自动下载，
-    // 放进来就等于把刚堵上的口子又打开了。拒绝之后内容脚本会让
-    // 浏览器自己下载，不会丢文件。
-    if (message.source !== SOURCE.USER) {
+    // 新内容脚本会带 source:'user'；老的不带。
+    //
+    // 老内容脚本怎么办：扩展升级之后，用户已经打开的标签页里跑的
+    // 还是旧脚本，它分不清点击和页面自动下载，直接放行等于把刚堵上
+    // 的口子又打开了。
+    //
+    // 但也不能一律拒绝——那会让扩展升级之后的一段时间里，正常下载
+    // 完全接不上，用户会觉得"扩展坏了"。
+    //
+    // 折中办法：老内容脚本的请求，用手势记录来补。
+    // 新内容脚本在用户点击时会先发一条 user-gesture；老内容脚本不会，
+    // 所以老脚本的请求在有手势记录时放行——那说明用户确实在同一个
+    // 页面上点过东西，页面自动下载（没有手势）依然进不来。
+    const isNewContent = message.source === SOURCE.USER;
+    const hasGesture = hasUserGesture(message.referer);
+    if (!isNewContent && !hasGesture) {
       sendResponse({ ok: false });
       return false;
     }

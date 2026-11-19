@@ -161,7 +161,13 @@ fn user_data_dir(browser: Browser) -> Option<PathBuf> {
 /// 为什么不能只看磁盘上的 manifest：浏览器把已解压扩展的注册信息缓存住了，
 /// 文件换了新版它照样跑旧代码。这时候磁盘上是 0.1.4，注册的是 0.1.0，
 /// 只看文件会以为一切正常。
-fn unpacked_extension_entries(prefs: &Path) -> Vec<(PathBuf, Option<String>)> {
+///
+/// 另外还会读 `disable_reasons`：浏览器要求扩展重新加载时会把
+/// service worker 的注册信息整个删掉，`running_version` 就成了 None。
+/// 这种"读不到版本号"不是"没问题"，而是"根本不知道它在跑什么"——
+/// 2026-11-19 事故后排查时，用户机器上的扩展就是这个状态：
+/// 文件是新的，浏览器却没在跑新的代码。
+fn unpacked_extension_entries(prefs: &Path) -> Vec<(PathBuf, Option<String>, bool)> {
     let Ok(text) = std::fs::read_to_string(prefs) else {
         return Vec::new();
     };
@@ -182,7 +188,7 @@ fn unpacked_extension_entries(prefs: &Path) -> Vec<(PathBuf, Option<String>)> {
         }
         if let Some(path) = entry.get("path").and_then(|p| p.as_str()) {
             let path = PathBuf::from(path);
-            if out.iter().any(|(p, _)| *p == path) {
+            if out.iter().any(|(p, _, _)| *p == path) {
                 continue;
             }
             let running = entry
@@ -190,7 +196,15 @@ fn unpacked_extension_entries(prefs: &Path) -> Vec<(PathBuf, Option<String>)> {
                 .and_then(|i| i.get("version"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            out.push((path, running));
+            // disable_reasons 非空 = 浏览器把这个扩展标记成"要重新加载"
+            // 或者干脆禁用了。不管是哪种，浏览器现在跑的都可能不是
+            // 磁盘上这份代码，得当成"状态不明"报出来。
+            let needs_reload = entry
+                .get("disable_reasons")
+                .and_then(|r| r.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            out.push((path, running, needs_reload));
         }
     }
     out
@@ -232,7 +246,7 @@ fn scan_user_data(browser: Browser, user_data: &Path) -> Vec<LoadedCopy> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        for (path, running) in unpacked_extension_entries(&prefs) {
+        for (path, running, needs_reload) in unpacked_extension_entries(&prefs) {
             let Some((name, version)) = read_manifest(&path) else {
                 continue;
             };
@@ -248,7 +262,15 @@ fn scan_user_data(browser: Browser, user_data: &Path) -> Vec<LoadedCopy> {
             let running_stale = running
                 .as_deref()
                 .map(|v| v != shipped_version())
-                .unwrap_or(false);
+                // 读不到版本号时不能假设"跑的肯定是最新的"。
+                //
+                // 浏览器要求重新加载扩展时会把 service worker 的注册
+                // 信息整个删掉——这时候它到底在跑什么版本没人知道，
+                // 多半是旧代码。disable_reasons 非空就是明确的信号。
+                //
+                // 反过来，扩展刚装上、浏览器还没起过它的时候也读不到
+                // 版本号，但那时跑的就是磁盘上这份代码，不算旧。
+                .unwrap_or(needs_reload);
             out.push(LoadedCopy {
                 browser: browser.as_str().to_string(),
                 browser_label: browser.label().to_string(),
@@ -256,7 +278,7 @@ fn scan_user_data(browser: Browser, user_data: &Path) -> Vec<LoadedCopy> {
                 path: path.to_string_lossy().to_string(),
                 version,
                 running_version: running,
-                stale: disk_stale || running_stale,
+                stale: disk_stale || running_stale || needs_reload,
             });
         }
     }
@@ -463,6 +485,20 @@ mod tests {
         version: &str,
         running: Option<&str>,
     ) -> PathBuf {
+        fake_user_data_full(root, ext_dir, version, running, &[])
+    }
+
+    /// 造一个假的浏览器用户数据目录，并指定浏览器的 disable_reasons。
+    ///
+    /// `disable_reasons` 非空 = 浏览器要求这个扩展重新加载（或者禁用了它）。
+    /// 这种时候浏览器会把 service worker 的注册信息删掉。
+    fn fake_user_data_full(
+        root: &Path,
+        ext_dir: &Path,
+        version: &str,
+        running: Option<&str>,
+        disable_reasons: &[i64],
+    ) -> PathBuf {
         let profile = root.join("Default");
         std::fs::create_dir_all(&profile).unwrap();
         let manifest = format!(
@@ -478,6 +514,12 @@ mod tests {
             entry.insert(
                 "service_worker_registration_info".into(),
                 serde_json::json!({ "version": v }),
+            );
+        }
+        if !disable_reasons.is_empty() {
+            entry.insert(
+                "disable_reasons".into(),
+                serde_json::json!(disable_reasons),
             );
         }
         let prefs = serde_json::json!({
@@ -662,6 +704,61 @@ mod tests {
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join("Secure Preferences"), "{ not json").unwrap();
         assert!(scan_user_data(Browser::Edge, &root).is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn an_extension_the_browser_wants_reloaded_is_stale() {
+        // 用户机器上的真实状态（2026-11-19 事故之后）：
+        //
+        //   磁盘上的文件已经是新的，浏览器却把 service worker 的
+        //   注册信息删了，并且 disable_reasons 非空——它在要求
+        //   「重新加载」。
+        //
+        // 这种情况下 running_version 读不到。以前这被当成"没问题"，
+        // 界面上一片安静，用户根本不知道扩展没在跑新代码。
+        let tmp = std::env::temp_dir().join(format!("idm-shadow-scan-{}", uuid::Uuid::new_v4()));
+        let root = tmp.join("User Data");
+        let ext_dir = tmp.join("idm-shadow-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let current = shipped_version();
+        fake_user_data_full(&root, &ext_dir, &current, None, &[16777216]);
+        for (name, bytes) in shipped_files() {
+            std::fs::write(ext_dir.join(name), bytes).unwrap();
+        }
+
+        let found = scan_user_data(Browser::Edge, &root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].running_version, None,
+            "浏览器没记下版本号"
+        );
+        assert!(
+            found[0].stale,
+            "浏览器要求重新加载时必须报成过期，否则用户不知道扩展没生效"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_never_started_extension_with_current_files_is_not_stale() {
+        // 刚装上、浏览器还没起过它：读不到版本号，但跑的就是磁盘上
+        // 这份代码，不该报成过期（否则刚装完就吓用户一跳）。
+        let tmp = std::env::temp_dir().join(format!("idm-shadow-scan-{}", uuid::Uuid::new_v4()));
+        let root = tmp.join("User Data");
+        let ext_dir = tmp.join("idm-shadow-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let current = shipped_version();
+        fake_user_data_full(&root, &ext_dir, &current, None, &[]);
+        for (name, bytes) in shipped_files() {
+            std::fs::write(ext_dir.join(name), bytes).unwrap();
+        }
+
+        let found = scan_user_data(Browser::Edge, &root);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].stale);
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 

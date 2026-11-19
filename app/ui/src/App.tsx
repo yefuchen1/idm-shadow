@@ -696,7 +696,9 @@ export default function App() {
                   <span className="unit">
                     {extension.connected
                       ? extension.stale
-                        ? `扩展是旧版（v${extension.running_version}），点一次「重新加载」才会更新`
+                        ? extension.running_version
+                          ? `扩展是旧版（v${extension.running_version}），点一次「重新加载」才会更新`
+                          : "浏览器需要重新加载扩展，点一次「重新加载」才会生效"
                         : "浏览器下载会交给 IDM Shadow"
                       : extension.installed
                         ? "扩展已释放，还需要在浏览器里启用"
@@ -934,9 +936,13 @@ export default function App() {
           <div className="warn-banner">
             <AlertTriangle size={15} />
             <div className="warn-banner-text">
-              <strong>浏览器里跑的是旧版扩展（v{extension.running_version}）</strong>
+              <strong>
+                {extension.running_version
+                  ? `浏览器里跑的是旧版扩展（v${extension.running_version}）`
+                  : "浏览器需要重新加载扩展"}
+              </strong>
               <span>
-                旧版接管不到跨源下载链接，点下载会一点反应都没有。
+                不重新加载的话，扩展不会接管下载，点下载会一点反应都没有。
                 在扩展管理页点一下「重新加载」就会更新。
               </span>
             </div>
