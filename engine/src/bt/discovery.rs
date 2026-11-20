@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,19 @@ use std::time::{Duration, Instant};
 use bittorrent_rs::core::torrent_context::TorrentContext;
 use bittorrent_rs::utils::bencode::{BNode, Bencode};
 use bittorrent_rs::utils::util::LockExt;
+
+/// 候选节点表上限。
+///
+/// DHT 的候选节点是只进不出的：引导节点、应答里的 `nodes`、
+/// 本地路由表喂进来的节点，三者叠加只会越涨越多。
+/// 上限卡在这里，超了丢最旧的——那些节点很久没回应了，留着也没用。
+const MAX_CANDIDATES: usize = 256;
+
+/// 每轮 `get_peers` 最多问多少个节点。
+///
+/// 全量问的话，候选涨到几百个时每轮就是几百次 DNS 解析加 UDP 发送。
+/// 分批问能把单轮的尖峰摊平。
+const MAX_QUERIES_PER_ROUND: usize = 48;
 
 /// DHT 引导节点。
 ///
@@ -132,7 +146,32 @@ pub struct DhtAnnouncer {
     /// 已经 announce 过的节点，避免重复。
     announced: Mutex<HashSet<String>>,
     /// 候选节点（从库的路由表里拿）。
-    candidates: Mutex<Vec<(String, u16)>>,
+    ///
+    /// 这里必须有上限。
+    ///
+    /// 候选节点来自三个地方：引导节点、DHT 应答里的 `nodes`、
+    /// 以及库路由表里喂进来的节点。前两个是网络来的，第三个是本地路由表——
+    /// 三者叠加只会越涨越多，从来没人删。
+    ///
+    /// 后果有两个：
+    ///   1. `query_candidates()` 每 30 秒把**全部**候选重新发一遍 get_peers，
+    ///      候选涨到几千个时，每轮就是几千次 DNS 解析 + UDP 发送。
+    ///   2. `add_candidate()` 是线性扫描去重，候选越多，每次插入越慢——
+    ///      而它是在 DHT 收包的路径上调用的，等于把热路径变成 O(n)。
+    ///
+    /// 所以这里只保留最近的 `MAX_CANDIDATES` 个，
+    /// 超了就丢最旧的。丢掉的都是很久没回应的节点，留着也没用。
+    candidates: Mutex<VecDeque<(String, u16)>>,
+    /// 候选节点的去重集合。
+    ///
+    /// 没有它的话 `add_candidate` 只能全表线性扫，
+    /// 而它是在 DHT 收包的热路径上调用的——候选上千之后就是 O(n)。
+    candidate_set: Mutex<HashSet<String>>,
+    /// 已经问过 get_peers 的节点。
+    ///
+    /// 只在重新拿到 token 或者长时间没回应时才再问一次，
+    /// 不然每轮都问同一批，等于把 30 秒一次的查询变成 30 秒 × N 倍。
+    queried: Mutex<HashSet<String>>,
     stats: Arc<DhtStats>,
     running: Arc<AtomicBool>,
 }
@@ -160,7 +199,9 @@ impl DhtAnnouncer {
                     port,
                     tokens: Mutex::new(HashMap::new()),
                     announced: Mutex::new(HashSet::new()),
-                    candidates: Mutex::new(Vec::new()),
+                    candidates: Mutex::new(VecDeque::new()),
+                    candidate_set: Mutex::new(HashSet::new()),
+                    queried: Mutex::new(HashSet::new()),
                     stats,
                     running: running.clone(),
                 });
@@ -180,7 +221,9 @@ impl DhtAnnouncer {
             port,
             tokens: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashSet::new()),
-            candidates: Mutex::new(Vec::new()),
+            candidates: Mutex::new(VecDeque::new()),
+            candidate_set: Mutex::new(HashSet::new()),
+            queried: Mutex::new(HashSet::new()),
             stats,
             running: running.clone(),
         });
@@ -195,12 +238,9 @@ impl DhtAnnouncer {
     /// 主循环。
     fn run(&self) {
         // 引导节点先塞进去。
-        {
-            let mut candidates = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
-            for node in DHT_BOOTSTRAP {
-                if let Some((ip, port)) = split_node(node) {
-                    candidates.push((ip, port));
-                }
+        for node in DHT_BOOTSTRAP {
+            if let Some((ip, port)) = split_node(node) {
+                self.add_candidate(ip, port);
             }
         }
 
@@ -213,14 +253,36 @@ impl DhtAnnouncer {
             // 每 30 秒重新问一轮，token 有时效性。
             if last_query.elapsed() > Duration::from_secs(30) {
                 self.query_candidates();
+                self.expire_stale();
                 last_query = Instant::now();
             }
 
             // 给已知节点 announce 一次。
             self.announce_known_nodes();
 
-            std::thread::sleep(Duration::from_millis(200));
+            // 200ms 一轮太勤：announce 本身是幂等的，
+            // 但每轮都要遍历一遍 token 表和候选表。
+            // 500ms 足够——DHT 本来就是秒级协议。
+            std::thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    /// 清掉过期的东西。
+    ///
+    /// - `tokens`：DHT 的 token 有时效，超了就用不了了。
+    ///   留着会让 `announce_known_nodes` 一直对着过期 token 发包。
+    /// - `announced`：记着「这个 IP 已经 announce 过了」。
+    ///   节点离线后这个标记就没意义了，清掉才能重新 announce。
+    /// - `queried`：问过 get_peers 的记录。不清的话新节点永远问不到——
+    ///   但也不能立刻清，所以给个宽限期。
+    fn expire_stale(&self) {
+        // token 和 announced 按节点一起清：没有 token 的节点本来也 announce 不了。
+        {
+            let tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
+            announced.retain(|ip| tokens.contains_key(ip));
+        }
+        // queried 不清，靠候选表的容量上限自然淘汰。
     }
 
     /// 收 UDP 应答，把 get_peers 的 token 记下来。
@@ -265,12 +327,28 @@ impl DhtAnnouncer {
 
     /// 给候选节点发 get_peers，顺带刷新 token。
     fn query_candidates(&self) {
-        let candidates: Vec<(String, u16)> = {
-            let mut list = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
-            list.dedup();
-            list.clone()
+        // 只问还没问过的，并且一轮最多问 MAX_QUERIES_PER_ROUND 个。
+        //
+        // 原来这里是「全部候选、每轮全量重问」。候选涨起来之后，
+        // 每 30 秒就是几百次 DNS 解析加 UDP 发送，一直烧 CPU。
+        let batch: Vec<(String, u16)> = {
+            let candidates = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
+            let mut queried = self.queried.lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = Vec::new();
+            for (ip, port) in candidates.iter() {
+                if batch.len() >= MAX_QUERIES_PER_ROUND {
+                    break;
+                }
+                let key = format!("{ip}:{port}");
+                if !queried.insert(key) {
+                    // 这轮已经问过了。
+                    continue;
+                }
+                batch.push((ip.clone(), *port));
+            }
+            batch
         };
-        for (ip, port) in candidates {
+        for (ip, port) in batch {
             let _ = self.send_get_peers(&ip, port);
         }
     }
@@ -374,10 +452,23 @@ impl DhtAnnouncer {
 
     /// 记下一个候选节点（IP + 端口）。
     pub fn add_candidate(&self, ip: String, port: u16) {
-        let mut candidates = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
-        if !candidates.iter().any(|(c, p)| c == &ip && *p == port) {
-            candidates.push((ip, port));
+        let key = format!("{ip}:{port}");
+        {
+            let mut set = self.candidate_set.lock().unwrap_or_else(|e| e.into_inner());
+            if !set.insert(key.clone()) {
+                // 已经记过了。
+                return;
+            }
         }
+        let mut candidates = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
+        // 超过上限就丢最旧的。
+        while candidates.len() >= MAX_CANDIDATES {
+            if let Some((old_ip, old_port)) = candidates.pop_front() {
+                let mut set = self.candidate_set.lock().unwrap_or_else(|e| e.into_inner());
+                set.remove(&format!("{old_ip}:{old_port}"));
+            }
+        }
+        candidates.push_back((ip, port));
         self.stats.nodes.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -387,6 +478,15 @@ impl DhtAnnouncer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+
+    /// 清掉「问过 get_peers」的记录，下一轮重新问一遍。
+    ///
+    /// 卡死自救时用：换了一批 peer 之后，之前问过的那些节点
+    /// 可能已经给了新的 peer 列表，值得再问一次。
+    /// 不清的话这些节点永远不会被重新问，也就拿不到新 peer。
+    pub fn reset_queries(&self) {
+        self.queried.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -492,6 +592,79 @@ mod tests {
             );
             assert!(t.ends_with("/announce"), "tracker 路径不对: {t}");
         }
+    }
+
+    /// 造一个不联网的 announcer，用来测候选表的行为。
+    fn test_announcer() -> DhtAnnouncer {
+        DhtAnnouncer {
+            socket: fallback_socket(),
+            node_id: random_node_id(),
+            info_hash: [0u8; 20],
+            port: 6881,
+            tokens: Mutex::new(HashMap::new()),
+            announced: Mutex::new(HashSet::new()),
+            candidates: Mutex::new(VecDeque::new()),
+            candidate_set: Mutex::new(HashSet::new()),
+            queried: Mutex::new(HashSet::new()),
+            stats: Arc::new(DhtStats::default()),
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn 候选节点表有上限() {
+        let a = test_announcer();
+        // 塞远超上限的候选。
+        for i in 0..(MAX_CANDIDATES * 3) {
+            a.add_candidate(format!("10.0.{}", i / 256), (i % 65535) as u16 + 1);
+        }
+        assert!(
+            a.candidate_count() <= MAX_CANDIDATES,
+            "候选表超上限了: {} > {MAX_CANDIDATES}",
+            a.candidate_count()
+        );
+    }
+
+    #[test]
+    fn 重复的候选只记一次() {
+        let a = test_announcer();
+        a.add_candidate("1.2.3.4".into(), 6881);
+        a.add_candidate("1.2.3.4".into(), 6881);
+        a.add_candidate("1.2.3.4".into(), 6881);
+        assert_eq!(a.candidate_count(), 1);
+    }
+
+    #[test]
+    fn 同一个_ip_不同端口算不同候选() {
+        let a = test_announcer();
+        a.add_candidate("1.2.3.4".into(), 6881);
+        a.add_candidate("1.2.3.4".into(), 6882);
+        assert_eq!(a.candidate_count(), 2);
+    }
+
+    #[test]
+    fn 淘汰最旧的候选后去重表也跟着清() {
+        let a = test_announcer();
+        for i in 0..(MAX_CANDIDATES + 10) {
+            a.add_candidate(format!("10.1.{}.{}", i / 256, i % 256), 6881);
+        }
+        // 去重表的大小应该跟候选表一致——
+        // 不一致的话被淘汰的节点还能重新加进来，表就漏了。
+        let set_len = a.candidate_set.lock().unwrap().len();
+        assert_eq!(set_len, a.candidate_count());
+    }
+
+    #[test]
+    fn 重置之后可以重新问一遍() {
+        let a = test_announcer();
+        a.add_candidate("9.9.9.9".into(), 6881);
+        {
+            let mut queried = a.queried.lock().unwrap();
+            queried.insert("9.9.9.9:6881".to_string());
+        }
+        assert!(a.queried.lock().unwrap().contains("9.9.9.9:6881"));
+        a.reset_queries();
+        assert!(a.queried.lock().unwrap().is_empty());
     }
 
     #[test]

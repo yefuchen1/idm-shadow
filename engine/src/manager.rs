@@ -96,6 +96,57 @@ struct Inner {
     /// 下载结束和用户确认会同时发生，得靠这个把它们串起来，
     /// 否则会出现"文件正被下载引擎写，同时又被转存走"的撕裂。
     confirms: Arc<Mutex<HashMap<TaskId, ConfirmState>>>,
+    /// BT 选文件确认的唤醒信号。
+    ///
+    /// BT 引擎在等用户勾选要下载的文件。原来这里是**每 200 毫秒查一次
+    /// 数据库**，用户可能几分钟都不点选择——那期间就是每 200ms 一次
+    /// SQLite 查询，纯属白烧。
+    ///
+    /// 改成：用户选好之后发一个通知，等着的线程立刻醒过来检查一次。
+    /// 没通知的时候就睡着，不用反复查库。
+    bt_selection: Arc<BtSelectionSignal>,
+}
+
+/// BT 选文件的唤醒信号。
+///
+/// 用 `Condvar` 而不是 `tokio::sync::Notify`：
+/// 等待方在 `spawn_blocking` 里——那是阻塞线程，没法 await。
+/// `Condvar` 就是给这种场景用的。
+#[derive(Default)]
+struct BtSelectionSignal {
+    /// 有没有待处理的通知。
+    pending: std::sync::Mutex<bool>,
+    /// 通知时唤醒等待者。
+    cvar: std::sync::Condvar,
+}
+
+impl BtSelectionSignal {
+    /// 发出一次通知。
+    fn notify(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        *pending = true;
+        self.cvar.notify_all();
+    }
+
+    /// 等一次通知，最多等 `timeout`。
+    ///
+    /// 返回 true 表示收到了通知，false 表示等超时了。
+    /// 超时也返回，让调用方去做兜底检查——不能因为通知丢了就永远卡住。
+    fn wait(&self, timeout: std::time::Duration) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // 通知可能已经在等着了，别漏掉。
+        if *pending {
+            *pending = false;
+            return true;
+        }
+        let (mut guard, _timeout) = self
+            .cvar
+            .wait_timeout(pending, timeout)
+            .unwrap_or_else(|e| e.into_inner());
+        let notified = *guard;
+        *guard = false;
+        notified
+    }
 }
 
 impl DownloadManager {
@@ -116,6 +167,7 @@ impl DownloadManager {
                 max_concurrent_tasks: Arc::new(Mutex::new(None)),
                 pending: Arc::new(Mutex::new(VecDeque::new())),
                 confirms: Arc::new(Mutex::new(HashMap::new())),
+                bt_selection: Arc::new(BtSelectionSignal::default()),
             }),
         })
     }
@@ -458,6 +510,8 @@ impl DownloadManager {
         let task_confirms = confirms.clone();
         let running = self.inner.running.clone();
         let finishing = self.inner.finishing.clone();
+        // BT 选文件的唤醒信号，等着的那边会用到。
+        let bt_selection_signal = self.inner.bt_selection.clone();
         tokio::spawn(async move {
             let manager_finishing = finishing.clone();
             manager_finishing.lock().await.insert(id);
@@ -498,9 +552,30 @@ impl DownloadManager {
             let progress_events = events.clone();
             let progress_live = live.clone();
             let progress_task = tokio::spawn(async move {
+                // 上一次发出去的进度。
+                //
+                // 引擎那边没有进展时也会照样发进度（速度是 0），
+                // 一个卡住的任务每 500ms 发一次，内容一模一样。
+                // 每条都要写一次数据库、克隆一次、广播给前端——
+                // 全部是白做的功。
+                //
+                // 这里比一下，内容没变就不往下发。
+                let mut last_sent: Option<TaskProgress> = None;
                 while let Some(p) = progress_rx.recv().await {
+                    if let Some(prev) = last_sent.as_ref() {
+                        if prev.downloaded == p.downloaded
+                            && prev.total == p.total
+                            && prev.speed == p.speed
+                            && prev.connections == p.connections
+                            && prev.note == p.note
+                        {
+                            // 没变化，跳过。
+                            continue;
+                        }
+                    }
                     let _ = progress_store.set_progress(id, p.downloaded, p.total);
                     progress_live.lock().await.insert(id, p.clone());
+                    last_sent = Some(p.clone());
                     let _ = progress_events.send(TaskEvent::Progress(id, p));
                 }
             });
@@ -566,7 +641,7 @@ impl DownloadManager {
                         // 多文件种子、还没勾选、也还没确认保存位置：停下来等。
                         //
                         // 关键：这个线程**不能退出**。确认弹窗里的勾选结果
-                        // 只写数据库，由这里轮询拿到再继续下载。
+                        // 只写数据库，由这里拿到再继续下载。
                         // 如果这里返回、让 confirm_path 重新 start，
                         // 会跟本线程的收尾撞在一起——running 表里还挂着 id，
                         // start 以为任务在跑，结果谁也没真正下载。
@@ -579,18 +654,31 @@ impl DownloadManager {
                             let _ = bt_events.send(TaskEvent::ConfirmNeeded(id));
                             crate::bt::send_note(&bt_ctx, "等待选择要下载的文件…");
 
+                            // 等用户勾选。
+                            //
+                            // 这里**不能退出去轮询数据库**：用户可能几分钟都不点，
+                            // 每 200ms 查一次 SQLite 纯属白烧 CPU 和磁盘 IO。
+                            //
+                            // 改成等信号：用户选好之后 `confirm_path` 唤醒这边，
+                            // 这边立刻醒过来查一次数据库。
+                            // 等待期间线程是睡着的，不占 CPU。
+                            //
+                            // 保险起见留一个 5 秒的兜底超时——
+                            // 万一信号丢了（进程重启、状态被别的路径改了），
+                            // 任务也不会永远卡住。
                             loop {
                                 if *bt_ctx.cancel.borrow() {
                                     return Err(anyhow!("已取消"));
                                 }
-                                let current = bt_store
-                                    .get_task(id)?
-                                    .ok_or_else(|| anyhow!("任务不存在"))?;
-                                fresh = current;
-                                if fresh.bt_selected.is_some() || !fresh.needs_confirm {
-                                    break;
+                                bt_selection_signal.wait(std::time::Duration::from_secs(5));
+                                if let Ok(current) = bt_store.get_task(id) {
+                                    if let Some(current) = current {
+                                        fresh = current;
+                                        if fresh.bt_selected.is_some() || !fresh.needs_confirm {
+                                            break;
+                                        }
+                                    }
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(200));
                             }
                         }
 
@@ -808,6 +896,13 @@ impl DownloadManager {
             }
         }
         self.inner.store.update_task(&task)?;
+
+        // 唤醒正在等选文件的 BT 线程。
+        //
+        // 它在 `spawn_blocking` 里睡着等这个信号，
+        // 收到之后立刻去读数据库、继续下载。
+        // 不发的话它只能等兜底超时（5 秒）。
+        self.inner.bt_selection.notify();
 
         // BT 任务没有暂存文件，不需要转存；确认后直接启动/继续。
         if task.engine == crate::task::EngineKind::Bt {

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bittorrent_rs::core::metainfo::MetaInfoFile;
@@ -28,9 +28,89 @@ pub mod metadata;
 pub mod pe;
 pub mod peer_session;
 pub mod sparse;
+pub mod stall;
 pub mod tracker;
 
 use listener::InboundConfig;
+
+/// 接管 BT 库的调试日志。
+///
+/// ## 为什么需要它
+///
+/// `bittorrent-rs` 把每一条调试信息都无条件写进**当前工作目录**下的
+/// `debug.log`：
+///
+/// ```text
+/// OpenOptions::new().create(true).append(true).open("debug.log")
+/// ```
+///
+/// 没有开关、没有级别过滤、没有轮转。每写一条还 `flush()` 一次。
+/// 实测一个卡住的 BT 任务半小时能写 9 万多行、7.4MB——
+/// 全是 `[stats]`、`[peer ...]`、`[piece ...]` 这类高频噪音。
+///
+/// 这有两个后果：
+///   1. 白白吃掉 CPU 和磁盘 IO（每次 flush 都是一次系统调用）；
+///   2. 文件落在哪取决于进程启动时的工作目录——
+///      从资源管理器启动就落在 exe 旁边，`cargo run` 就落在项目根目录。
+///
+/// ## 怎么绕过去
+///
+/// 库的文件句柄是 `OnceLock`，只在第一次写日志时打开一次，之后一直复用。
+/// 而且 `open()` 失败的话它会存 `None`，之后**所有写入都变成空操作**。
+///
+/// 所以：
+///   1. 临时切到一个受控的空目录；
+///   2. 在那里建一个名叫 `debug.log` 的**目录**——
+///      打开目录必然失败（Windows 上是访问被拒），句柄就是 `None`；
+///   3. 触发一次写日志，让它把「打开失败」这件事固化下来；
+///   4. 切回原来的工作目录。
+///
+/// 之后无论在哪个目录、什么时候，库都不会再写文件。
+///
+/// 同时装一个 `set_log_sender`，把库的消息引到我们自己的 `tracing` 里——
+/// 这样默认级别是 `warn` 时它们被丢掉（不落盘、不格式化），
+/// 用户想排查时设 `RUST_LOG=debug` 就能拿到。
+pub fn init_logging() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // 1. 找一个受控的空目录。
+        let scratch = std::env::temp_dir().join("idm-shadow-bt-log");
+        if std::fs::create_dir_all(&scratch).is_err() {
+            return;
+        }
+
+        // 2. 在里面放一个叫 debug.log 的**目录**，让库开文件时失败。
+        let blocker = scratch.join("debug.log");
+        if !blocker.exists() {
+            let _ = std::fs::create_dir_all(&blocker);
+        }
+
+        // 3. 临时切过去，触发一次打开，让 OnceLock 把「失败」固化下来。
+        let original = std::env::current_dir().ok();
+        if std::env::set_current_dir(&scratch).is_err() {
+            return;
+        }
+        // 这一行会真正执行库的 log_debug，把文件句柄初始化成 None。
+        bittorrent_rs::utils::util::log_debug("idm-shadow: 接管 BT 调试日志");
+
+        // 4. 切回去。
+        if let Some(dir) = original {
+            let _ = std::env::set_current_dir(dir);
+        }
+
+        // 5. 库的消息引到我们的 tracing，默认级别下直接丢掉。
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        bittorrent_rs::utils::util::set_log_sender(tx);
+        std::thread::Builder::new()
+            .name("idm-shadow-bt-log".to_string())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    tracing::debug!("[bt] {msg}");
+                }
+            })
+            .ok();
+    });
+}
 
 /// 准备阶段：拿到文件清单、写好 `.torrent` 缓存、给所有文件做稀疏占位。
 ///
@@ -249,9 +329,23 @@ pub fn download_prepared(
     let mut finished = false;
     // 上一轮读到的分片状态。读不到时沿用它。
     let mut last_pieces = PieceStatus::default();
+    // 稀缺度缓存。算一次 O(peer 数 × 分片数)，
+    // 不用每轮都重算——它只影响界面显示。
+    let mut availability: Vec<u16> = Vec::new();
+    // 稀缺度是不是该刷新了。每隔几秒刷一次就够了。
+    let mut availability_stale = true;
+    let mut last_availability = Instant::now() - AVAILABILITY_INTERVAL;
     let mut reported_downloading = false;
     // tracker announce：自己来一份，用真实端口上报。
     let mut tracker_announcer = tracker::TrackerAnnouncer::new(listen_port);
+    // 卡死检测器：种子没人做的时候它会空转，这里负责把它捞出来。
+    let mut stall_detector = stall::StallDetector::new(task.downloaded);
+    // 上一轮的已下载字节数，用来判断「这一轮有没有进展」，
+    // 以及决定轮询频率。
+    let mut last_downloaded = task.downloaded;
+    // 这一轮有没有进展。决定轮询频率：有进展就勤读一点，
+    // 没进展就拉长间隔，别在零进度的任务上白烧 CPU。
+    let mut progressed = false;
 
     loop {
         if *ctx.cancel.borrow() {
@@ -276,6 +370,11 @@ pub fn download_prepared(
             let downloaded = stats.bytes_downloaded.min(selected_total);
             let total = selected_total;
             let speed = stats.download_speed.max(0.0) as u64;
+            // 有进展就刷新基准。轮询频率和卡死检测都靠它。
+            progressed = downloaded != last_downloaded;
+            if progressed {
+                last_downloaded = downloaded;
+            }
 
             // 报一次阶段变化，任务状态从"探测中"变成"下载中"。
             // 不发的话界面上的状态会一直停在"探测中"。
@@ -291,8 +390,18 @@ pub fn download_prepared(
             // 表现为任务永远停在"探测中"，界面上什么都不动。
             // 这里用 try_lock 自己读，拿不到就沿用上一轮的值，
             // 进度照常上报。
-            if let Some((local, availability, failures)) = read_pieces(&session) {
+            if let Some((local, total_pieces, failures)) = read_pieces(&session) {
                 track_corruption(&corrupted, &previous_local, &local);
+                // 稀缺度单独算，而且不用每轮都算。
+                //
+                // 它是 O(peer 数 × 分片数)，4GB 的种子分片上万，
+                // 每轮算一次光这一项就是十万次位运算。
+                // 它只用来给界面显示「这块有多稀有」，慢一拍没关系。
+                if availability_stale || last_availability.elapsed() >= AVAILABILITY_INTERVAL {
+                    availability = read_availability(&session, total_pieces);
+                    availability_stale = false;
+                    last_availability = Instant::now();
+                }
                 last_pieces =
                     build_piece_status(&local, &availability, &corrupted, failures);
             }
@@ -322,9 +431,51 @@ pub fn download_prepared(
                 finished = true;
                 break;
             }
+
+            // 卡死检测。
+            //
+            // 没有进展但还连着 peer → 踢掉这批 peer，换一批。
+            // 换过多次还是没进展 → 这个种子没救了，退出循环，
+            // 让上层把任务标成失败。用户可以手动重试。
+            match stall_detector.observe(downloaded) {
+                stall::StallAction::None => {}
+                stall::StallAction::Rescue => {
+                    tracing::warn!(
+                        "BT 卡住（第 {} 次），踢掉当前 peer 重新找",
+                        stall_detector.rescues()
+                    );
+                    rescue_peers(&session);
+                    // 重新问 tracker 和 DHT，拿新的 peer。
+                    tracker_announcer.reset();
+                    dht_announcer.reset_queries();
+                    // peer 换了一批，稀缺度得重算。
+                    availability_stale = true;
+                    // 进度基准也重置，不然下一轮立刻又判卡住。
+                    last_downloaded = downloaded;
+                    stall_detector.reset_progress();
+                    // 踢完之后多等一会儿再轮询，给连接留时间。
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                stall::StallAction::GiveUp => {
+                    tracing::warn!("BT 多次尝试仍无进展，判定种子已失效");
+                    send_note(ctx, ctx_note_stalled());
+                    break;
+                }
+            }
         }
 
-        std::thread::sleep(Duration::from_millis(300));
+        // 轮询频率自适应。
+        //
+        // 有进展时 300ms 一次，界面上的进度条才跟手；
+        // 没进展时拉到 1.2 秒——反正速度是 0，
+        // 读得再勤也变不出数据来，不如省下 CPU。
+        let sleep = if progressed {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_millis(1200)
+        };
+        std::thread::sleep(sleep);
     }
 
     let _ = session.stop();
@@ -337,6 +488,22 @@ pub fn download_prepared(
     } else {
         Err(anyhow!("BT 下载未完成"))
     }
+}
+
+/// 踢掉当前所有 peer，让库重新去连别的。
+///
+/// 卡死的时候这些 peer 留着也没用——它们不给我们要的块，
+/// 但库会一直 keep-alive 吊着它们，白占线程和 CPU。
+/// 踢掉之后库会重新从 tracker / DHT 拿到的 peer 列表里挑人。
+fn rescue_peers(session: &TorrentSession) {
+    let ctx = session.context();
+    let guard = ctx.lock_safe();
+    guard.disconnect_all_peers();
+}
+
+/// 判定种子失效时给用户看的话。
+fn ctx_note_stalled() -> &'static str {
+    "种子已失效：多次尝试都无法获取数据，请换一个磁力链接或种子源"
 }
 
 /// 把库 DHT 路由表里的节点喂给 announce 线程。
@@ -406,7 +573,8 @@ fn track_corruption(
 
 /// 非阻塞地读出分片状态。
 ///
-/// 返回 (本地已有的块, 每块在 swarm 里的持有者数量, 累计校验失败次数)。
+/// 返回 (本地已有的块, 分片总数, 累计校验失败次数)。
+/// 稀缺度不在这里算——它太贵，单独走 [`read_availability`]。
 /// 拿不到锁就返回 None，这一轮跳过。
 ///
 /// 为什么不直接用库给的 `piece_availability()`：
@@ -414,7 +582,7 @@ fn track_corruption(
 /// 而下载线程持有那把锁的时间可能很长——
 /// 一旦卡在这里，整个进度上报就停了，
 /// 任务会永远停在"探测中"，界面上连进度条都不动。
-fn read_pieces(session: &TorrentSession) -> Option<(Vec<bool>, Vec<u16>, u64)> {
+fn read_pieces(session: &TorrentSession) -> Option<(Vec<bool>, usize, u64)> {
     // 本地 bitfield 和校验统计都在 context 里。
     let context = session.context();
     let ctx = context.try_lock().ok()?;
@@ -433,27 +601,41 @@ fn read_pieces(session: &TorrentSession) -> Option<(Vec<bool>, Vec<u16>, u64)> {
         .collect();
     drop(ctx);
 
-    // 稀缺度：swarm 里有几个 peer 手上有这块。
+    Some((local, total, failures))
+}
+
+/// 算稀缺度：swarm 里有几个 peer 手上有这块。
+///
+/// 这个是 O(peer 数 × 分片数) 的循环——4GB 的种子分片数上万，
+/// 8 个 peer 就是十万多次位运算，每轮主循环做一次就够呛。
+///
+/// 所以它跟本地 bitfield 分开：本地 bitfield 每轮都要（进度要用），
+/// 稀缺度只在需要的时候算（换 peer 的时候、下完一轮的时候），
+/// 中间沿用上一轮的结果。
+///
+/// 稀缺度只用来给界面显示「这一块有多稀有」，
+/// 慢一拍完全没关系。
+fn read_availability(session: &TorrentSession, total: usize) -> Vec<u16> {
     // peer_swarm 是 RwLock，用 try_read 拿不到就算了，不影响别的。
     let mut availability = vec![0u16; total];
-    if let Ok(swarm) = session.peer_swarm.try_read() {
-        for peer in swarm.values() {
-            let Ok(peer) = peer.try_lock() else { continue };
-            for i in 0..total {
-                let (byte_idx, mask) = get_bitfield_index_and_mask(i as u32);
-                if peer
-                    .remote_piece_bitfield
-                    .get(byte_idx)
-                    .map(|b| b & mask != 0)
-                    .unwrap_or(false)
-                {
-                    availability[i] = availability[i].saturating_add(1);
-                }
+    let Ok(swarm) = session.peer_swarm.try_read() else {
+        return availability;
+    };
+    for peer in swarm.values() {
+        let Ok(peer) = peer.try_lock() else { continue };
+        let bitfield = &peer.remote_piece_bitfield;
+        for i in 0..total {
+            let (byte_idx, mask) = get_bitfield_index_and_mask(i as u32);
+            if bitfield
+                .get(byte_idx)
+                .map(|b| b & mask != 0)
+                .unwrap_or(false)
+            {
+                availability[i] = availability[i].saturating_add(1);
             }
         }
     }
-
-    Some((local, availability, failures))
+    availability
 }
 
 /// 按"是不是全新下载"配置会话。
@@ -531,6 +713,13 @@ const MAX_PEER_CANDIDATES: usize = 2000;
 /// 比 `config.max_connections` 更严格——后者管的是出站线程数，
 /// 前者管的是 peer 能不能进 swarm。不改这个的话连接上限调再多也卡在 100。
 const MAX_SWARM_SIZE: usize = 400;
+
+/// 稀缺度（每个分片有几个 peer 持有）的刷新间隔。
+///
+/// 算一次是 O(peer 数 × 分片数)。4GB 的种子分片上万，
+/// 8 个 peer 就是十万次位运算。
+/// 它只用来给界面显示「这块有多稀有」，几秒刷一次完全够用。
+const AVAILABILITY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 把 swarm 的 peer 上限提上去。
 ///
