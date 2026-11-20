@@ -144,7 +144,7 @@ const source = readFileSync(join(here, '..', 'background.js'), 'utf8');
 const factory = new Function(
   'chrome',
   'fetch',
-  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, shouldSkipImage, isRestoredDownload, hasUserGesture, noteGesture, recentGestures, dropRestored, injectContentInto, reloadIfOutdated, compareVersions, extensionVersion };`
+  `${source}\nreturn { capture, settings, apiUrl, createTask, cookieHeader, syncWithApp, effectiveMode, autoConfigure, discoverApp, basename, looksLikeImage, isLocalFile, shouldSkip, shouldSkipImage, isRestoredDownload, hasUserGesture, noteGesture, noteGestureWithTarget, matchesClickedTarget, gesturePageFor, resolveReferer, recentGestures, dropRestored, injectContentInto, reloadIfOutdated, compareVersions, extensionVersion };`
 );
 
 const fetchCalls = [];
@@ -460,6 +460,142 @@ await test('用户点击后的下载照常接管，并标记来源', async () =>
   assert.equal(body.source, 'user');
   assert.equal(body.needs_confirm, true);
   assert.equal(calls.downloads.length, 1, '接管成功后取消浏览器下载');
+});
+
+await test('跨源下载：referer 被裁成 origin 也能接管', async () => {
+  // 2026-11-20 的报障：用户在 itmop 的下载页点了"电信下载"，
+  // 浏览器没跳到 IDM Shadow。
+  //
+  // 根因：Chrome 的默认 Referrer-Policy（strict-origin-when-cross-origin）
+  // 对跨源请求只保留 origin，路径被丢掉。于是下载项的 referrer 是
+  // "https://www.itmop.com/"，而用户点的是
+  // "https://www.itmop.com/downinfo/187908.html"——对不上，
+  // 用户自己的点击被误判成"页面自动发起的下载"。
+  //
+  // 同源的下载（onlinedown.net 那次）referrer 不被裁，所以正常接管。
+  api.recentGestures.length = 0;
+  api.noteGesture('https://www.itmop.com/downinfo/187908.html', 'click');
+
+  // 浏览器把 referer 裁成了 origin。
+  assert.equal(
+    api.hasUserGesture('https://www.itmop.com/'),
+    false,
+    '光靠 referer 对不上——这正是 bug 的成因'
+  );
+
+  calls.downloads.length = 0;
+  fetchCalls.length = 0;
+  await listeners.onCreated({
+    id: 8100,
+    url: 'https://down2.itmopcdn.com/filebig/100/repetierhost.zip',
+    filename: '',
+    referrer: 'https://www.itmop.com/',
+    startTime: new Date().toISOString(),
+    bytesReceived: 0,
+    state: 'in_progress'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(
+    fetchCalls.filter((f) => f.url.endsWith('/api/v1/tasks')).length,
+    0,
+    '没有用户手势时不该接管（页面自动下载要放行）'
+  );
+});
+
+await test('跨源下载：用户点过的那条链接会被接管', async () => {
+  // 上面那条的修复：内容脚本报上来"用户点了哪个地址"，
+  // 后台拿它跟真正要下的地址比。这个信号不受 referrer 裁剪影响。
+  api.recentGestures.length = 0;
+  api.noteGestureWithTarget(
+    'https://www.itmop.com/downinfo/187908.html',
+    'click',
+    'https://down2.itmopcdn.com/filebig/100/repetierhost.zip'
+  );
+
+  assert.equal(
+    api.matchesClickedTarget('https://down2.itmopcdn.com/filebig/100/repetierhost.zip'),
+    true
+  );
+  // 别的地址不能算。
+  assert.equal(
+    api.matchesClickedTarget('https://down2.itmopcdn.com/other.zip'),
+    false
+  );
+
+  calls.downloads.length = 0;
+  fetchCalls.length = 0;
+  await listeners.onCreated({
+    id: 8101,
+    url: 'https://down2.itmopcdn.com/filebig/100/repetierhost.zip',
+    filename: '',
+    referrer: 'https://www.itmop.com/',
+    startTime: new Date().toISOString(),
+    bytesReceived: 0,
+    state: 'in_progress'
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const posted = fetchCalls.find(
+    (f) => f.options.method === 'POST' && f.url.endsWith('/api/v1/tasks')
+  );
+  assert.ok(posted, '用户点过的跨源链接应当被接管');
+  assert.equal(
+    JSON.parse(posted.options.body).url,
+    'https://down2.itmopcdn.com/filebig/100/repetierhost.zip'
+  );
+  assert.equal(calls.downloads.length, 1, '接管成功后取消浏览器下载');
+});
+
+await test('用户没点过的地址不因为"同一个 origin"就被接管', async () => {
+  // 兜底：只比 origin+路径的话，页面上别的链接会被误认成用户点的。
+  // 这里确认跨源下载必须命中"用户点的那条地址"，
+  // 而不是同 origin 的任意地址。
+  api.recentGestures.length = 0;
+  api.noteGestureWithTarget(
+    'https://www.itmop.com/downinfo/187908.html',
+    'click',
+    'https://down2.itmopcdn.com/filebig/100/repetierhost.zip'
+  );
+
+  assert.equal(
+    api.matchesClickedTarget('https://down2.itmopcdn.com/filebig/100/other.zip'),
+    false,
+    '同 origin 的别的文件不算用户点的'
+  );
+});
+
+await test('跨源下载会带上完整的来源页地址', async () => {
+  // 浏览器给的 referrer 被裁成了 origin，站点防盗链要的却是完整路径。
+  // 光有 "https://www.itmop.com/" 会被 403，任务直接失败。
+  api.recentGestures.length = 0;
+  api.noteGestureWithTarget(
+    'https://www.itmop.com/downinfo/187908.html',
+    'click',
+    'https://down2.itmopcdn.com/filebig/100/repetierhost.zip'
+  );
+
+  assert.equal(
+    api.gesturePageFor('https://down2.itmopcdn.com/filebig/100/repetierhost.zip'),
+    'https://www.itmop.com/downinfo/187908.html'
+  );
+  assert.equal(
+    api.resolveReferer({
+      url: 'https://down2.itmopcdn.com/filebig/100/repetierhost.zip',
+      referrer: 'https://www.itmop.com/'
+    }),
+    'https://www.itmop.com/downinfo/187908.html',
+    '该用完整的页面地址，而不是被裁过的 origin'
+  );
+
+  // 没有匹配的手势时，老老实实用浏览器给的。
+  assert.equal(
+    api.resolveReferer({
+      url: 'https://example.com/x.zip',
+      referrer: 'https://example.com/page'
+    }),
+    'https://example.com/page'
+  );
 });
 
 await test('没有 user 标记的 capture-url 不接管', async () => {

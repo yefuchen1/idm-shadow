@@ -220,6 +220,28 @@ function noteGesture(pageUrl, kind) {
   while (recentGestures.length > 40) recentGestures.shift();
 }
 
+/// 记一次用户手势，顺带记下用户点的是哪个地址。
+///
+/// `targetUrl` 是内容脚本报上来的、用户实际点的那条链接。
+///
+/// 为什么需要它：浏览器给下载项的 referrer 是被 Referrer-Policy
+/// 裁过的。默认的 strict-origin-when-cross-origin 对**跨源**请求
+/// 只保留 origin，路径直接丢掉。下载站的文件几乎都放在 CDN 上，
+/// 所以 referrer 常常只剩 "https://例子.com/"，跟页面地址
+/// "https://例子.com/详情/123.html" 对不上。
+///
+/// 对不上就意味着用户自己点的下载被误判成"页面自己下的"，
+/// 于是不被接管——这正是 2026-11-20 用户报的那个问题。
+///
+/// 用户点了哪个地址，内容脚本知道，而且不受 referrer 裁剪影响。
+/// 拿它跟真正要下的地址比，就绕开了裁剪。
+function noteGestureWithTarget(pageUrl, kind, targetUrl) {
+  noteGesture(pageUrl, kind);
+  if (!targetUrl) return;
+  const last = recentGestures[recentGestures.length - 1];
+  if (last) last.target = stripHash(targetUrl);
+}
+
 /// 这个下载有没有用户手势。
 ///
 /// - 有 referrer：必须是同一个页面上的点击/右键；
@@ -237,6 +259,61 @@ function hasUserGesture(referrer) {
     if (g.url === key || g.raw === ref) return true;
   }
   return false;
+}
+
+/// 这个下载是不是用户点的那条链接。
+///
+/// 比 `hasUserGesture` 更准：它比的是**下载地址**本身，
+/// 不受 referrer 被裁成 origin 的影响。
+///
+/// 跨源下载只能靠这个认。referrer 那个信号在跨源时已经废了
+/// （见 noteGestureWithTarget 的说明）。
+///
+/// 比不了整串的情况是有的：链接可能带查询串、页面可能用
+/// `onclick` 拼地址、也可能先跳转一次。这些情况下退一步，
+/// 只比 origin + 路径——还是比 referrer 强，因为 referrer 连
+/// 路径都没了。
+function matchesClickedTarget(downloadUrl) {
+  const url = stripHash(downloadUrl);
+  if (!url) return false;
+  const key = gestureKey(url);
+
+  const now = Date.now();
+  for (let i = recentGestures.length - 1; i >= 0; i--) {
+    const g = recentGestures[i];
+    if (now - g.at > g.ttl) continue;
+    if (!g.target) continue;
+    if (g.target === url) return true;
+    if (gestureKey(g.target) === key) return true;
+  }
+  return false;
+}
+
+/// 找到"用户点了这个地址"的那次手势，顺带把页面地址带出来。
+///
+/// 浏览器给下载项的 referrer 被 Referrer-Policy 裁过：跨源请求
+/// 只留 origin，路径丢掉。下载站的文件几乎都在 CDN 上，于是
+/// referrer 常常只剩 "https://例子.com/"。
+///
+/// 有些站点的防盗链比对的正是完整路径，光有 origin 会被拒
+/// （403）。手势里记着完整的页面地址，这里把它取出来补上。
+///
+/// 找不到匹配的手势就返回空字符串——那种情况本来就该走
+/// 浏览器给的 referrer。
+function gesturePageFor(downloadUrl) {
+  const url = stripHash(downloadUrl);
+  if (!url) return '';
+  const key = gestureKey(url);
+
+  const now = Date.now();
+  for (let i = recentGestures.length - 1; i >= 0; i--) {
+    const g = recentGestures[i];
+    if (now - g.at > g.ttl) continue;
+    if (!g.target) continue;
+    if (g.target !== url && gestureKey(g.target) !== key) continue;
+    return g.raw || '';
+  }
+  return '';
 }
 
 /// 浏览器恢复的旧下载。
@@ -523,6 +600,27 @@ async function cookieHeader(url) {
   }
 }
 
+/// 这个下载该带哪个 Referer。
+///
+/// 浏览器给的 referrer 被 Referrer-Policy 裁过：跨源请求只留 origin，
+/// 路径丢掉。下载站的文件几乎都在 CDN 上，于是 referrer 常常只剩
+/// "https://例子.com/"。
+///
+/// 有些站点的防盗链比对的正是完整路径（"这个文件只能从详情页下载"），
+/// 光有 origin 会被拒——403，任务直接失败。
+///
+/// 手势里记着完整的页面地址，这里用它补上。补不上就用浏览器给的，
+/// 总比没有强。
+function resolveReferer(item) {
+  const fromBrowser = item.referrer || item.referer || '';
+  const fromGesture = gesturePageFor(item.url || '');
+  // 手势里的页面地址更完整就用它。
+  if (fromGesture && fromGesture.length > fromBrowser.length) {
+    return fromGesture;
+  }
+  return fromBrowser || undefined;
+}
+
 // 投递一个下载任务给应用。
 async function createTask(payload) {
   const s = await settings();
@@ -612,7 +710,7 @@ async function capture(item, source = SOURCE.USER) {
     filename: finalName || undefined,
     // chrome.downloads 用的是 referrer（两个 r），内容脚本发过来的是 referer。
     // 两个都认，免得丢掉来源页信息——不少站点靠 Referer 校验才肯给文件。
-    referer: item.referrer || item.referer || undefined,
+    referer: resolveReferer(item),
     userAgent: navigator.userAgent,
     cookies: await cookieHeader(url),
     engine: 'auto',
@@ -740,7 +838,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // 内容脚本在真实点击时记一笔手势，这里只认带手势的。
     // 没有手势就交给浏览器：不投任务，也不取消，页面自己的行为
     // 不该由我们来打断。
-    if (!hasUserGesture(item.referrer || item.referer)) {
+    if (
+      !hasUserGesture(item.referrer || item.referer) &&
+      !matchesClickedTarget(item.url)
+    ) {
       console.info('[IDM Shadow] 页面自动发起的下载，交给浏览器:', item.url);
       return;
     }
@@ -932,9 +1033,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === 'user-gesture') {
     // 内容脚本在真实点击/右键时发来的。页面自己 dispatch 的
     // click 事件 `isTrusted` 是 false，内容脚本那边已经挡住了。
-    noteGesture(
+    noteGestureWithTarget(
       message.pageUrl || (sender && sender.url) || (sender && sender.tab && sender.tab.url),
-      message.kind
+      message.kind,
+      message.targetUrl
     );
     sendResponse({ ok: true });
     return false;

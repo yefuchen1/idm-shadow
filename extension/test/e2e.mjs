@@ -44,6 +44,12 @@ const SERVER_PORT = 18997;
 // 跨源 a[download] 才是那个浏览器当成导航、扩展根本不会被唤醒的场景。
 const PAGE_PORT = 18998;
 
+// 服务器收到的请求头。
+//
+// 用来验证引擎真的带上了完整的 Referer——有的站点按 Referer
+// 校验防盗链，光有 origin 会被 403。
+const receivedHeaders = [];
+
 function log(...args) {
   console.log('  ', ...args);
 }
@@ -52,6 +58,7 @@ function startFileServer(payload) {
   return new Promise((resolvePromise) => {
     const server = require('node:http').createServer((req, res) => {
       const path = (req.url || '/').split('?')[0];
+      receivedHeaders.push({ path, referer: req.headers.referer || '' });
 
       // 跨源下载目标：模拟 ClipKnight 修好之前的形状——
       // 末段是 "download"，响应里没有 Content-Disposition。
@@ -59,6 +66,21 @@ function startFileServer(payload) {
       if (path === '/api/download') {
         res.writeHead(200, {
           'Content-Type': 'video/mp4',
+          'Content-Length': payload.length
+        });
+        res.end(payload);
+        return;
+      }
+
+      // 下载站放在 CDN 上的文件：跨源、Content-Type 是浏览器不会
+      // 直接显示的类型、没有 Content-Disposition。
+      //
+      // 浏览器会把它当成下载，于是 downloads.onCreated 会触发——
+      // 但 referrer 被 Referrer-Policy 裁成了 origin，路径没了。
+      // 这正是 2026-11-20 用户报的那个场景（itmop 的下载链接）。
+      if (path === '/cdn/file.zip') {
+        res.writeHead(200, {
+          'Content-Type': 'application/x-zip-compressed',
           'Content-Length': payload.length
         });
         res.end(payload);
@@ -125,6 +147,8 @@ function startPageServer() {
       const html = `<!doctype html><html><body>
 <a id="dl" download="clip.mp4"
    href="http://127.0.0.1:${SERVER_PORT}/api/download?url=x">download</a>
+<a id="cdn"
+   href="http://127.0.0.1:${SERVER_PORT}/cdn/file.zip">电信下载</a>
 </body></html>`;
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -552,6 +576,61 @@ try {
     check('跨源下载只投递了一个任务',
       afterCross.length === beforeCross.length + 1,
       `${beforeCross.length} -> ${afterCross.length}`);
+  }
+
+  // 跨源链接，**没有** download 属性。
+  //
+  // 2026-11-20 的报障：用户在 itmop 的下载页点了"电信下载"，
+  // 浏览器没跳到 IDM Shadow，文件自己下到了 Downloads。
+  //
+  // 根因：Chrome 的默认 Referrer-Policy（strict-origin-when-cross-origin）
+  // 对跨源请求只保留 origin，路径被丢掉。于是下载项的 referrer 是
+  // "https://www.itmop.com/"，跟页面地址
+  // "https://www.itmop.com/downinfo/187908.html" 对不上，
+  // 用户自己点的下载被误判成"页面自己下的"，于是不接管。
+  //
+  // 这种链接没有 download 属性，内容脚本的 a[download] 拦截器
+  // 碰不到它，只能靠 downloads.onCreated 那条路——
+  // 所以这里必须能认出"用户点的就是这个地址"。
+  const beforeCdn = await listTasks();
+  const pageCdn = await browser.newPage();
+  await pageCdn.goto(`http://127.0.0.1:${PAGE_PORT}/page`);
+  await pageCdn.click('#cdn');
+
+  let cdnTask = null;
+  for (let i = 0; i < 40; i++) {
+    const tasks = await listTasks();
+    const found = tasks.find(
+      (t) =>
+        t.url.includes('/cdn/file.zip') &&
+        !beforeCdn.some((b) => b.id === t.id)
+    );
+    if (found) {
+      cdnTask = found;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  check('跨源下载链接（无 download 属性）也会被接管', Boolean(cdnTask),
+    cdnTask ? '' : '桌面应用没收到任务');
+
+  if (cdnTask) {
+    // 来源页地址要带上完整路径——有的站点按 Referer 校验防盗链，
+    // 光有 origin 会被 403。
+    //
+    // 直接看服务器收到了什么：那是引擎真正发出去的请求头。
+    // 任务一建好引擎就开始下载了（状态是"待确认"但下载已经在跑），
+    // 所以等一下请求到达。
+    let seen = [];
+    for (let i = 0; i < 40; i++) {
+      seen = receivedHeaders.filter((h) => h.path === '/cdn/file.zip');
+      if (seen.length) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    const referer = seen.length ? seen[seen.length - 1].referer : '';
+    check('跨源下载带上了完整的来源页地址',
+      referer.includes('/page'),
+      referer || '(无 referer)');
   }
 
   // off 模式：不接管，下载留给浏览器。

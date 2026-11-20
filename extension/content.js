@@ -227,20 +227,63 @@
   // 好让 __idmShadowCleanup 能把它摘掉。
   let onDownloadClick = null;
 
+  // 用户点的是哪条链接。
+  //
+  // 跨源下载能不能接管，全看这个。
+  //
+  // 浏览器给 `downloads.onCreated` 的 referrer 是按 Referrer-Policy
+  // 裁过的：默认的 strict-origin-when-cross-origin 对跨源请求只保留
+  // origin，路径直接丢掉。下载站的文件几乎都放在 CDN 上（跨源），
+  // 于是 referrer 变成 "https://例子.com/"——跟页面地址
+  // "https://例子.com/详情/123.html" 对不上，用户自己点的下载
+  // 就被误判成"页面自己下的"了。
+  //
+  // 用户点了哪个地址，页面知道，而且不受 referrer 裁剪影响。
+  // 后台拿它跟真正要下的那个地址比，比 referrer 准得多。
+  function clickedLinkUrl(event) {
+    const anchor =
+      event.target && event.target.closest
+        ? event.target.closest('a[href]')
+        : null;
+    if (!anchor) return '';
+    const href = anchor.getAttribute('href');
+    if (!href) return '';
+    const trimmed = href.trim();
+    // 纯锚点和脚本链接不是下载目标。
+    if (!trimmed || trimmed.startsWith('#')) return '';
+    if (/^(javascript|data|blob):/i.test(trimmed)) return '';
+    try {
+      return new URL(trimmed, location.href).href;
+    } catch (err) {
+      return '';
+    }
+  }
+
   // 把用户手势报给后台。
   //
   // `downloads.onCreated` 分不清"用户点了下载"和"页面自己下载"。
   // 真实点击的 `isTrusted` 是 true；页面脚本 dispatch 的点击是 false，
   // 这里只报前者。后台据此决定要不要接管。
+  //
+  // 点了链接的话，把那条链接的地址一起报上去——见上面
+  // clickedLinkUrl 的说明，那是跨源下载能不能被接管的唯一可靠线索。
   let lastGestureAt = 0;
-  function reportGesture(kind) {
+  function reportGesture(kind, targetUrl) {
     const now = Date.now();
-    // 连点几下不用每一下都发消息。
-    if (now - lastGestureAt < 400) return;
+    // 点了链接一定要报，不管隔了多久。
+    //
+    // 用户点了哪个下载，只有这里知道。跟 downloads.onCreated
+    // 对不上号，这次下载就白点了。普通点击才做节流，免得刷屏。
+    if (!targetUrl && now - lastGestureAt < 400) return;
     lastGestureAt = now;
     try {
       chrome.runtime.sendMessage(
-        { type: 'user-gesture', pageUrl: location.href, kind: kind },
+        {
+          type: 'user-gesture',
+          pageUrl: location.href,
+          kind: kind,
+          targetUrl: targetUrl || ''
+        },
         () => {
           // 后台可能刚重载，读一下 lastError 免得控制台报
           // "Unchecked runtime.lastError"。
@@ -254,10 +297,10 @@
 
   // 监听器都记下来，扩展重载后要能把自己摘掉。
   const onClick = (event) => {
-    if (event.isTrusted) reportGesture('click');
+    if (event.isTrusted) reportGesture('click', clickedLinkUrl(event));
   };
   const onContextMenu = (event) => {
-    if (event.isTrusted) reportGesture('context');
+    if (event.isTrusted) reportGesture('context', clickedLinkUrl(event));
   };
 
   const timer = setInterval(scan, 1500);
