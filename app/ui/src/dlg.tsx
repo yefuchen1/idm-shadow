@@ -270,6 +270,9 @@ function DownloadDialog() {
             {bytesDone && phase === "choose"
               ? " · 已下载完，等待确认保存位置"
               : ""}
+            {task?.status === "waiting_peers"
+              ? " · 还没连上 peer，正在等待连接"
+              : ""}
             {task?.source ? ` · 来源：${SOURCE_LABEL[task.source]}` : ""}
           </span>
         </div>

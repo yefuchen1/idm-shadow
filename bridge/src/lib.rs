@@ -992,6 +992,8 @@ pub fn status_label(status: &str) -> &'static str {
         "downloading" => "下载中",
         "retrying" => "重试中",
         "paused" => "已暂停",
+        "awaiting_confirm" => "待确认",
+        "waiting_peers" => "等待连接",
         "completed" => "已完成",
         "error" => "出错",
         "cancelled" => "已取消",

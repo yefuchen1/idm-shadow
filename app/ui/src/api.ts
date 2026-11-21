@@ -7,6 +7,7 @@ export type TaskStatus =
   | "retrying"
   | "paused"
   | "awaiting_confirm"
+  | "waiting_peers"
   | "completed"
   | "error"
   | "cancelled";
@@ -263,6 +264,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   retrying: "重试中",
   paused: "已暂停",
   awaiting_confirm: "待确认",
+  waiting_peers: "等待连接",
   completed: "已完成",
   error: "出错",
   cancelled: "已取消"

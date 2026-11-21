@@ -809,7 +809,8 @@ body {
 }
 
 .badge.downloading,
-.badge.probing {
+.badge.probing,
+.badge.waiting_peers {
   background: var(--accent-soft);
   color: var(--accent);
 }

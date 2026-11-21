@@ -30,10 +30,24 @@ const STATUS_LABEL = {
   downloading: '下载中',
   retrying: '重试中',
   paused: '已暂停',
+  awaiting_confirm: '待确认',
+  waiting_peers: '等待连接',
   completed: '已完成',
   error: '出错',
   cancelled: '已取消'
 };
+
+// 算作"进行中"的状态。
+//
+// `waiting_peers`（等待连接）也要算：磁力任务起来了但还没连上 peer，
+// 它照样占着一个下载名额，也照样在等用户处理。
+const ACTIVE_STATUS = [
+  'queued',
+  'probing',
+  'downloading',
+  'retrying',
+  'waiting_peers'
+];
 
 async function refresh() {
   const status = await chrome.runtime.sendMessage({ type: 'status' });
@@ -54,7 +68,7 @@ async function refresh() {
   let active = 0;
   let totalSpeed = 0;
   tasks.forEach((task) => {
-    if (['queued', 'probing', 'downloading', 'retrying'].includes(task.status)) {
+    if (ACTIVE_STATUS.includes(task.status)) {
       active += 1;
       totalSpeed += task.speed || 0;
     }

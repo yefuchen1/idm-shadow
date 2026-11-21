@@ -179,6 +179,17 @@ pub enum TaskStatus {
     Paused,
     /// 等用户确认保存位置。此时下载可能已经在进行中。
     AwaitingConfirm,
+    /// BT 任务已经起来了，但一个 peer 都还没连上，在等资源。
+    ///
+    /// 这个状态跟 `Queued` 有本质区别：
+    /// - `Queued` 是**排队等名额**——前面有别的任务占着位置，
+    ///   轮到它的时候会自动开始。
+    /// - `WaitingPeers` 是**资源不存在**——tracker 和 DHT 都问过了，
+    ///   但没人做这个种子，或者能连上的 peer 手里没有我们缺的块。
+    ///
+    /// 后者不会自动好转，得等用户的动作（换源）或者卡死检测器出手。
+    /// 混用 `Queued` 表示会让用户以为"马上就开始下"，实际是干等。
+    WaitingPeers,
     Completed,
     Error,
     Cancelled,
@@ -193,6 +204,7 @@ impl TaskStatus {
             TaskStatus::Retrying => "retrying",
             TaskStatus::Paused => "paused",
             TaskStatus::AwaitingConfirm => "awaiting_confirm",
+            TaskStatus::WaitingPeers => "waiting_peers",
             TaskStatus::Completed => "completed",
             TaskStatus::Error => "error",
             TaskStatus::Cancelled => "cancelled",
@@ -207,6 +219,7 @@ impl TaskStatus {
             "retrying" => Some(TaskStatus::Retrying),
             "paused" => Some(TaskStatus::Paused),
             "awaiting_confirm" => Some(TaskStatus::AwaitingConfirm),
+            "waiting_peers" => Some(TaskStatus::WaitingPeers),
             "completed" => Some(TaskStatus::Completed),
             "error" => Some(TaskStatus::Error),
             "cancelled" => Some(TaskStatus::Cancelled),
@@ -218,7 +231,11 @@ impl TaskStatus {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            TaskStatus::Queued | TaskStatus::Probing | TaskStatus::Downloading | TaskStatus::Retrying
+            TaskStatus::Queued
+                | TaskStatus::Probing
+                | TaskStatus::Downloading
+                | TaskStatus::Retrying
+                | TaskStatus::WaitingPeers
         )
     }
 

@@ -39,7 +39,13 @@ import {
 import { SegmentBar } from "./SegmentBar";
 import { PieceBar } from "./PieceBar";
 
-const ACTIVE: TaskStatus[] = ["queued", "probing", "downloading", "retrying"];
+const ACTIVE: TaskStatus[] = [
+  "queued",
+  "probing",
+  "downloading",
+  "retrying",
+  "waiting_peers"
+];
 
 /** 任务到了这些状态就不用再问用户保存位置了。 */
 const TERMINAL: TaskStatus[] = ["completed", "error", "cancelled"];
@@ -1135,7 +1141,9 @@ export default function App() {
                     <FolderInput size={14} />
                   </button>
                 )}
-                {task.status === "downloading" || task.status === "queued" ? (
+                {task.status === "downloading" ||
+                task.status === "queued" ||
+                task.status === "waiting_peers" ? (
                   <button
                     className="btn icon"
                     title="暂停"

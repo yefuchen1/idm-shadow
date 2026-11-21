@@ -80,6 +80,13 @@ struct Inner {
     store: Arc<Store>,
     engine: Arc<HttpEngine>,
     running: Arc<Mutex<HashMap<TaskId, Running>>>,
+    /// 各任务当前**真实的**下载阶段。
+    ///
+    /// 界面上的状态会被"等用户确认"盖住（`AwaitingConfirm`），
+    /// 所以引擎报上来的阶段得单独记一份。用户确认完之后，
+    /// 用它把状态恢复成真实情况，而不是一律写成「下载中」——
+    /// 磁力任务一个 peer 都没连上的时候，真实情况是「等待连接」。
+    phases: Arc<Mutex<HashMap<TaskId, TaskStatus>>>,
     /// 正在收尾的任务。收尾期间不接受新的 pause/cancel 意图。
     finishing: Arc<Mutex<HashSet<TaskId>>>,
     /// 实时进度快照，UI 与桥接接口读它拿速度。
@@ -159,6 +166,7 @@ impl DownloadManager {
                 store,
                 engine,
                 running: Arc::new(Mutex::new(HashMap::new())),
+                phases: Arc::new(Mutex::new(HashMap::new())),
                 finishing: Arc::new(Mutex::new(HashSet::new())),
                 live: Arc::new(Mutex::new(HashMap::new())),
                 events,
@@ -506,6 +514,7 @@ impl DownloadManager {
         let engine = self.inner.engine.clone();
         let events = self.inner.events.clone();
         let live = self.inner.live.clone();
+        let phases = self.inner.phases.clone();
         let task_intent = intent.clone();
         let task_confirms = confirms.clone();
         let running = self.inner.running.clone();
@@ -523,27 +532,37 @@ impl DownloadManager {
             // 阶段变化：引擎进入下载阶段时，把任务状态从 Probing 改成 Downloading。
             let phase_store = store.clone();
             let phase_events = events.clone();
+            let phase_map = phases.clone();
             let phase_task = tokio::spawn(async move {
                 while let Some(phase) = phase_rx.recv().await {
                     let status = match phase {
                         "downloading" => TaskStatus::Downloading,
+                        "waiting_peers" => TaskStatus::WaitingPeers,
                         _ => continue,
+                    };
+                    // 真实阶段单独记一份。用户确认之后要用它恢复状态。
+                    phase_map.lock().await.insert(id, status);
+                    // 任务已经被删掉了，别再往回写状态。
+                    let Some(current) = phase_store.get_task(id).ok().flatten() else {
+                        continue;
                     };
                     // 如果任务还在等用户确认，状态保持 AwaitingConfirm，
                     // 不然界面上的确认弹窗就没了。
-                    let current = phase_store
-                        .get_task(id)
-                        .ok()
-                        .flatten()
-                        .map(|t| t.status)
-                        .unwrap_or(status);
-                    let final_status = if current == TaskStatus::AwaitingConfirm {
+                    let final_status = if current.status == TaskStatus::AwaitingConfirm {
                         TaskStatus::AwaitingConfirm
                     } else {
                         status
                     };
-                    let _ = phase_store.set_status(id, final_status, None);
-                    let _ = phase_events.send(TaskEvent::StatusChanged(id, final_status));
+                    // 状态没变就别写库。引擎那边会反复报同一个阶段，
+                    // 每次都落库 + 广播是白做的功。
+                    //
+                    // 更重要的是这里成了**自愈**的地方：状态要是被别处
+                    // 写歪了（比如用户点了"继续"，旧代码无条件写 `Queued`），
+                    // 引擎下一轮报的阶段会把它纠正回来。
+                    if final_status != current.status {
+                        let _ = phase_store.set_status(id, final_status, None);
+                        let _ = phase_events.send(TaskEvent::StatusChanged(id, final_status));
+                    }
                 }
             });
 
@@ -749,6 +768,7 @@ impl DownloadManager {
                             let _ = progress_task.await;
                             let _ = phase_task.await;
                             running.lock().await.remove(&id);
+                            phases.lock().await.remove(&id);
                             manager_finishing.lock().await.remove(&id);
                             return;
                         }
@@ -818,6 +838,7 @@ impl DownloadManager {
 
             // 任务结束：从运行表里摘掉，这样"继续"才能重新启动它。
             running.lock().await.remove(&id);
+            phases.lock().await.remove(&id);
             manager_finishing.lock().await.remove(&id);
 
         });
@@ -842,8 +863,7 @@ impl DownloadManager {
 
     /// 继续任务（从断点续传）。
     pub async fn resume(&self, id: TaskId) -> Result<()> {
-        self.inner.store.set_status(id, TaskStatus::Queued, None)?;
-        self.start(id).await
+        self.continue_task(id).await
     }
 
     /// 用户确认保存位置。
@@ -910,12 +930,24 @@ impl DownloadManager {
             if never_started {
                 self.start(id).await?;
             } else if task.status == TaskStatus::AwaitingConfirm {
-                self.inner
-                    .store
-                    .set_status(id, TaskStatus::Downloading, None)?;
+                // 恢复成引擎报上来的**真实**阶段。
+                //
+                // 以前这里一律写成「下载中」。但磁力任务一个 peer
+                // 都没连上的时候，真实情况是「等待连接」——
+                // 写成「下载中」就是又一次误报，用户以为在下，
+                // 实际上在干等。
+                let status = self
+                    .inner
+                    .phases
+                    .lock()
+                    .await
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(TaskStatus::Downloading);
+                self.inner.store.set_status(id, status, None)?;
                 self.inner
                     .events
-                    .send(TaskEvent::StatusChanged(id, TaskStatus::Downloading))
+                    .send(TaskEvent::StatusChanged(id, status))
                     .ok();
             }
             return Ok(());
@@ -1015,8 +1047,125 @@ impl DownloadManager {
 
     /// 重试一个失败的任务。
     pub async fn retry(&self, id: TaskId) -> Result<()> {
+        self.continue_task(id).await
+    }
+
+    /// "继续"/"重试"的共同实现。
+    ///
+    /// 这里要分清三种情况——分错了就是用户点了「继续」没反应：
+    ///
+    /// 1. **任务正在跑**（引擎活着）：把被写歪的状态摆正，
+    ///    不要重启。重启会打断正在进行的传输。
+    /// 2. **任务正在收尾**（刚点过暂停，引擎还没退出）：等它退干净再重启。
+    ///    这时候直接 `start()` 会被"已经在跑"的短路吃掉，什么都不做，
+    ///    随后引擎退出又把状态写回「已暂停」——点了继续等于没点。
+    /// 3. **任务没在跑**：正常重启。
+    ///
+    /// 起因：以前 `resume()` 无条件写 `Queued`，然后调 `start()`。
+    /// 但 `start()` 开头有个短路：任务已经在 `running` 表里就直接返回。
+    ///
+    /// BT 引擎是常驻线程模型的——任务跑起来就不退出，
+    /// 所以点了"继续"之后引擎往往还活着，`start()` 走短路返回，
+    /// **没有任何代码再去把状态从 `Queued` 改成 `Downloading`**。
+    /// 结果就是：任务明明在下载（速度、连接数都是实的），
+    /// 标签却一直写着"排队中"。
+    async fn continue_task(&self, id: TaskId) -> Result<()> {
+        // 先把意图取出来，**取完立刻放锁**。
+        //
+        // 下面要 await（等收尾、重启任务），而 `start()` 里还会
+        // 再去锁 `running`。tokio 的 Mutex 不可重入——
+        // 攥着 `running` 去 await 一个会锁 `running` 的操作就是死锁。
+        let intent = {
+            let map = self.inner.running.lock().await;
+            match map.get(&id) {
+                Some(running) => Some(*running.intent.lock().await),
+                // 情况 3：没在跑。
+                None => None,
+            }
+        };
+
+        match intent {
+            // 情况 3：没在跑，正常重启。
+            None => self.restart_task(id).await,
+            // 情况 1：引擎还活着，任务在正常跑。
+            Some(Intent::Active) => {
+                self.realign_status(id).await?;
+                Ok(())
+            }
+            // 情况 2：引擎正在收尾。等它退干净。
+            Some(Intent::Paused) => {
+                if !self.wait_for_teardown(id).await {
+                    return Err(anyhow!("任务正在收尾，请稍候"));
+                }
+                self.restart_task(id).await
+            }
+            // 情况 2 变体：用户已经取消了。取消是不可逆的，
+            // "继续"不该把它复活——等收尾完就完事。
+            Some(Intent::Cancelled) => {
+                self.wait_for_teardown(id).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// 把被写歪的状态摆正（任务确实还在跑的时候）。
+    async fn realign_status(&self, id: TaskId) -> Result<()> {
+        let current = self
+            .inner
+            .store
+            .get_task(id)?
+            .map(|t| t.status)
+            .unwrap_or(TaskStatus::Downloading);
+        // 只在状态确实不对的时候才改，避免无谓的写库。
+        //
+        // 恢复成引擎报上来的**真实**阶段。
+        //
+        // 不能一律写成「下载中」：磁力任务一个 peer 都没连上的时候，
+        // 真实情况是「等待连接」。写成「下载中」就是骗用户。
+        let real = self.inner.phases.lock().await.get(&id).copied();
+        let fixed = match current {
+            TaskStatus::Queued | TaskStatus::Probing => {
+                real.unwrap_or(TaskStatus::Downloading)
+            }
+            other => other,
+        };
+        if fixed != current {
+            self.inner.store.set_status(id, fixed, None)?;
+            self.inner
+                .events
+                .send(TaskEvent::StatusChanged(id, fixed))
+                .ok();
+        }
+        Ok(())
+    }
+
+    /// 正常重启一个没在跑的任务。
+    async fn restart_task(&self, id: TaskId) -> Result<()> {
         self.inner.store.set_status(id, TaskStatus::Queued, None)?;
         self.start(id).await
+    }
+
+    /// 等任务从运行表和收尾表里都退出去。
+    ///
+    /// 引擎线程退出时是先把 `running` 摘掉、再摘 `finishing`，
+    /// 两个表都空了才算真的退干净——只等 `running` 的话，
+    /// 有个窗口 `start()` 会撞上"任务正在收尾"的检查而失败。
+    async fn wait_for_teardown(&self, id: TaskId) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            // 两把锁分开拿，别同时攥着。
+            //
+            // 引擎线程收尾时是先摘 `running`、再摘 `finishing`。
+            // 这里要是反过来（先 running 后 finishing）并且中途 await，
+            // 两边就可能互相等。
+            let running = { self.inner.running.lock().await.contains_key(&id) };
+            let finishing = { self.inner.finishing.lock().await.contains(&id) };
+            if !running && !finishing {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
     }
 
     /// 删除任务。可选同时删除已下载的文件。
@@ -1084,7 +1233,10 @@ impl DownloadManager {
         for task in self.inner.store.list_tasks()? {
             if matches!(
                 task.status,
-                TaskStatus::Downloading | TaskStatus::Probing | TaskStatus::Queued
+                TaskStatus::Downloading
+                    | TaskStatus::Probing
+                    | TaskStatus::Queued
+                    | TaskStatus::WaitingPeers
             ) {
                 self.inner.store
                     .set_status(task.id, TaskStatus::Paused, None)?;

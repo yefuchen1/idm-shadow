@@ -335,7 +335,15 @@ pub fn download_prepared(
     // 稀缺度是不是该刷新了。每隔几秒刷一次就够了。
     let mut availability_stale = true;
     let mut last_availability = Instant::now() - AVAILABILITY_INTERVAL;
-    let mut reported_downloading = false;
+    // 上一次报出去的状态是什么。
+    //
+    // 用 `Option` 而不是 bool：还没有报过任何状态的时候，
+    // 跟"报过「等待连接」"是两回事——
+    // 前者要报一次，后者不用再报。
+    //
+    // 一开始是 `None`，不是 `Some(false)`：否则第一个 peer 都没连上时
+    // 会因为"状态没变"而永远不报，任务就一直停在「探测中」。
+    let mut reported_phase: Option<bool> = None;
     // tracker announce：自己来一份，用真实端口上报。
     let mut tracker_announcer = tracker::TrackerAnnouncer::new(listen_port);
     // 卡死检测器：种子没人做的时候它会空转，这里负责把它捞出来。
@@ -376,11 +384,26 @@ pub fn download_prepared(
                 last_downloaded = downloaded;
             }
 
-            // 报一次阶段变化，任务状态从"探测中"变成"下载中"。
-            // 不发的话界面上的状态会一直停在"探测中"。
-            if !reported_downloading {
-                reported_downloading = true;
-                ctx.send_phase("downloading");
+            // 报阶段变化，让界面上的状态跟实际情况对得上。
+            //
+            // 连上一个 peer 都没有的时候，状态是「等待连接」——
+            // 不是「排队中」。排队中意味着"前面有任务占着名额，
+            // 轮到我就开始下"，而实际上是我们自己在等 peer。
+            // 混用会让用户以为马上就能开始下载。
+            //
+            // 这里报的是**当前**状态，不是"报过一次就算了"。
+            //
+            // 以前每种阶段只报一次，但确认保存位置那一步会把状态
+            // 改成「下载中」——引擎这边不知道这件事，也就不再报了。
+            // 结果任务明明一个 peer 都没连上，界面却写着「下载中」。
+            //
+            // 所以改成：只在阶段**真的变了**的时候报。
+            // 连接数每轮都在变，但"连上了/没连上"这个状态本身很少变，
+            // 所以实际产生的消息很少。
+            let connected = stats.connected_peers > 0;
+            if reported_phase != Some(connected) {
+                reported_phase = Some(connected);
+                ctx.send_phase(if connected { "downloading" } else { "waiting_peers" });
             }
 
             // 分片状态是非阻塞读的。

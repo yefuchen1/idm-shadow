@@ -41,6 +41,19 @@ const SOURCE = {
   EXTENSION: 'extension'
 };
 
+/// 算作"进行中"的任务状态。
+///
+/// 徽标上显示的数字是"正在进行的下载数"。
+/// `waiting_peers`（等待连接）也要算进去：磁力任务起来了但还没连上 peer，
+/// 它照样占着一个下载名额，也照样在等用户处理。
+const ACTIVE_STATUS = [
+  'queued',
+  'probing',
+  'downloading',
+  'retrying',
+  'waiting_peers'
+];
+
 /// 浏览器恢复的旧下载，`startTime` 会保留原始时间。
 /// 超过这个年龄的 `onCreated` 不可能是刚刚的用户点击。
 const RESTORED_AGE_MS = 10 * 60 * 1000;
@@ -921,7 +934,7 @@ async function updateBadge() {
     if (!resp.ok) throw new Error('bad status');
     const body = await resp.json();
     const active = (body.tasks || []).filter((t) =>
-      ['queued', 'probing', 'downloading', 'retrying'].includes(t.status)
+      ACTIVE_STATUS.includes(t.status)
     ).length;
     await chrome.action.setBadgeText({ text: active > 0 ? String(active) : '' });
     await chrome.action.setBadgeBackgroundColor({ color: '#2f7de1' });
